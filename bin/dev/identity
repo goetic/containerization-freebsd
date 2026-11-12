@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+#
+# Prints the codesigning identity belonging to a team id.
+#
+# `codesign --sign` matches the common name, which holds the certificate's
+# id, not the team's — that is the OU — so this reads each subject.
+
+set -e
+
+team="${1:?usage: bin/dev/identity <team-id>}"
+
+security find-identity -v -p codesigning |
+  sed -n 's/^ *[0-9]*) \([0-9A-F][0-9A-F]*\) "\(.*\)"$/\1 \2/p' |
+  while read -r hash name; do
+    # Splits both `subject=CN=…, OU=…` and `subject= /CN=…/OU=…` (the two
+    # openssl output styles) into one field per line.
+    organizational_unit="$(
+      security find-certificate -c "$name" -p 2>/dev/null |
+        openssl x509 -noout -subject 2>/dev/null |
+        tr ',/' '\n\n' |
+        sed -n 's/^ *OU *= *//p' |
+        head -1
+    )"
+
+    if [ "$organizational_unit" = "$team" ]; then
+      printf '%s\n' "$hash"
+      break
+    fi
+  done

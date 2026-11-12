@@ -1,0 +1,26 @@
+[package]
+categories.workspace = true
+description = "FreeBSD virtual machines on macOS, through Apple's Virtualization framework."
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "containerization-freebsd"
+readme = "../../README.md"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+dispatch2.workspace = true
+url.workspace = true
+virtualization.workspace = true
+xz2.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Reads the kernel's message buffer out of guest RAM through a custom virtio
+# device: the only view of a boot that never reaches the console. Breaks save
+# (VZErrorDomain 11).
+kernel-messages = []

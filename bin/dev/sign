@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+#
+# Signs a binary with `com.apple.security.virtualization`, which
+# Virtualization.framework requires and every rebuild drops.
+#
+# DEVELOPMENT_TEAM picks that team's identity. Without it, ad hoc: enough for
+# the entitlement, but a new code identity per build, so anything keyed to one
+# prompts again.
+
+set -e
+
+binary="${1:?usage: bin/dev/sign <binary>}"
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+
+if [ -n "$DEVELOPMENT_TEAM" ]; then
+  identity="$("$root/bin/dev/identity" "$DEVELOPMENT_TEAM")"
+
+  if [ -z "$identity" ]; then
+    echo "bin/dev/sign: no codesigning identity belongs to team $DEVELOPMENT_TEAM" >&2
+    echo "the identities this machine holds are:" >&2
+    security find-identity -v -p codesigning >&2
+    exit 1
+  fi
+else
+  identity="-"
+fi
+
+codesign --force --entitlements "$root/virtualization.entitlements" --sign "$identity" --timestamp=none "$binary"

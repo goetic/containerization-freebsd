@@ -1,0 +1,39 @@
+[doctor]
+checks = [
+  {check = "homebrew"},
+  {check = "tool-versions", command = "plugin-installed", args = {plugin = "rust"}},
+  {check = "tool-versions", command = "package-installed", args = {plugin = "rust"}},
+  {check = "rust", command = "crate-installed", args = {name = ["cargo-audit","cargo-outdated", "cargo-nextest"]}},
+]
+
+[test]
+checks = [
+  {name = "rust: test!", shell = "cargo nextest run --color always", verbose = true},
+  {name = "rust: integration!", shell = "bin/dev/test-integration", verbose = true},
+]
+
+[audit]
+checks = [
+  {name = "rust: audit", shell = "cargo audit", verbose = true},
+  {name = "rust: clippy", shell = "cargo clippy --workspace --all-targets --all-features -- -D warnings", remedy = "cargo clippy --workspace --all-targets --all-features --fix --allow-dirty"},
+  {check = "rust", command = "format-check"},
+]
+
+[outdated]
+checks = [
+  {check = "rust"},
+]
+
+[update]
+steps = [
+  {step = "git", command = "pull"},
+  {doctor = {}},
+]
+
+[shipit]
+steps = [
+  {audit = {}},
+  {update = {}},
+  {test = {}},
+  {step = "git", command = "push"},
+]

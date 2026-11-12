@@ -1,0 +1,5 @@
+# The Swift runtime virtualization-sys links against is dynamic and referenced
+# through `@rpath`, so every binary that links it, test binaries included,
+# needs this rpath or dies in dyld at launch.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]

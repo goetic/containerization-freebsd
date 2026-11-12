@@ -1,0 +1,15 @@
+Applied after virtiofs-15.1.patch. Its module Makefile omits the generated
+vnode_if.h, so the build fails with `'vnode_if.h' file not found`; fusefs's
+Makefile lists it first in SRCS, and so does this.
+
+diff --git a/sys/modules/virtiofs/Makefile b/sys/modules/virtiofs/Makefile
+--- a/sys/modules/virtiofs/Makefile
++++ b/sys/modules/virtiofs/Makefile
+@@ -1,6 +1,6 @@
+ .PATH: ${SRCTOP}/sys/fs/fuse
+
+ KMOD=	virtiofs
+-SRCS=	virtiofs_vfsops.c
++SRCS=	vnode_if.h virtiofs_vfsops.c
+
+ .include <bsd.kmod.mk>

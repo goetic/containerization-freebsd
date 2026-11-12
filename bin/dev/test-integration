@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# Runs the integration suites: builds their test binaries, signs them, runs them.
+#
+# The entitlement check is `SecTaskCreateFromSelf`, so it is the *test binary*
+# that must carry `com.apple.security.virtualization`. Cargo builds it
+# unsigned and signs nothing, hence this.
+#
+# Further arguments reach nextest, so a single test can be run the way it
+# usually takes one:
+#
+#   bin/dev/test-integration -E 'test(restores)'
+#
+# Only options that choose and run tests: one that changes the build
+# (`--release`, `--cargo-profile`, `--features`) makes nextest build unsigned
+# binaries, which Virtualization refuses.
+
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$root"
+
+package=containerization-freebsd-test
+targets=()
+for suite in crates/$package/tests/*.rs; do
+  [ -e "$suite" ] || continue
+  targets+=(--test "$(basename "$suite" .rs)")
+done
+
+if [ "${#targets[@]}" -eq 0 ]; then
+  echo "bin/dev/test-integration: there are no suites in crates/$package/tests/" >&2
+  exit 1
+fi
+
+# `--message-format=json` puts the manifest on stdout and the compiler's output on
+# stderr, so this prints paths and shows progress as usual.
+binaries="$(
+  cargo test -p "$package" "${targets[@]}" --no-run --message-format=json |
+    python3 -c 'import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if message.get("executable") and message.get("profile", {}).get("test"):
+        print(message["executable"])'
+)"
+
+if [ -z "$binaries" ]; then
+  echo "bin/dev/test-integration: cargo built no test binaries" >&2
+  exit 1
+fi
+
+while IFS= read -r binary; do
+  "$root/bin/dev/sign" "$binary"
+done <<<"$binaries"
+
+exec cargo nextest run -p "$package" "${targets[@]}" "$@"

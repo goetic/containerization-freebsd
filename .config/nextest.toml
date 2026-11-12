@@ -1,0 +1,10 @@
+# Under a booting guest's load, a test's output can close more than nextest's
+# default 100ms after it exits. A real leak still outlasts 1s.
+[profile.default]
+leak-timeout = "1s"
+
+# A boot that stalls fails rather than hanging the run. The suite takes about
+# 30s; its own timeouts allow minutes.
+[[profile.default.overrides]]
+filter = 'package(containerization-freebsd-test)'
+slow-timeout = { period = "60s", terminate-after = 10 }

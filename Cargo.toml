@@ -1,0 +1,25 @@
+[workspace.package]
+categories = ["virtualization", "os::macos-apis"]
+edition = "2024"
+keywords = ["freebsd", "virtualization", "macos", "vm", "container"]
+license = "MIT"
+repository = "https://github.com/goetic/containerization-freebsd"
+rust-version = "1.99"
+
+[workspace]
+members = [
+    "crates/containerization-freebsd",
+    "crates/containerization-freebsd-test",
+]
+# The integration suite runs only signed, through bin/dev/test-integration.
+default-members = [
+    "crates/containerization-freebsd",
+]
+resolver = "3"
+
+[workspace.dependencies]
+containerization-freebsd = { path = "crates/containerization-freebsd", version = "0.1.0" }
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
+url = "2"
+virtualization = { version = "0.2.0" }
+xz2 = { version = "0.1", features = ["static"] }

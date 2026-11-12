@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+#
+# Downloads FreeBSD's VM image into the integration suites' cache, which they
+# read but never fill. Does nothing once it is there.
+
+set -e
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$root"
+
+exec cargo run --quiet -p containerization-freebsd-test --bin fetch-image
