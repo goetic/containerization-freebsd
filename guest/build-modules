@@ -32,6 +32,8 @@ work="$(cd "$work" && pwd)"
 out="$(cd "$out" && pwd)"
 src="$work/src"
 obj="$work/obj"
+# make.py refuses a MAKEOBJDIRPREFIX that does not exist yet.
+mkdir -p "$obj"
 
 sha256() {
   if command -v sha256sum >/dev/null; then
@@ -55,8 +57,9 @@ fi
 git -C "$src" fetch --quiet --depth 1 origin "$commit"
 git -C "$src" checkout --quiet --force FETCH_HEAD
 git -C "$src" clean --quiet -fdx
-git -C "$src" apply "$guest/virtiofs-15.1.patch"
-git -C "$src" apply "$guest/virtiofs-makefile.patch"
+# Upstream's patch has trailing whitespace, which is not ours to fix.
+git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-15.1.patch"
+git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-makefile.patch"
 
 jobs="$(getconf _NPROCESSORS_ONLN)"
 modules="fusefs virtio/fs virtiofs"
