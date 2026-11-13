@@ -2,7 +2,7 @@
 //! bundle, a cold boot of the prepared disk, and a restore of its saved
 //! state. Run signed, through `bin/dev/test-integration`.
 
-use containerization_freebsd::{Share, Upgrade};
+use containerization_freebsd::{Exec, Exit, Output, Share, Upgrade, WindowSize};
 use containerization_freebsd_test::{base_disk, bundle};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -93,6 +93,31 @@ fn prepares_boots_and_restores() {
   restored
     .save(&work.join("mounted.vzvmsave"))
     .expect_err("save with a share mounted");
+
+  let terminal = restored
+    .agent
+    .spawn(Exec {
+      argv: vec!["tty".into()],
+      pty: Some(WindowSize { rows: 24, columns: 80 }),
+      ..Exec::default()
+    })
+    .expect("run a command in a terminal");
+  let mut output = Vec::new();
+  loop {
+    match terminal.recv().expect("its output") {
+      Output::Stdout(bytes) => output.extend(bytes),
+      Output::Exited(exit) => {
+        assert_eq!(exit, Exit::Code(0));
+        break;
+      }
+      Output::Stderr(_) => unreachable!("a terminal merges stderr into stdout"),
+    }
+  }
+  assert!(
+    output.starts_with(b"/dev/pts/"),
+    "{:?}",
+    String::from_utf8_lossy(&output)
+  );
 
   restored
     .shut_down(Duration::from_secs(120))

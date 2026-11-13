@@ -7,14 +7,20 @@
 //! and end it.
 
 use crate::error::{Error, Result};
-use containerization_freebsd_protocol::{Decoder, Exec, Frame, Message, Mux, Side, Skipped, VersionMismatch};
+use containerization_freebsd_protocol::{Decoder, Frame, Message, Mux, Side, Skipped, VersionMismatch};
 use std::collections::HashMap;
 use std::io::{PipeReader, PipeWriter, Read, Write};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-pub use containerization_freebsd_protocol::Exit;
+pub use containerization_freebsd_protocol::{Exec, Exit, WindowSize};
+
+/// How long the agent has to start a process or connect a relay.
+const OPENING: Duration = Duration::from_secs(60);
+/// Data goes in frames of at most this, well under MAX_PAYLOAD.
+const CHUNK: usize = 64 << 10;
 
 pub struct Agent {
   shared: Arc<Shared>,
@@ -35,6 +41,38 @@ impl Ran {
   }
 }
 
+/// A process the agent runs. Dropping it before it exits kills it.
+pub struct Process {
+  stream: Stream,
+  exited: AtomicBool,
+}
+
+/// What a process sends back.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Output {
+  /// Its stdout; in a terminal, stderr too.
+  Stdout(Vec<u8>),
+  Stderr(Vec<u8>),
+  /// The last of its output.
+  Exited(Exit),
+}
+
+/// A connection to a TCP port on the guest's loopback. Dropping it closes
+/// the connection.
+pub struct Relay {
+  stream: Stream,
+  ended: AtomicBool,
+}
+
+/// An open channel: its number, and the messages the agent sends on it.
+struct Stream {
+  channel: u32,
+  shared: Arc<Shared>,
+  messages: Mutex<Receiver<Message>>,
+  /// The process or port, for errors.
+  what: String,
+}
+
 struct Shared {
   state: Mutex<State>,
   /// Notified when a session starts, or the console closes.
@@ -44,7 +82,7 @@ struct Shared {
 struct State {
   mux: Mux,
   console: PipeWriter,
-  /// Where each open channel's messages go: the command waiting on it.
+  /// Where each open channel's messages go.
   channels: HashMap<u32, mpsc::Sender<Message>>,
   mismatch: Option<VersionMismatch>,
   closed: bool,
@@ -102,21 +140,40 @@ impl Agent {
     }
   }
 
+  /// Starts `exec`'s process in the guest. The environment adds to the
+  /// agent's; with `pty`, it runs in a terminal of that size.
+  pub fn spawn(&self, exec: Exec) -> Result<Process> {
+    let what = format!("{:?}", exec.argv);
+
+    Ok(Process {
+      stream: self.open(Message::Exec(exec), what)?,
+      exited: AtomicBool::new(false),
+    })
+  }
+
+  /// Connects to `port` on the guest's loopback.
+  pub fn connect(&self, port: u16) -> Result<Relay> {
+    Ok(Relay {
+      stream: self.open(Message::Connect { port }, format!("port {port}"))?,
+      ended: AtomicBool::new(false),
+    })
+  }
+
   /// Runs `argv` in the guest, with no input, and collects what it prints.
   /// One still running after `timeout` is killed.
   pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
     let started = Instant::now();
-    let (sender, receiver) = mpsc::channel();
-    let channel = self.shared.lock().exec(argv, Some(sender))?;
+    let process = self.spawn(command(argv))?;
+    process.close_input()?;
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
 
     loop {
       let left = timeout.saturating_sub(started.elapsed());
 
-      match receiver.recv_timeout(left) {
-        Ok(Message::Data(bytes)) => stdout.extend(bytes),
-        Ok(Message::Stderr(bytes)) => stderr.extend(bytes),
-        Ok(Message::Exited(exit)) => {
+      match process.recv_timeout(left)? {
+        Some(Output::Stdout(bytes)) => stdout.extend(bytes),
+        Some(Output::Stderr(bytes)) => stderr.extend(bytes),
+        Some(Output::Exited(exit)) => {
           return Ok(Ran {
             exit,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -124,18 +181,12 @@ impl Agent {
             seconds: started.elapsed().as_secs_f64(),
           });
         }
-        Ok(Message::Error(reason)) => return Err(Error::Guest(format!("{argv:?}: {reason}"))),
-        Ok(_) => {}
-        Err(RecvTimeoutError::Timeout) => {
-          // Error closes the channel, and the agent kills what it ran.
-          self.shared.lock().close(channel, "timed out");
+        // Dropping the process kills it.
+        None => {
           return Err(Error::Timeout(format!(
             "{argv:?} did not finish within {}s",
             timeout.as_secs()
           )));
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-          return Err(Error::SessionEnded(format!("{argv:?} was running")));
         }
       }
     }
@@ -162,7 +213,191 @@ impl Agent {
   /// Starts `argv` in the guest without waiting for it, for a command that
   /// may never report back, such as one that powers the guest off.
   pub fn launch(&self, argv: &[&str]) -> Result<()> {
-    self.shared.lock().exec(argv, None).map(|_| ())
+    let mut state = self.shared.lock();
+    let protocol = |error| Error::Guest(format!("{argv:?}: {error}"));
+
+    let (channel, frame) = state
+      .mux
+      .open(Message::Exec(command(argv)))
+      .map_err(protocol)?;
+    state.write(&frame)?;
+    let eof = state.mux.send(channel, Message::Eof).map_err(protocol)?;
+    state.write(&eof)
+  }
+
+  /// Opens a channel with `message`, and waits for the agent to start what
+  /// it asks for.
+  fn open(&self, message: Message, what: String) -> Result<Stream> {
+    let (sender, receiver) = mpsc::channel();
+    let channel = {
+      let mut state = self.shared.lock();
+      let (channel, frame) = state
+        .mux
+        .open(message)
+        .map_err(|error| Error::Guest(format!("{what}: {error}")))?;
+      state.channels.insert(channel, sender);
+      state.write(&frame)?;
+      channel
+    };
+    let stream = Stream {
+      channel,
+      shared: self.shared.clone(),
+      messages: Mutex::new(receiver),
+      what,
+    };
+
+    match stream.recv(Some(OPENING))? {
+      Some(Message::Opened) => Ok(stream),
+      Some(other) => Err(Error::Guest(format!(
+        "{}: the agent sent {} before opened",
+        stream.what,
+        other.name()
+      ))),
+      None => Err(Error::Timeout(format!(
+        "{}: the agent did not open it within {}s",
+        stream.what,
+        OPENING.as_secs()
+      ))),
+    }
+  }
+}
+
+fn command(argv: &[&str]) -> Exec {
+  Exec {
+    argv: argv.iter().map(|arg| arg.to_string()).collect(),
+    ..Exec::default()
+  }
+}
+
+impl Process {
+  /// Writes to its stdin.
+  pub fn write(&self, bytes: &[u8]) -> Result<()> {
+    self.stream.write(bytes)
+  }
+
+  /// Ends its stdin. In a terminal, write ^D instead.
+  pub fn close_input(&self) -> Result<()> {
+    self.stream.send(Message::Eof)
+  }
+
+  /// Resizes its terminal.
+  pub fn resize(&self, size: WindowSize) -> Result<()> {
+    self.stream.send(Message::Resize(size))
+  }
+
+  /// Sends it a signal, numbered as in the guest.
+  pub fn signal(&self, signal: i32) -> Result<()> {
+    self.stream.send(Message::Signal(signal))
+  }
+
+  /// Its next output, waiting as long as that takes.
+  pub fn recv(&self) -> Result<Output> {
+    self
+      .next(None)?
+      .ok_or_else(|| Error::Guest(format!("{}: no output", self.stream.what)))
+  }
+
+  /// Its next output, or `None` if none came within `timeout`.
+  pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<Output>> {
+    self.next(Some(timeout))
+  }
+
+  fn next(&self, timeout: Option<Duration>) -> Result<Option<Output>> {
+    if self.exited.load(Ordering::Relaxed) {
+      return Err(Error::Guest(format!("{} has exited", self.stream.what)));
+    }
+
+    loop {
+      match self.stream.recv(timeout)? {
+        Some(Message::Data(bytes)) => return Ok(Some(Output::Stdout(bytes))),
+        Some(Message::Stderr(bytes)) => return Ok(Some(Output::Stderr(bytes))),
+        Some(Message::Exited(exit)) => {
+          self.exited.store(true, Ordering::Relaxed);
+          return Ok(Some(Output::Exited(exit)));
+        }
+        // The end of stdout, which Exited follows.
+        Some(_) => {}
+        None => return Ok(None),
+      }
+    }
+  }
+}
+
+impl Relay {
+  /// Writes to the connection.
+  pub fn write(&self, bytes: &[u8]) -> Result<()> {
+    self.stream.write(bytes)
+  }
+
+  /// Shuts the connection's write side.
+  pub fn close_write(&self) -> Result<()> {
+    self.stream.send(Message::Eof)
+  }
+
+  /// What the connection sends next, or `None` at its end.
+  pub fn read(&self) -> Result<Option<Vec<u8>>> {
+    if self.ended.load(Ordering::Relaxed) {
+      return Ok(None);
+    }
+
+    loop {
+      match self.stream.recv(None)? {
+        Some(Message::Data(bytes)) => return Ok(Some(bytes)),
+        Some(Message::Eof) => {
+          self.ended.store(true, Ordering::Relaxed);
+          return Ok(None);
+        }
+        Some(_) => {}
+        None => return Ok(None),
+      }
+    }
+  }
+}
+
+impl Stream {
+  fn send(&self, message: Message) -> Result<()> {
+    let mut state = self.shared.lock();
+    let frame = state
+      .mux
+      .send(self.channel, message)
+      .map_err(|error| Error::Guest(format!("{}: {error}", self.what)))?;
+    state.write(&frame)
+  }
+
+  fn write(&self, bytes: &[u8]) -> Result<()> {
+    bytes
+      .chunks(CHUNK)
+      .try_for_each(|chunk| self.send(Message::Data(chunk.to_vec())))
+  }
+
+  /// The next message, or `None` if none came within `timeout`. The
+  /// agent's Error, and the session's end, are errors.
+  fn recv(&self, timeout: Option<Duration>) -> Result<Option<Message>> {
+    let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+    let message = match timeout {
+      Some(timeout) => messages.recv_timeout(timeout),
+      None => messages.recv().map_err(|_| RecvTimeoutError::Disconnected),
+    };
+
+    match message {
+      Ok(Message::Error(reason)) => Err(Error::Guest(format!("{}: {reason}", self.what))),
+      Ok(message) => Ok(Some(message)),
+      Err(RecvTimeoutError::Timeout) => Ok(None),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::SessionEnded(format!("{} was open", self.what))),
+    }
+  }
+}
+
+impl Drop for Stream {
+  /// Closes the channel if it is still open, which kills the process or
+  /// closes the connection.
+  fn drop(&mut self) {
+    let mut state = self.shared.lock();
+
+    if state.channels.contains_key(&self.channel) && state.mux.is_open(self.channel) {
+      state.close(self.channel, "closed by the host");
+    }
+    state.channels.remove(&self.channel);
   }
 }
 
@@ -187,26 +422,7 @@ impl State {
     self.write(&hello)
   }
 
-  /// Opens a channel running `argv`, whose messages go to `sender`.
-  fn exec(&mut self, argv: &[&str], sender: Option<mpsc::Sender<Message>>) -> Result<u32> {
-    let protocol = |error| Error::Guest(format!("{argv:?}: {error}"));
-    let exec = Exec {
-      argv: argv.iter().map(|arg| arg.to_string()).collect(),
-      ..Exec::default()
-    };
-
-    let (channel, frame) = self.mux.open(Message::Exec(exec)).map_err(protocol)?;
-    if let Some(sender) = sender {
-      self.channels.insert(channel, sender);
-    }
-    self.write(&frame)?;
-    let eof = self.mux.send(channel, Message::Eof).map_err(protocol)?;
-    self.write(&eof)?;
-    Ok(channel)
-  }
-
   fn close(&mut self, channel: u32, reason: &str) {
-    self.channels.remove(&channel);
     if let Ok(frame) = self.mux.send(channel, Message::Error(reason.to_string())) {
       let _ = self.write(&frame);
     }
@@ -301,8 +517,12 @@ fn echo(line: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
   use super::*;
   use containerization_freebsd_protocol::VERSION;
+  use std::net::TcpListener;
 
   const PATIENCE: Duration = Duration::from_secs(10);
+  const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
+  /// FreeBSD and macOS number it alike.
+  const SIGTERM: i32 = 15;
 
   /// The real agent, serving over pipes as it would the console; and the
   /// ends the host reads and writes.
@@ -318,6 +538,41 @@ mod tests {
     let agent = Agent::new(output, input);
     agent.wait_ready(PATIENCE).expect("a session");
     agent
+  }
+
+  /// Its stdout until it holds `text`.
+  fn read_until(process: &Process, text: &str) -> String {
+    let mut output = String::new();
+
+    while !output.contains(text) {
+      match process.recv_timeout(PATIENCE).unwrap() {
+        Some(Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
+        other => panic!("{other:?} before {text:?}, after {output:?}"),
+      }
+    }
+    output
+  }
+
+  /// Its stdout until it exits, and how.
+  fn finish(process: &Process) -> (String, Exit) {
+    let mut output = String::new();
+
+    loop {
+      match process.recv_timeout(PATIENCE).unwrap() {
+        Some(Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
+        Some(Output::Exited(exit)) => return (output, exit),
+        other => panic!("{other:?} after {output:?}"),
+      }
+    }
+  }
+
+  fn running(pid: &str) -> bool {
+    std::process::Command::new("kill")
+      .args(["-0", pid])
+      .stderr(std::process::Stdio::null())
+      .status()
+      .unwrap()
+      .success()
   }
 
   #[test]
@@ -378,5 +633,112 @@ mod tests {
 
     let ran = agent.check(&["echo", "next"], PATIENCE).unwrap();
     assert_eq!(ran.lines(), ["next"]);
+  }
+
+  #[test]
+  fn refuses_a_command_that_does_not_exist() {
+    let agent = started();
+
+    let error = agent
+      .spawn(command(&["/nonexistent/command"]))
+      .err()
+      .unwrap();
+
+    assert!(error.to_string().contains("/nonexistent/command"), "{error}");
+  }
+
+  #[test]
+  fn feeds_a_process_its_input() {
+    let agent = started();
+
+    let process = agent.spawn(command(&["cat"])).unwrap();
+    process.write(b"fed\n").unwrap();
+    process.close_input().unwrap();
+
+    assert_eq!(finish(&process), ("fed\n".to_string(), Exit::Code(0)));
+  }
+
+  #[test]
+  fn signals_a_process() {
+    let agent = started();
+
+    let process = agent.spawn(command(&["sleep", "30"])).unwrap();
+    process.signal(SIGTERM).unwrap();
+
+    assert_eq!(finish(&process).1, Exit::Signal(SIGTERM));
+  }
+
+  #[test]
+  fn runs_and_resizes_a_terminal() {
+    let agent = started();
+
+    let process = agent
+      .spawn(Exec {
+        pty: Some(TERMINAL),
+        ..command(&["sh", "-c", "stty size; read line; stty size"])
+      })
+      .unwrap();
+    read_until(&process, "24 80");
+    process
+      .resize(WindowSize { rows: 40, columns: 100 })
+      .unwrap();
+    process.write(b"\n").unwrap();
+
+    let (output, exit) = finish(&process);
+    assert!(output.contains("40 100"), "{output:?}");
+    assert_eq!(exit, Exit::Code(0));
+  }
+
+  #[test]
+  fn dropping_a_process_kills_it() {
+    let agent = started();
+    let process = agent
+      .spawn(command(&["sh", "-c", "echo $$; exec sleep 30"]))
+      .unwrap();
+    let pid = read_until(&process, "\n").trim().to_string();
+
+    drop(process);
+
+    let started = Instant::now();
+    while running(&pid) {
+      assert!(started.elapsed() < PATIENCE, "process {pid} outlived its handle");
+      std::thread::sleep(Duration::from_millis(20));
+    }
+  }
+
+  #[test]
+  fn relays_to_a_port() {
+    let agent = started();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut received = Vec::new();
+      stream.read_to_end(&mut received).unwrap();
+      stream.write_all(&received.to_ascii_uppercase()).unwrap();
+    });
+
+    let relay = agent.connect(port).unwrap();
+    relay.write(b"relayed").unwrap();
+    relay.close_write().unwrap();
+    let mut received = Vec::new();
+    while let Some(bytes) = relay.read().unwrap() {
+      received.extend(bytes);
+    }
+    server.join().unwrap();
+
+    assert_eq!(received, b"RELAYED");
+  }
+
+  #[test]
+  fn refuses_a_port_nothing_listens_on() {
+    let agent = started();
+    let port = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+
+    assert!(agent.connect(port).is_err());
   }
 }

@@ -11,7 +11,7 @@ pub mod machine;
 mod memory;
 pub mod prepare;
 
-pub use agent::{Agent, Exit, Ran};
+pub use agent::{Agent, Exec, Exit, Output, Process, Ran, Relay, WindowSize};
 pub use error::{Error, Result};
 pub use machine::{Layout, Machine, Share};
 pub use prepare::{Upgrade, prepare};

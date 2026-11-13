@@ -5,7 +5,9 @@
 - Boots FreeBSD 15.1 arm64 VMs on macOS: downloads and verifies the official
   image, clones disks instantly, prepares a base on first boot, and saves and
   restores running VMs.
-- Runs commands in the guest through its agent, over the virtio console.
+- Runs commands in the guest through its agent, over the virtio console: on
+  pipes or in a terminal, with input, signals and resizing. Connects to the
+  guest's TCP ports.
 - Preparing a base installs the guest bundle: the agent, and the virtiofs
   modules, loaded at every boot.
 - Mounts shared host directories in the guest. Saving refuses while one is
