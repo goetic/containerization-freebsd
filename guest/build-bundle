@@ -30,8 +30,7 @@ for module in fusefs vtfs virtiofs; do
   install -m 0555 "$modules/$module.ko" "$staging/boot/modules/$module.ko"
 done
 install -m 0555 "$agent" "$staging/usr/local/sbin/containerization-freebsd-agent"
-chmod 0555 "$staging/usr/local/etc/rc.d/cfbsd_agent"
-chmod 0444 "$staging/boot/loader.conf.d/containerization-freebsd.conf"
+chmod 0555 "$staging"/usr/local/etc/rc.d/*
 
 # Files only: extracting a directory entry over /usr or /boot would reset its
 # mode and times. tar creates any missing parents.

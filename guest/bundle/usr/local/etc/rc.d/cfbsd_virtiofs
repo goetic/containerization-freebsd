@@ -1,0 +1,25 @@
+#!/bin/sh
+#
+# PROVIDE: cfbsd_virtiofs
+# REQUIRE: FILESYSTEMS
+# BEFORE: cfbsd_agent
+#
+# Loads the guest bundle's patched virtiofs modules, our fusefs first. Not
+# from loader.conf: the loader loads modules in no set order, and virtiofs
+# first would pull in the stock fusefs from /boot/kernel, which the module
+# path searches first. virtiofs pulls in vtfs.
+
+. /etc/rc.subr
+
+name=cfbsd_virtiofs
+start_cmd=cfbsd_virtiofs_start
+stop_cmd=:
+
+cfbsd_virtiofs_start()
+{
+	kldstat -q -m fusefs || kldload /boot/modules/fusefs.ko
+	kldstat -q -m virtiofs || kldload virtiofs
+}
+
+load_rc_config $name
+run_rc_command "$1"

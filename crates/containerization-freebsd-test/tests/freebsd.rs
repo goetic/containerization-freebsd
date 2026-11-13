@@ -54,7 +54,7 @@ fn prepares_boots_and_restores() {
     .expect("run a command");
   assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
 
-  // The loader loaded the bundle's modules, ours rather than the stock fusefs.
+  // rc loaded the bundle's modules: ours, not the stock fusefs.
   let ran = cold
     .agent
     .check(&sh("kldstat -v | grep -E 'virtiofs|vtfs|fusefs'"), SECONDS)
@@ -63,21 +63,8 @@ fn prepares_boots_and_restores() {
     assert!(ran.stdout.contains(module), "{module} is not loaded: {ran:?}");
   }
 
-  cold
-    .agent
-    .check(
-      &sh("mkdir -p /mnt/shared && mount -t virtiofs shared /mnt/shared && cat /mnt/shared/from-host && echo written in the guest > /mnt/shared/from-guest"),
-      SECONDS,
-    )
-    .map(|ran| assert_eq!(ran.lines(), ["written on the host"]))
-    .expect("use the share");
-  assert_eq!(
-    std::fs::read_to_string(shared.join("from-guest")).expect("read the guest's file"),
-    "written in the guest\n"
-  );
-
+  // A clean base: saved before any share is mounted.
   let state = work.join("state.vzvmsave");
-  cold.pause().expect("pause");
   cold.save(&state).expect("save");
   cold.stop().expect("stop");
   drop(cold);
@@ -88,11 +75,24 @@ fn prepares_boots_and_restores() {
   restored
     .wait_ready(SECONDS)
     .expect("the agent answers after restoring");
+  restored
+    .mount_share("shared", "/mnt/shared")
+    .expect("mount the share");
   let ran = restored
     .agent
-    .check(&sh("echo restored; cat /mnt/shared/from-host"), SECONDS)
-    .expect("run a command after restoring");
+    .check(
+      &sh("echo restored; cat /mnt/shared/from-host && echo written in the guest > /mnt/shared/from-guest"),
+      SECONDS,
+    )
+    .expect("use the share after restoring");
   assert_eq!(ran.lines(), ["restored", "written on the host"]);
+  assert_eq!(
+    std::fs::read_to_string(shared.join("from-guest")).expect("read the guest's file"),
+    "written in the guest\n"
+  );
+  restored
+    .save(&work.join("mounted.vzvmsave"))
+    .expect_err("save with a share mounted");
 
   restored
     .shut_down(Duration::from_secs(120))

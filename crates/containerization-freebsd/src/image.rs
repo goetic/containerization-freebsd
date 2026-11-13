@@ -14,7 +14,7 @@ pub const BASE_DISK: &str = "base.raw";
 /// this repository's CI publishes them.
 pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r1.tar.xz";
 const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r1/freebsd-15.1-arm64-guest-r1.tar.xz";
-const BUNDLE_SHA256: &str = "";
+const BUNDLE_SHA256: &str = "f976c3a351e1c29650cbebdf1b7e1d5243ede1bbee8d39b0342b588065c0a544";
 
 fn run(command: &mut Command) -> Result<String> {
   let description = format!("{command:?}");

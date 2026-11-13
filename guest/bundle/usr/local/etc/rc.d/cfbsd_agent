@@ -6,7 +6,9 @@
 # KEYWORD: shutdown
 #
 # The guest agent, serving the host over /dev/ttyV0.0. daemon(8) restarts it
-# whenever it exits, as it does when the console closes.
+# whenever it exits, as it does when the console closes. -f leaves daemon
+# none of its caller's descriptors: holding a pipe its caller reads would
+# keep the caller waiting.
 #
 # cfbsd_agent_enable (bool): "NO" by default.
 
@@ -22,6 +24,6 @@ load_rc_config $name
 pidfile="/var/run/${name}.pid"
 procname=/usr/sbin/daemon
 command=/usr/sbin/daemon
-command_args="-r -t ${name} -P ${pidfile} -o /var/log/${name}.log /usr/local/sbin/containerization-freebsd-agent"
+command_args="-f -r -t ${name} -P ${pidfile} -o /var/log/${name}.log /usr/local/sbin/containerization-freebsd-agent"
 
 run_rc_command "$1"

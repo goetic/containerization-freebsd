@@ -250,8 +250,14 @@ impl State {
 fn read(mut output: PipeReader, shared: &Shared) {
   let mut decoder = Decoder::new();
   let mut buffer = vec![0; 64 << 10];
+  let mut line = Vec::new();
 
   while let Ok(read @ 1..) = output.read(&mut buffer) {
+    // Before a session, console text is the guest explaining why there is
+    // none, such as first-boot.sh failing.
+    if !shared.lock().mux.in_session() {
+      echo(&mut line, &buffer[..read]);
+    }
     decoder.push(&buffer[..read]);
 
     while let Some(decoded) = decoder.decode() {
@@ -275,6 +281,20 @@ fn read(mut output: PipeReader, shared: &Shared) {
   state.closed = true;
   state.channels.clear();
   shared.changed.notify_all();
+}
+
+/// Copies the text among `bytes` to stderr, a line at a time.
+fn echo(line: &mut Vec<u8>, bytes: &[u8]) {
+  for &byte in bytes {
+    match byte {
+      b'\n' if !line.is_empty() => {
+        eprintln!("guest| {}", String::from_utf8_lossy(line));
+        line.clear();
+      }
+      b' '..=b'~' | b'\t' => line.push(byte),
+      _ => {}
+    }
+  }
 }
 
 #[cfg(test)]

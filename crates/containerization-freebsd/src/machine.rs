@@ -25,7 +25,7 @@ use virtualization::{
 /// ("desired features were not accepted"); these drop them from the request.
 pub const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\n";
 
-/// A host directory the guest mounts with `mount -t virtiofs <tag> <path>`.
+/// A host directory the guest mounts with `Machine::mount_share`.
 #[derive(Clone, Debug)]
 pub struct Share {
   pub tag: String,
@@ -297,13 +297,42 @@ impl Machine {
     })
   }
 
-  /// Saves a paused machine's state to `path`.
+  /// Pauses the running machine and saves its state to `path`, leaving it
+  /// paused. Fails if the guest has a share mounted, so save bases first and
+  /// mount shares after restoring.
+  ///
+  /// A share mounted across a save goes stale: the host's virtio-fs server
+  /// restarts with the restored machine, forgetting the files the guest
+  /// cached, so each fails once. Nor can it be unmounted first: FreeBSD's
+  /// virtiofs hangs on a second mount of a share in the same boot.
   pub fn save(&self, path: &Path) -> Result<f64> {
+    let started = Instant::now();
     let url = url(path)?;
 
+    let mounted = self
+      .agent
+      .check(&["mount", "-t", "virtiofs"], Duration::from_secs(60))?;
+    if !mounted.stdout.trim().is_empty() {
+      return Err(Error::Guest(format!(
+        "the guest has shares mounted, which a restore would leave stale: {}",
+        mounted.stdout.trim()
+      )));
+    }
+    self.pause()?;
     self.completed("save the machine's state", |machine, done| {
       machine.save_machine_state_to(&url, done)
-    })
+    })?;
+    Ok(started.elapsed().as_secs_f64())
+  }
+
+  /// Mounts the share tagged `tag` at `path` in the guest.
+  pub fn mount_share(&self, tag: &str, path: &str) -> Result<()> {
+    let script = r#"mkdir -p "$2" && mount -t virtiofs "$1" "$2""#;
+
+    self
+      .agent
+      .check(&["sh", "-c", script, "sh", tag, path], Duration::from_secs(60))
+      .map(|_| ())
   }
 
   /// Restores a state `save` wrote, into a machine of the same layout that

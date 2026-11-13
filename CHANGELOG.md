@@ -8,6 +8,8 @@
 - Runs commands in the guest through its agent, over the virtio console.
 - Preparing a base installs the guest bundle: the agent, and the virtiofs
   modules, loaded at every boot.
+- Mounts shared host directories in the guest. Saving refuses while one is
+  mounted, so save bases first and mount shares after restoring.
 - Preparing a base can skip the first boot's online upgrade, taking seconds
   instead of minutes.
 - A protocol for the coming guest agent: commands, terminals, port relays and

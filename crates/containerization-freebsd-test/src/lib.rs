@@ -14,8 +14,15 @@ pub fn base_disk() -> PathBuf {
   cached(image::BASE_DISK)
 }
 
-/// The cached guest bundle, which `bin/dev/fetch-image` downloads too.
+/// The cached guest bundle, which `bin/dev/fetch-image` downloads too, or an
+/// unreleased one from `guest/build-bundle` at `tmp/guest-bundle.tar.xz`.
 pub fn bundle() -> PathBuf {
+  let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/guest-bundle.tar.xz");
+
+  if local.exists() {
+    eprintln!("using {}", local.display());
+    return local;
+  }
   cached(image::BUNDLE)
 }
 

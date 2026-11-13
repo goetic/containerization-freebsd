@@ -4,7 +4,9 @@
 # it again to install the guest bundle from it, then starts the bundle's agent,
 # which serves the host on /dev/ttyV0.0 at this boot and every later one.
 
-set -e
+set -ex
+# The host shows console text that arrives before the agent's first frame.
+exec >/dev/ttyV0.0 2>&1
 
 seed=/media/cfbsd-seed
 mkdir -p "$seed"
