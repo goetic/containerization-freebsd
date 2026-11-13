@@ -12,9 +12,9 @@ pub const IMAGE: &str = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.
 pub const BASE_DISK: &str = "base.raw";
 /// The guest bundle for `RELEASE`: the agent and the virtiofs modules, as
 /// this repository's CI publishes them.
-pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r2.tar.xz";
-const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r2/freebsd-15.1-arm64-guest-r2.tar.xz";
-const BUNDLE_SHA256: &str = "5d738486eb52bf443dfdd0f84fc1510a660ffb1764389a7f20e20c0cb79565d0";
+pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r3.tar.xz";
+const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r3/freebsd-15.1-arm64-guest-r3.tar.xz";
+const BUNDLE_SHA256: &str = "4e1fc71b24896a0b1efdac5d3da900ccb89346a85e5defdc69d36971d48c3c28";
 
 fn run(command: &mut Command) -> Result<String> {
   let description = format!("{command:?}");
