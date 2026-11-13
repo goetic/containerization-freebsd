@@ -35,3 +35,18 @@ tty = true
 [project]
 image = "compostbin/base:latest"
 name = "cfbsd"
+
+# guest/build-modules, as CI runs it: FreeBSD's make.py (python3) builds bmake
+# against libarchive and libbz2, then cross-builds with LLVM 19
+# (CROSS_BINDIR=/usr/lib/llvm-19/bin).
+[image]
+packages = [
+    "build-essential",
+    "clang-19",
+    "file",
+    "libarchive-dev",
+    "libbz2-dev",
+    "lld-19",
+    "llvm-19",
+    "python3",
+]
