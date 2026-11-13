@@ -51,7 +51,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bc build-essential file libarchive-dev libbz2-dev python3 \
+          sudo apt-get install -y --no-install-recommends bc bison build-essential file flex libarchive-dev libbz2-dev libssl-dev m4 python3 time zlib1g-dev \
             "clang-$LLVM" "lld-$LLVM" "llvm-$LLVM"
 
       - name: Build

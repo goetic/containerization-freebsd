@@ -42,14 +42,20 @@ name = "cfbsd"
 [image]
 packages = [
     "bc",
+    "bison",
     "build-essential",
     "clang-19",
     "file",
+    "flex",
     "libarchive-dev",
     "libbz2-dev",
+    "libssl-dev",
     "lld-19",
     "llvm-19",
+    "m4",
     "python3",
+    "time",
+    "zlib1g-dev",
 ]
 # guest/build-agent: the toolchain rust-toolchain.toml pins, with the rust-src
 # that -Zbuild-std builds FreeBSD's std from.
