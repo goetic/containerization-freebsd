@@ -20,7 +20,4 @@ xz2.workspace = true
 tempfile = "3"
 
 [features]
-# Reads the kernel's message buffer out of guest RAM through a custom virtio
-# device: the only view of a boot that never reaches the console. Breaks save
-# (VZErrorDomain 11).
 kernel-messages = []

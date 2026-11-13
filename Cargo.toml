@@ -13,7 +13,6 @@ members = [
     "crates/containerization-freebsd-protocol",
     "crates/containerization-freebsd-test",
 ]
-# The integration suite runs only signed, through bin/dev/test-integration.
 default-members = [
     "crates/containerization-freebsd",
     "crates/containerization-freebsd-agent",

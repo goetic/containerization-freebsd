@@ -10,7 +10,5 @@ repository.workspace = true
 rust-version.workspace = true
 version = "0.1.0"
 
-# No dependencies: the agent builds it for FreeBSD, a Tier 3 target.
-
 [lints.rust]
 unsafe_code = "forbid"
