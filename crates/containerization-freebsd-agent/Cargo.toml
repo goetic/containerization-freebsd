@@ -1,0 +1,16 @@
+[package]
+description = "Guest agent for containerization-freebsd: serves the host from inside FreeBSD over the virtio console."
+edition.workspace = true
+license.workspace = true
+name = "containerization-freebsd-agent"
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+containerization-freebsd-protocol.workspace = true
+libc.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"

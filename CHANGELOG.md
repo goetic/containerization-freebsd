@@ -14,3 +14,6 @@
 - The `kernel-messages` feature shows boot messages when the console stays
   silent. Off by default: it breaks saving.
 - Adds patches for virtiofs shared folders in FreeBSD 15.1 guests.
+- The guest agent: runs commands on pipes or in a terminal, signals and
+  resizes them, and relays to the guest's TCP ports. Not yet installed in
+  guests.

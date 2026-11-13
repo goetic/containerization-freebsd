@@ -80,6 +80,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "containerization-freebsd-agent"
+version = "0.1.0"
+dependencies = [
+ "containerization-freebsd-protocol",
+ "libc",
+]
+
+[[package]]
 name = "containerization-freebsd-protocol"
 version = "0.1.0"
 

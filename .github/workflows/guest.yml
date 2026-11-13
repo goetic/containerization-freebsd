@@ -1,21 +1,25 @@
-# Builds the guest bundle's virtiofs modules for FreeBSD 15.1 arm64, on a
-# Linux arm64 runner, through guest/build-modules.
+# Builds the guest bundle for FreeBSD 15.1 arm64 on Linux arm64 runners: the
+# virtiofs modules through guest/build-modules, the agent through
+# guest/build-agent.
 #
-# Releases come later: a bundle also carries the agent and its rc.d script,
-# and a release is never overwritten, so none is cut without them.
+# Releases come later: a bundle also carries the agent's rc.d script, and a
+# release is never overwritten, so none is cut without it.
 
 name: guest
 
 on:
   push:
     branches: [main]
-    paths:
+    paths: &inputs
       - "guest/**"
+      - "crates/containerization-freebsd-agent/**"
+      - "crates/containerization-freebsd-protocol/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
       - ".github/workflows/guest.yml"
   pull_request:
-    paths:
-      - "guest/**"
-      - ".github/workflows/guest.yml"
+    paths: *inputs
   workflow_dispatch:
 
 permissions:
@@ -55,4 +59,38 @@ jobs:
         with:
           name: freebsd-15.1-arm64-virtiofs-modules
           path: modules/*.ko
+          if-no-files-found: error
+
+  agent:
+    name: agent (15.1, arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      LLVM: 19
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends file "clang-$LLVM" "lld-$LLVM"
+
+      # rust-toolchain.toml picks the toolchain; the target's std builds from
+      # rust-src.
+      - name: Install Rust
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+            echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup component add rust-src
+
+      - name: Build
+        run: CROSS_BINDIR="/usr/lib/llvm-$LLVM/bin" guest/build-agent "$RUNNER_TEMP/agent" agent
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-15.1-arm64-agent
+          path: agent/containerization-freebsd-agent
           if-no-files-found: error

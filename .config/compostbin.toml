@@ -50,3 +50,8 @@ packages = [
     "llvm-19",
     "python3",
 ]
+# guest/build-agent: the toolchain rust-toolchain.toml pins, with the rust-src
+# that -Zbuild-std builds FreeBSD's std from.
+run = [
+    "curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1 --component rust-src",
+]

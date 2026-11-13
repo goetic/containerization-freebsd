@@ -11,9 +11,9 @@ FreeBSD's own arm64 VM image, through UEFI, from APFS copy-on-write clones.
 ## Status
 
 Early. The library boots and prepares FreeBSD guests, and drives them over a
-shell on their virtio console. The protocol the guest agent will speak is
-done; the agent, the guest bundle (virtiofs modules), and the CLI are still
-to come.
+shell on their virtio console. The guest agent and its protocol are done, and
+CI builds the agent and the virtiofs modules for 15.1; installing them in
+guests, the library's agent client, and the CLI are still to come.
 
 ## What a guest gets
 
@@ -34,11 +34,13 @@ to come.
 | --- | --- |
 | `crates/containerization-freebsd` | The library: the image, prepared bases, machines, the console. |
 | `crates/containerization-freebsd-protocol` | The protocol between the host and the guest agent: multiplexed channels in frames, over the console. No dependencies, for the agent's sake. |
+| `crates/containerization-freebsd-agent` | The guest agent: runs processes, on pipes or in a terminal, and relays to guest ports, for the host. POSIX, so its tests run on the Mac. Unpublished; it ships in the guest bundle. |
 | `crates/containerization-freebsd-test` | The integration suite, which boots FreeBSD. Unpublished. |
 | `guest/virtiofs-15.1.patch` | Emil Tsalapatis's virtiofs patches (D46295, D46296, D55047), rebased onto `releng/15.1`. sha256 `65cdc3ddf16ad504619fc729ba14dfbc79b67fb84819cb69538d987841afbc1c`. |
 | `guest/virtiofs-makefile.patch` | Ours, applied after it: the virtiofs module's `SRCS` needs `vnode_if.h`. |
 | `guest/first-boot.sh` | The seed volume's user-data, run once by nuageinit. |
 | `guest/build-modules` | Builds the three modules from a Linux or macOS host, through FreeBSD's `tools/build/make.py`. CI (`.github/workflows/guest.yml`) runs it on Linux arm64. |
+| `guest/build-agent` | Cross-builds the agent for `aarch64-unknown-freebsd`, a Tier 3 target: std from source (`-Zbuild-std`), linked against 15.1's `base.txz`. |
 
 ## Development
 

@@ -1,0 +1,84 @@
+#!/usr/bin/env sh
+#
+# Cross-builds containerization-freebsd-agent for FreeBSD 15.1 arm64
+# (aarch64-unknown-freebsd), from Linux or macOS.
+#
+#   guest/build-agent <work-dir> <out-dir>
+#
+# The sysroot and build go in <work-dir>, the agent in <out-dir>.
+#
+# The target is Tier 3: Rust ships no std for it, so cargo builds std from the
+# toolchain's rust-src (-Zbuild-std). RUSTC_BOOTSTRAP allows that on the
+# pinned stable toolchain. It links with LLVM, against FreeBSD's own
+# libraries from the release's base.txz. CROSS_BINDIR names the directory
+# holding clang and ld.lld, as for guest/build-modules.
+
+set -eu
+
+work="${1:?usage: guest/build-agent <work-dir> <out-dir>}"
+out="${2:?usage: guest/build-agent <work-dir> <out-dir>}"
+cross_bindir="${CROSS_BINDIR:?set CROSS_BINDIR to the directory holding clang and ld.lld}"
+
+base_url=https://download.freebsd.org/releases/arm64/aarch64/15.1-RELEASE/base.txz
+base_sha256=5b7a46a0abfbe23a1d4454b5600e2efcfce16b705bc7e9c851c37470c035ef98
+target=aarch64-unknown-freebsd
+agent=containerization-freebsd-agent
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+mkdir -p "$work" "$out"
+work="$(cd "$work" && pwd)"
+out="$(cd "$out" && pwd)"
+sysroot="$work/sysroot"
+
+sha256() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+if [ ! -e "$sysroot/.complete" ]; then
+  curl -fsSL -o "$work/base.txz" "$base_url"
+  actual="$(sha256 "$work/base.txz")"
+  if [ "$actual" != "$base_sha256" ]; then
+    echo "guest/build-agent: base.txz has sha256 $actual, not $base_sha256" >&2
+    exit 1
+  fi
+
+  rm -rf "$sysroot"
+  mkdir -p "$sysroot"
+  # Linking needs only the C runtime and the libraries std links.
+  tar -xf "$work/base.txz" -C "$sysroot" ./lib ./usr/lib
+  rm "$work/base.txz"
+  touch "$sysroot/.complete"
+fi
+
+linker="$work/link"
+cat >"$linker" <<EOF
+#!/bin/sh
+exec "$cross_bindir/clang" --target=$target --sysroot="$sysroot" -fuse-ld=lld "\$@"
+EOF
+chmod +x "$linker"
+
+cd "$root"
+RUSTC_BOOTSTRAP=1 CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER="$linker" \
+  cargo build --release --locked \
+  -p "$agent" \
+  --target "$target" \
+  --target-dir "$work/target" \
+  -Zbuild-std=std,panic_abort
+
+cp "$work/target/$target/release/$agent" "$out/$agent"
+
+# file(1) names FreeBSD from the binary's ABI note, which only a FreeBSD
+# executable carries.
+description="$(file -b "$out/$agent")"
+case "$description" in
+  *"ELF 64-bit LSB"*"ARM aarch64"*"FreeBSD"*) ;;
+  *)
+    echo "guest/build-agent: $out/$agent is not an aarch64 FreeBSD executable: $description" >&2
+    exit 1
+    ;;
+esac
+printf '%s: %s\n' "$agent" "$description"
