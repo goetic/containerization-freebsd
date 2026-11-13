@@ -29,12 +29,12 @@ jobs:
     env:
       LLVM: 19
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The key covers the modules' inputs: the script pins FreeBSD's commit
       # and the patch's sha256. LLVM point releases are excluded.
       - id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: modules
           key: virtiofs-modules-arm64-llvm${{ env.LLVM }}-${{ hashFiles('guest/build-modules', 'guest/virtiofs-*.patch') }}
@@ -51,7 +51,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: CROSS_BINDIR="/usr/lib/llvm-$LLVM/bin" guest/build-modules "$RUNNER_TEMP/freebsd" modules
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: freebsd-15.1-arm64-virtiofs-modules
           path: modules/*.ko
