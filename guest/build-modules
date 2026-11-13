@@ -85,16 +85,21 @@ for module in fusefs vtfs virtiofs; do
   cp "$built" "$out/$module.ko"
 done
 
-# Each must be an aarch64 FreeBSD ELF. (On arm64 modules are shared objects,
-# not the relocatable objects amd64 uses.)
+# Each must be an aarch64 ELF shared object (amd64 modules are relocatable
+# instead) with FreeBSD module metadata. file(1) says SYSV, not FreeBSD:
+# modules carry no OS ABI brand.
 for module in "$out"/*.ko; do
   description="$(file -b "$module")"
   case "$description" in
-    *"ELF 64-bit LSB"*"ARM aarch64"*"(FreeBSD)"*) ;;
+    *"ELF 64-bit LSB shared object, ARM aarch64"*) ;;
     *)
-      echo "guest/build-modules: $module is not an aarch64 FreeBSD module: $description" >&2
+      echo "guest/build-modules: $module is not an aarch64 shared object: $description" >&2
       exit 1
       ;;
   esac
+  if ! "$cross_bindir/llvm-readelf" -S "$module" | grep -q set_modmetadata_set; then
+    echo "guest/build-modules: $module has no FreeBSD module metadata (set_modmetadata_set)" >&2
+    exit 1
+  fi
   printf '%s: %s\n' "$(basename "$module")" "$description"
 done
