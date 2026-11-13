@@ -11,8 +11,9 @@ FreeBSD's own arm64 VM image, through UEFI, from APFS copy-on-write clones.
 ## Status
 
 Early. The library boots and prepares FreeBSD guests, and drives them over a
-shell on their virtio console. The guest agent, the framed protocol it
-speaks, the guest bundle (virtiofs modules), and the CLI are still to come.
+shell on their virtio console. The protocol the guest agent will speak is
+done; the agent, the guest bundle (virtiofs modules), and the CLI are still
+to come.
 
 ## What a guest gets
 
@@ -32,6 +33,7 @@ speaks, the guest bundle (virtiofs modules), and the CLI are still to come.
 | Path | What |
 | --- | --- |
 | `crates/containerization-freebsd` | The library: the image, prepared bases, machines, the console. |
+| `crates/containerization-freebsd-protocol` | The protocol between the host and the guest agent: multiplexed channels in frames, over the console. No dependencies, for the agent's sake. |
 | `crates/containerization-freebsd-test` | The integration suite, which boots FreeBSD. Unpublished. |
 | `guest/virtiofs-15.1.patch` | Emil Tsalapatis's virtiofs patches (D46295, D46296, D55047), rebased onto `releng/15.1`. sha256 `65cdc3ddf16ad504619fc729ba14dfbc79b67fb84819cb69538d987841afbc1c`. |
 | `guest/virtiofs-makefile.patch` | Ours, applied after it: the virtiofs module's `SRCS` needs `vnode_if.h`. |

@@ -80,6 +80,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "containerization-freebsd-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "containerization-freebsd-test"
 version = "0.1.0"
 dependencies = [

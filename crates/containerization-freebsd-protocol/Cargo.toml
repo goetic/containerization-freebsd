@@ -1,0 +1,16 @@
+[package]
+categories.workspace = true
+description = "The framed, multiplexed protocol between containerization-freebsd and its FreeBSD guest agent."
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "containerization-freebsd-protocol"
+readme = "../../README.md"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+# No dependencies: the agent builds it for FreeBSD, a Tier 3 target.
+
+[lints.rust]
+unsafe_code = "forbid"
