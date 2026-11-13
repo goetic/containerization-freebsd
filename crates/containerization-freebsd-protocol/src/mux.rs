@@ -6,7 +6,7 @@
 use crate::frame::{Frame, MAX_PAYLOAD};
 use crate::message::{DecodeError, Message};
 use std::collections::HashMap;
-use std::fmt;
+use std::{fmt, mem};
 
 pub const CONTROL: u32 = 0;
 
@@ -32,6 +32,11 @@ impl Side {
       Self::Host => 2,
       Self::Guest => 1,
     }
+  }
+
+  /// The side's channel after `channel`: numbers wrap around, past control.
+  fn after(self, channel: u32) -> u32 {
+    channel.checked_add(2).unwrap_or(self.first_channel())
   }
 
   fn owns(self, channel: u32) -> bool {
@@ -165,6 +170,10 @@ pub struct Mux {
   side: Side,
   versions: (u16, u16),
   version: Option<u16>,
+  /// The host's Hellos the guest hasn't answered.
+  unanswered: u32,
+  /// Whether the guest owes the host's last Hello an answer.
+  answer_due: bool,
   next: u32,
   channels: HashMap<u32, Channel>,
 }
@@ -179,6 +188,8 @@ impl Mux {
       side,
       versions,
       version: None,
+      unanswered: 0,
+      answer_due: false,
       next: side.first_channel(),
       channels: HashMap::new(),
     }
@@ -194,29 +205,36 @@ impl Mux {
   }
 
   /// From the host, a Hello starts a session: the host forgets every channel,
-  /// and opens none until the guest's Hello arrives. From the guest, it
-  /// answers the host's, or announces an agent that just started.
+  /// and opens none until the guest answers. From the guest, it answers the
+  /// host's last, or if no answer is due, announces that the agent has no
+  /// session: it just started, or lost frames.
   pub fn hello(&mut self) -> Frame {
-    if self.side == Side::Host {
-      self.version = None;
-      self.channels.clear();
+    let answer = match self.side {
+      Side::Host => {
+        self.unanswered = self.unanswered.saturating_add(1);
+        false
+      }
+      Side::Guest => mem::take(&mut self.answer_due),
+    };
+    if !answer {
+      self.end_session();
     }
     let (min, max) = self.versions;
 
-    Message::Hello { min, max }.frame(CONTROL)
+    Message::Hello { min, max, answer }.frame(CONTROL)
   }
 
   /// Opens a channel with Exec or Connect from the host, or HostCommand from
   /// the guest.
   pub fn open(&mut self, message: Message) -> Result<(u32, Frame), Error> {
     self.negotiated()?;
-    let channel = self.next;
+    let channel = self.free_channel();
     let kind = Kind::of(&message)
       .filter(|_| self.side.opens(&message))
       .ok_or_else(|| not_allowed(channel, &message))?;
     let frame = sized(message.frame(channel))?;
 
-    self.next += 2;
+    self.next = self.side.after(channel);
     self.channels.insert(channel, Channel::new(kind, self.side));
     Ok((channel, frame))
   }
@@ -237,7 +255,8 @@ impl Mux {
   }
 
   /// The channel and message a frame from the other side carries, if they
-  /// may send it now. A Hello ends the session before it: every channel is
+  /// may send it now. Answer a Hello that isn't an answer itself with
+  /// [`Mux::hello`]: it ended the session before it, and every channel is
   /// forgotten.
   pub fn receive(&mut self, frame: Frame) -> Result<(u32, Message), Error> {
     let channel = frame.channel;
@@ -245,11 +264,7 @@ impl Mux {
 
     if channel == CONTROL {
       match message {
-        Message::Hello { min, max } => {
-          self.channels.clear();
-          self.version = None;
-          self.version = Some(negotiate(self.versions, (min, max)).map_err(Error::Version)?);
-        }
+        Message::Hello { min, max, answer } => self.hear_hello((min, max), answer)?,
         Message::Ping(_) | Message::Pong(_) => {}
         _ => return Err(not_allowed(channel, &message)),
       }
@@ -269,8 +284,48 @@ impl Mux {
     Ok((channel, message))
   }
 
+  fn hear_hello(&mut self, theirs: (u16, u16), answer: bool) -> Result<(), Error> {
+    match (self.side, answer) {
+      (Side::Guest, false) => {
+        self.end_session();
+        self.answer_due = true;
+      }
+      // The agent has no session; the host's next Hello starts one.
+      (Side::Host, false) => {
+        self.end_session();
+        return Ok(());
+      }
+      (Side::Host, true) if self.unanswered > 0 => self.unanswered -= 1,
+      // Such as an answer to the Hello of the host before a restore.
+      _ => {
+        return Err(Error::NotAllowed {
+          channel: CONTROL,
+          message: "hello",
+        });
+      }
+    }
+    let agreed = negotiate(self.versions, theirs);
+
+    self.version = agreed.ok();
+    agreed.map(|_| ()).map_err(Error::Version)
+  }
+
+  fn end_session(&mut self) {
+    self.version = None;
+    self.channels.clear();
+  }
+
   fn negotiated(&self) -> Result<(), Error> {
     self.version.map(|_| ()).ok_or(Error::NotNegotiated)
+  }
+
+  /// This side's first channel from `next` that isn't open.
+  fn free_channel(&self) -> u32 {
+    let mut channel = self.next;
+    while self.is_open(channel) {
+      channel = self.side.after(channel);
+    }
+    channel
   }
 
   fn step(&mut self, channel: u32, sender: Side, message: &Message) -> Result<(), Error> {
@@ -343,5 +398,31 @@ impl std::error::Error for Error {
       Self::Version(mismatch) => Some(mismatch),
       _ => None,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::message::Exec;
+
+  #[test]
+  fn wraps_channel_numbers_around_past_control_and_open_channels() {
+    let mut host = Mux::new(Side::Host);
+    let mut guest = Mux::new(Side::Guest);
+    guest.receive(host.hello()).unwrap();
+    host.receive(guest.hello()).unwrap();
+    let open = |mux: &mut Mux, message: &Message| mux.open(message.clone()).unwrap().0;
+    let exec = Message::Exec(Exec::default());
+    let command = Message::HostCommand {
+      name: "test".into(),
+      args: Vec::new(),
+    };
+
+    assert_eq!(open(&mut host, &exec), 2);
+    host.next = u32::MAX - 1;
+    guest.next = u32::MAX;
+    assert_eq!([open(&mut host, &exec), open(&mut host, &exec)], [u32::MAX - 1, 4]);
+    assert_eq!([open(&mut guest, &command), open(&mut guest, &command)], [u32::MAX, 1]);
   }
 }

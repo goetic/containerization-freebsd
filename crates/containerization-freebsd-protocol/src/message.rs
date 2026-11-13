@@ -9,10 +9,13 @@ use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-  /// The versions a side supports. Control.
+  /// The versions a side supports. Control. From the guest, `answer` tells an
+  /// answer to the host's Hello from an announcement that the agent has no
+  /// session, which the host answers by starting one.
   Hello {
     min: u16,
     max: u16,
+    answer: bool,
   },
   /// Answered with a Pong of the same number. Control.
   Ping(u64),
@@ -111,8 +114,8 @@ impl Message {
   pub fn frame(&self, channel: u32) -> Frame {
     let mut payload = Writer::default();
     let kind = match self {
-      Self::Hello { min, max } => {
-        payload.u16(*min).u16(*max);
+      Self::Hello { min, max, answer } => {
+        payload.u16(*min).u16(*max).u8(u8::from(*answer));
         kind::HELLO
       }
       Self::Ping(number) => {
@@ -205,6 +208,7 @@ impl Message {
       kind::HELLO => Self::Hello {
         min: reader.u16()?,
         max: reader.u16()?,
+        answer: reader.flag()?,
       },
       kind::PING => Self::Ping(reader.u64()?),
       kind::PONG => Self::Pong(reader.u64()?),
@@ -341,12 +345,16 @@ impl Reader<'_> {
     })
   }
 
-  fn option<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, DecodeError>) -> Result<Option<T>, DecodeError> {
+  fn flag(&mut self) -> Result<bool, DecodeError> {
     match self.u8()? {
-      0 => Ok(None),
-      1 => read(self).map(Some),
+      0 => Ok(false),
+      1 => Ok(true),
       tag => Err(DecodeError::UnknownTag(tag)),
     }
+  }
+
+  fn option<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, DecodeError>) -> Result<Option<T>, DecodeError> {
+    if self.flag()? { read(self).map(Some) } else { Ok(None) }
   }
 }
 
@@ -370,7 +378,11 @@ mod tests {
   #[test]
   fn decodes_every_message_it_encodes() {
     let messages = [
-      Message::Hello { min: 1, max: 3 },
+      Message::Hello {
+        min: 1,
+        max: 3,
+        answer: true,
+      },
       Message::Ping(7),
       Message::Pong(u64::MAX),
       Message::Exec(Exec {

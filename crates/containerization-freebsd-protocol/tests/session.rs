@@ -313,6 +313,62 @@ fn forgets_the_old_session_at_a_new_hello() {
 }
 
 #[test]
+fn starts_over_when_the_agent_announces_it_has_no_session() {
+  let (mut host, mut guest) = session();
+  let (channel, open) = host.open(exec(&["sleep", "60"], None)).unwrap();
+  deliver(&mut guest, [open]);
+
+  // The agent restarts.
+  let mut agent = Mux::new(Side::Guest);
+  let received = deliver(&mut host, [agent.hello()]);
+  assert!(matches!(
+    received[..],
+    [(CONTROL, Message::Hello { answer: false, .. })]
+  ));
+  assert_eq!((host.is_open(channel), host.version()), (false, None));
+
+  deliver(&mut agent, [host.hello()]);
+  deliver(&mut host, [agent.hello()]);
+  assert_eq!(host.version(), Some(1));
+}
+
+#[test]
+fn settles_when_the_agent_starts_as_the_host_says_hello() {
+  let mut host = Mux::new(Side::Host);
+  let mut guest = Mux::new(Side::Guest);
+  let first = host.hello();
+  let announcement = guest.hello();
+  deliver(&mut guest, [first]);
+  let answer = guest.hello();
+
+  // The host answers the announcement before the answer to its first Hello
+  // arrives, and opens a channel on that answer.
+  deliver(&mut host, [announcement]);
+  let second = host.hello();
+  deliver(&mut host, [answer]);
+  let (channel, open) = host.open(exec(&["true"], None)).unwrap();
+  deliver(&mut guest, [second]);
+  let answer = guest.hello();
+  deliver(&mut guest, [open]);
+  deliver(&mut host, [answer]);
+
+  assert!(host.is_open(channel) && guest.is_open(channel));
+}
+
+#[test]
+fn refuses_an_answer_to_another_hosts_hello() {
+  // As after a restore: the guest answers the Hello of the host that saved it.
+  let mut saved = Mux::new(Side::Host);
+  let mut guest = Mux::new(Side::Guest);
+  deliver(&mut guest, [saved.hello()]);
+  let answer = carry([guest.hello()]).remove(0);
+  let mut host = Mux::new(Side::Host);
+
+  assert_eq!(host.receive(answer).unwrap_err(), not_allowed(CONTROL, "hello"));
+  assert_eq!(host.version(), None);
+}
+
+#[test]
 fn refuses_a_payload_over_the_limit() {
   let (mut host, mut guest) = session();
   let (channel, open) = host.open(exec(&["cat"], None)).unwrap();
