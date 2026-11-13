@@ -1,20 +1,18 @@
 //! What frames carry: a message is a frame's kind and payload.
 //!
-//! Payloads are little-endian integers, and strings with a u32 length. Data,
-//! Stderr and Error are their bytes alone. A decoder ignores bytes after the
-//! fields it knows, so a later version can append fields.
+//! Payloads are little-endian integers, and strings with a u32 length, and
+//! nothing after. Data, Stderr and Error are their bytes alone.
 
 use crate::frame::Frame;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-  /// The versions a side supports. Control. From the guest, `answer` tells an
-  /// answer to the host's Hello from an announcement that the agent has no
-  /// session, which the host answers by starting one.
+  /// The version a side speaks, which must match. Control. From the guest,
+  /// `answer` tells an answer to the host's Hello from an announcement that
+  /// the agent has no session, which the host answers by starting one.
   Hello {
-    min: u16,
-    max: u16,
+    version: u16,
     answer: bool,
   },
   /// Answered with a Pong of the same number. Control.
@@ -70,6 +68,8 @@ pub enum Exit {
 pub enum DecodeError {
   UnknownKind(u8),
   Truncated,
+  /// Bytes after the message's fields.
+  TooLong,
   NotUtf8,
   UnknownTag(u8),
 }
@@ -114,8 +114,8 @@ impl Message {
   pub fn frame(&self, channel: u32) -> Frame {
     let mut payload = Writer::default();
     let kind = match self {
-      Self::Hello { min, max, answer } => {
-        payload.u16(*min).u16(*max).u8(u8::from(*answer));
+      Self::Hello { version, answer } => {
+        payload.u16(*version).u8(u8::from(*answer));
         kind::HELLO
       }
       Self::Ping(number) => {
@@ -204,10 +204,9 @@ impl Message {
 
     let mut reader = Reader(&payload);
     let reader = &mut reader;
-    Ok(match kind {
+    let message = match kind {
       kind::HELLO => Self::Hello {
-        min: reader.u16()?,
-        max: reader.u16()?,
+        version: reader.u16()?,
         answer: reader.flag()?,
       },
       kind::PING => Self::Ping(reader.u64()?),
@@ -235,7 +234,13 @@ impl Message {
         tag => return Err(DecodeError::UnknownTag(tag)),
       }),
       kind => return Err(DecodeError::UnknownKind(kind)),
-    })
+    };
+
+    if reader.0.is_empty() {
+      Ok(message)
+    } else {
+      Err(DecodeError::TooLong)
+    }
   }
 }
 
@@ -363,6 +368,7 @@ impl fmt::Display for DecodeError {
     match self {
       Self::UnknownKind(kind) => write!(formatter, "unknown message kind {kind:#04x}"),
       Self::Truncated => formatter.write_str("the payload ends early"),
+      Self::TooLong => formatter.write_str("the payload goes on after the message"),
       Self::NotUtf8 => formatter.write_str("a string is not UTF-8"),
       Self::UnknownTag(tag) => write!(formatter, "unknown tag {tag}"),
     }
@@ -379,8 +385,7 @@ mod tests {
   fn decodes_every_message_it_encodes() {
     let messages = [
       Message::Hello {
-        min: 1,
-        max: 3,
+        version: 1,
         answer: true,
       },
       Message::Ping(7),
@@ -414,7 +419,7 @@ mod tests {
   }
 
   #[test]
-  fn refuses_unknown_kinds_and_short_payloads() {
+  fn refuses_unknown_kinds_and_payloads_of_the_wrong_length() {
     let unknown = Frame {
       channel: 0,
       kind: 0x7F,
@@ -422,16 +427,11 @@ mod tests {
     };
     let mut short = Message::Connect { port: 80 }.frame(2);
     short.payload.pop();
+    let mut long = Message::Eof.frame(2);
+    long.payload.push(0);
 
     assert_eq!(Message::from_frame(unknown), Err(DecodeError::UnknownKind(0x7F)));
     assert_eq!(Message::from_frame(short), Err(DecodeError::Truncated));
-  }
-
-  #[test]
-  fn ignores_fields_a_later_version_appends() {
-    let mut frame = Message::Connect { port: 80 }.frame(2);
-    frame.payload.extend_from_slice(b"later");
-
-    assert_eq!(Message::from_frame(frame), Ok(Message::Connect { port: 80 }));
+    assert_eq!(Message::from_frame(long), Err(DecodeError::TooLong));
   }
 }

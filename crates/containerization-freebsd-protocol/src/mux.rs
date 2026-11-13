@@ -10,8 +10,8 @@ use std::{fmt, mem};
 
 pub const CONTROL: u32 = 0;
 
-/// The oldest and newest versions this crate speaks.
-pub const VERSIONS: (u16, u16) = (1, 1);
+/// The version this crate speaks, which the other side's must match.
+pub const VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -54,19 +54,8 @@ impl Side {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VersionMismatch {
-  pub ours: (u16, u16),
-  pub theirs: (u16, u16),
-}
-
-/// The newest version both ranges hold.
-pub fn negotiate(ours: (u16, u16), theirs: (u16, u16)) -> Result<u16, VersionMismatch> {
-  let newest = ours.1.min(theirs.1);
-
-  if newest >= ours.0.max(theirs.0) {
-    Ok(newest)
-  } else {
-    Err(VersionMismatch { ours, theirs })
-  }
+  pub ours: u16,
+  pub theirs: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,8 +63,8 @@ pub fn negotiate(ours: (u16, u16), theirs: (u16, u16)) -> Result<u16, VersionMis
 pub enum Error {
   Decode(DecodeError),
   Version(VersionMismatch),
-  /// Only control messages pass until both sides agree on a version.
-  NotNegotiated,
+  /// Only control messages pass until the Hellos start a session.
+  NoSession,
   /// Often a message that crossed the channel's closing in flight.
   UnknownChannel(u32),
   /// An opening message on a channel that is open already, or the other side's to open.
@@ -168,8 +157,7 @@ impl Channel {
 #[derive(Debug)]
 pub struct Mux {
   side: Side,
-  versions: (u16, u16),
-  version: Option<u16>,
+  session: bool,
   /// The host's Hellos the guest hasn't answered.
   unanswered: u32,
   /// Whether the guest owes the host's last Hello an answer.
@@ -180,14 +168,9 @@ pub struct Mux {
 
 impl Mux {
   pub fn new(side: Side) -> Self {
-    Self::with_versions(side, VERSIONS)
-  }
-
-  pub fn with_versions(side: Side, versions: (u16, u16)) -> Self {
     Self {
       side,
-      versions,
-      version: None,
+      session: false,
       unanswered: 0,
       answer_due: false,
       next: side.first_channel(),
@@ -195,9 +178,9 @@ impl Mux {
     }
   }
 
-  /// The version both sides agreed on.
-  pub fn version(&self) -> Option<u16> {
-    self.version
+  /// Whether both sides' Hellos have started a session.
+  pub fn in_session(&self) -> bool {
+    self.session
   }
 
   pub fn is_open(&self, channel: u32) -> bool {
@@ -219,15 +202,18 @@ impl Mux {
     if !answer {
       self.end_session();
     }
-    let (min, max) = self.versions;
 
-    Message::Hello { min, max, answer }.frame(CONTROL)
+    Message::Hello {
+      version: VERSION,
+      answer,
+    }
+    .frame(CONTROL)
   }
 
   /// Opens a channel with Exec or Connect from the host, or HostCommand from
   /// the guest.
   pub fn open(&mut self, message: Message) -> Result<(u32, Frame), Error> {
-    self.negotiated()?;
+    self.require_session()?;
     let channel = self.free_channel();
     let kind = Kind::of(&message)
       .filter(|_| self.side.opens(&message))
@@ -248,7 +234,7 @@ impl Mux {
       };
     }
 
-    self.negotiated()?;
+    self.require_session()?;
     let frame = sized(message.frame(channel))?;
     self.step(channel, self.side, &message)?;
     Ok(frame)
@@ -264,14 +250,14 @@ impl Mux {
 
     if channel == CONTROL {
       match message {
-        Message::Hello { min, max, answer } => self.hear_hello((min, max), answer)?,
+        Message::Hello { version, answer } => self.hear_hello(version, answer)?,
         Message::Ping(_) | Message::Pong(_) => {}
         _ => return Err(not_allowed(channel, &message)),
       }
       return Ok((channel, message));
     }
 
-    self.negotiated()?;
+    self.require_session()?;
     let peer = self.side.peer();
     match Kind::of(&message) {
       Some(_) if !peer.opens(&message) => return Err(not_allowed(channel, &message)),
@@ -284,7 +270,7 @@ impl Mux {
     Ok((channel, message))
   }
 
-  fn hear_hello(&mut self, theirs: (u16, u16), answer: bool) -> Result<(), Error> {
+  fn hear_hello(&mut self, theirs: u16, answer: bool) -> Result<(), Error> {
     match (self.side, answer) {
       (Side::Guest, false) => {
         self.end_session();
@@ -304,19 +290,22 @@ impl Mux {
         });
       }
     }
-    let agreed = negotiate(self.versions, theirs);
+    self.session = theirs == VERSION;
 
-    self.version = agreed.ok();
-    agreed.map(|_| ()).map_err(Error::Version)
+    if self.session {
+      Ok(())
+    } else {
+      Err(Error::Version(VersionMismatch { ours: VERSION, theirs }))
+    }
   }
 
   fn end_session(&mut self) {
-    self.version = None;
+    self.session = false;
     self.channels.clear();
   }
 
-  fn negotiated(&self) -> Result<(), Error> {
-    self.version.map(|_| ()).ok_or(Error::NotNegotiated)
+  fn require_session(&self) -> Result<(), Error> {
+    if self.session { Ok(()) } else { Err(Error::NoSession) }
   }
 
   /// This side's first channel from `next` that isn't open.
@@ -363,8 +352,8 @@ impl fmt::Display for VersionMismatch {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(
       formatter,
-      "no protocol version in common: ours are {}..={}, theirs {}..={}",
-      self.ours.0, self.ours.1, self.theirs.0, self.theirs.1
+      "the other side speaks protocol version {}, not {}",
+      self.theirs, self.ours
     )
   }
 }
@@ -376,7 +365,7 @@ impl fmt::Display for Error {
     match self {
       Self::Decode(error) => write!(formatter, "undecodable message: {error}"),
       Self::Version(mismatch) => write!(formatter, "{mismatch}"),
-      Self::NotNegotiated => formatter.write_str("no protocol version agreed yet"),
+      Self::NoSession => formatter.write_str("no session yet"),
       Self::UnknownChannel(channel) => write!(formatter, "channel {channel} is not open"),
       Self::BadChannel(channel) => write!(
         formatter,

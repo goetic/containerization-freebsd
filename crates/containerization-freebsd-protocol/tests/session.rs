@@ -2,7 +2,7 @@
 //! as the console carries them.
 
 use containerization_freebsd_protocol::{
-  CONTROL, Decoder, Error, Exec, Exit, Frame, MAX_PAYLOAD, Message, Mux, Side, VersionMismatch, WindowSize,
+  CONTROL, Decoder, Error, Exec, Exit, Frame, MAX_PAYLOAD, Message, Mux, Side, VERSION, VersionMismatch, WindowSize,
 };
 
 const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
@@ -51,44 +51,31 @@ fn not_allowed(channel: u32, message: &'static str) -> Error {
 }
 
 #[test]
-fn agrees_on_the_newest_version_both_support() {
-  let mut host = Mux::with_versions(Side::Host, (1, 3));
-  let mut guest = Mux::with_versions(Side::Guest, (2, 5));
+fn opens_nothing_when_the_versions_differ() {
+  let mut host = Mux::new(Side::Host);
+  let mut guest = Mux::new(Side::Guest);
+  let newer = |answer| {
+    Message::Hello {
+      version: VERSION + 1,
+      answer,
+    }
+    .frame(CONTROL)
+  };
+  let mismatch = Error::Version(VersionMismatch {
+    ours: VERSION,
+    theirs: VERSION + 1,
+  });
 
-  deliver(&mut guest, [host.hello()]);
-  deliver(&mut host, [guest.hello()]);
+  host.hello();
+  assert_eq!(host.receive(newer(true)).unwrap_err(), mismatch);
+  assert_eq!(guest.receive(newer(false)).unwrap_err(), mismatch);
 
-  assert_eq!((host.version(), guest.version()), (Some(3), Some(3)));
-}
-
-#[test]
-fn opens_nothing_when_no_version_is_common() {
-  let mut host = Mux::with_versions(Side::Host, (1, 1));
-  let mut guest = Mux::with_versions(Side::Guest, (2, 2));
-
-  let hello = carry([host.hello()]).remove(0);
-  assert_eq!(
-    guest.receive(hello),
-    Err(Error::Version(VersionMismatch {
-      ours: (2, 2),
-      theirs: (1, 1)
-    }))
-  );
-  let hello = carry([guest.hello()]).remove(0);
-  assert_eq!(
-    host.receive(hello),
-    Err(Error::Version(VersionMismatch {
-      ours: (1, 1),
-      theirs: (2, 2)
-    }))
-  );
-
-  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NotNegotiated);
+  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NoSession);
   let request = Message::HostCommand {
     name: "test".into(),
     args: Vec::new(),
   };
-  assert_eq!(guest.open(request).unwrap_err(), Error::NotNegotiated);
+  assert_eq!(guest.open(request).unwrap_err(), Error::NoSession);
 }
 
 #[test]
@@ -96,10 +83,10 @@ fn passes_only_control_messages_before_the_hellos() {
   let mut host = Mux::new(Side::Host);
   let mut guest = Mux::new(Side::Guest);
 
-  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NotNegotiated);
+  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NoSession);
   assert_eq!(
     guest.receive(exec(&["true"], None).frame(2)).unwrap_err(),
-    Error::NotNegotiated
+    Error::NoSession
   );
   // A ping finds out whether the agent is there at all.
   let ping = host.send(CONTROL, Message::Ping(1)).unwrap();
@@ -298,12 +285,12 @@ fn forgets_the_old_session_at_a_new_hello() {
 
   let hello = host.hello();
   assert!(!host.is_open(channel));
-  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NotNegotiated);
+  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NoSession);
   deliver(&mut guest, [hello]);
   assert!(!guest.is_open(channel));
   deliver(&mut host, [guest.hello()]);
 
-  assert_eq!(host.version(), Some(1));
+  assert!(host.in_session());
   assert_eq!(
     host
       .receive(Message::Data(b"late".to_vec()).frame(channel))
@@ -325,11 +312,11 @@ fn starts_over_when_the_agent_announces_it_has_no_session() {
     received[..],
     [(CONTROL, Message::Hello { answer: false, .. })]
   ));
-  assert_eq!((host.is_open(channel), host.version()), (false, None));
+  assert!(!host.is_open(channel) && !host.in_session());
 
   deliver(&mut agent, [host.hello()]);
   deliver(&mut host, [agent.hello()]);
-  assert_eq!(host.version(), Some(1));
+  assert!(host.in_session());
 }
 
 #[test]
@@ -365,7 +352,7 @@ fn refuses_an_answer_to_another_hosts_hello() {
   let mut host = Mux::new(Side::Host);
 
   assert_eq!(host.receive(answer).unwrap_err(), not_allowed(CONTROL, "hello"));
-  assert_eq!(host.version(), None);
+  assert!(!host.in_session());
 }
 
 #[test]
