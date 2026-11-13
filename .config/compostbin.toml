@@ -54,4 +54,6 @@ packages = [
 # that -Zbuild-std builds FreeBSD's std from.
 run = [
     "curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1 --component rust-src",
+    # rustup adds itself to ~/.profile only, which non-login shells skip.
+    """echo '. "$HOME/.cargo/env"' >> ~/.bashrc""",
 ]
