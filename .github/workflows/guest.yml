@@ -1,0 +1,48 @@
+# Builds the guest bundle's virtiofs modules for FreeBSD 15.1 arm64, on a
+# Linux arm64 runner, through guest/build-modules.
+#
+# Releases come later: a bundle also carries the agent and its rc.d script,
+# and a release is never overwritten, so none is cut without them.
+
+name: guest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "guest/**"
+      - ".github/workflows/guest.yml"
+  pull_request:
+    paths:
+      - "guest/**"
+      - ".github/workflows/guest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  modules:
+    name: virtiofs modules (15.1, arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same packages as [image] in .config/compostbin.toml.
+      - name: Install the build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang-19 file libarchive-dev libbz2-dev lld-19 llvm-19 python3
+
+      - name: Build
+        env:
+          CROSS_BINDIR: /usr/lib/llvm-19/bin
+        run: guest/build-modules "$RUNNER_TEMP/freebsd" modules
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-15.1-arm64-virtiofs-modules
+          path: modules/*.ko
+          if-no-files-found: error

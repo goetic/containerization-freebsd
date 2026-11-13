@@ -1,0 +1,97 @@
+#!/usr/bin/env sh
+#
+# Builds the virtiofs modules (fusefs.ko, vtfs.ko, virtiofs.ko) for FreeBSD
+# 15.1 arm64, from a non-FreeBSD host: FreeBSD's source at the commit the
+# patches were rebased onto, plus guest/virtiofs-15.1.patch, plus
+# guest/virtiofs-makefile.patch.
+#
+#   guest/build-modules <work-dir> <out-dir>
+#
+# The source and objects go in <work-dir>, the three modules in <out-dir>.
+#
+# FreeBSD's own tools/build/make.py drives the build: it bootstraps bmake,
+# which Linux and macOS lack, and points the build at the host's LLVM. It is
+# Python from FreeBSD's tree, not this repository. CROSS_BINDIR names the
+# directory holding clang and ld.lld, as make.py's --cross-bindir takes it;
+# the same LLVM builds the host tools.
+
+set -eu
+
+work="${1:?usage: guest/build-modules <work-dir> <out-dir>}"
+out="${2:?usage: guest/build-modules <work-dir> <out-dir>}"
+cross_bindir="${CROSS_BINDIR:?set CROSS_BINDIR to the directory holding clang and ld.lld}"
+
+# releng/15.1 at 15.1.0-p6, where the patches apply.
+repository=https://github.com/freebsd/freebsd-src
+commit=95719d8a895bf8170851e9844d9b4092b1d2b6fe
+patch_sha256=65cdc3ddf16ad504619fc729ba14dfbc79b67fb84819cb69538d987841afbc1c
+
+guest="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$work" "$out"
+work="$(cd "$work" && pwd)"
+out="$(cd "$out" && pwd)"
+src="$work/src"
+obj="$work/obj"
+
+sha256() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+actual="$(sha256 "$guest/virtiofs-15.1.patch")"
+if [ "$actual" != "$patch_sha256" ]; then
+  echo "guest/build-modules: virtiofs-15.1.patch has sha256 $actual, not $patch_sha256" >&2
+  exit 1
+fi
+
+# One commit, shallow: the full history is gigabytes.
+if [ ! -d "$src/.git" ]; then
+  git init --quiet "$src"
+  git -C "$src" remote add origin "$repository"
+fi
+git -C "$src" fetch --quiet --depth 1 origin "$commit"
+git -C "$src" checkout --quiet --force FETCH_HEAD
+git -C "$src" clean --quiet -fdx
+git -C "$src" apply "$guest/virtiofs-15.1.patch"
+git -C "$src" apply "$guest/virtiofs-makefile.patch"
+
+jobs="$(getconf _NPROCESSORS_ONLN)"
+modules="fusefs virtio/fs virtiofs"
+
+cd "$src"
+for target in kernel-toolchain buildkernel; do
+  MAKEOBJDIRPREFIX="$obj" ./tools/build/make.py \
+    --cross-bindir="$cross_bindir" \
+    --host-bindir="$cross_bindir" --host-compiler-type=clang \
+    -j"$jobs" \
+    TARGET=arm64 TARGET_ARCH=aarch64 \
+    KERNCONF=GENERIC MODULES_OVERRIDE="$modules" \
+    "$target"
+done
+
+for module in fusefs vtfs virtiofs; do
+  built="$(find "$obj" -path '*/sys/GENERIC/modules/*' -name "$module.ko" -type f)"
+  if [ "$(printf '%s\n' "$built" | grep -c .)" -ne 1 ]; then
+    echo "guest/build-modules: expected one $module.ko under $obj, found:" >&2
+    printf '%s\n' "$built" >&2
+    exit 1
+  fi
+  cp "$built" "$out/$module.ko"
+done
+
+# Each must be an aarch64 FreeBSD ELF. (On arm64 modules are shared objects,
+# not the relocatable objects amd64 uses.)
+for module in "$out"/*.ko; do
+  description="$(file -b "$module")"
+  case "$description" in
+    *"ELF 64-bit LSB"*"ARM aarch64"*"(FreeBSD)"*) ;;
+    *)
+      echo "guest/build-modules: $module is not an aarch64 FreeBSD module: $description" >&2
+      exit 1
+      ;;
+  esac
+  printf '%s: %s\n' "$(basename "$module")" "$description"
+done

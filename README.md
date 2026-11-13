@@ -38,6 +38,7 @@ to come.
 | `guest/virtiofs-15.1.patch` | Emil Tsalapatis's virtiofs patches (D46295, D46296, D55047), rebased onto `releng/15.1`. sha256 `65cdc3ddf16ad504619fc729ba14dfbc79b67fb84819cb69538d987841afbc1c`. |
 | `guest/virtiofs-makefile.patch` | Ours, applied after it: the virtiofs module's `SRCS` needs `vnode_if.h`. |
 | `guest/first-boot.sh` | The seed volume's user-data, run once by nuageinit. |
+| `guest/build-modules` | Builds the three modules from a Linux or macOS host, through FreeBSD's `tools/build/make.py`. CI (`.github/workflows/guest.yml`) runs it on Linux arm64. |
 
 ## Development
 
