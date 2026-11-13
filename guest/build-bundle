@@ -1,0 +1,50 @@
+#!/usr/bin/env sh
+#
+# Packages the guest bundle: the tree in guest/bundle, plus the virtiofs
+# modules and the agent that guest/build-modules and guest/build-agent build.
+#
+#   guest/build-bundle <modules-dir> <agent> <revision> <out-dir>
+#
+# Writes freebsd-15.1-arm64-guest-<revision>.tar.xz and its .sha256 to
+# <out-dir>. The tarball's paths are the guest's, so `tar -xf <it> -C /`
+# installs it. Its bytes depend only on its contents: names sorted, owners
+# root, times zero. Needs GNU tar.
+
+set -eu
+
+modules="${1:?usage: guest/build-bundle <modules-dir> <agent> <revision> <out-dir>}"
+agent="${2:?usage: guest/build-bundle <modules-dir> <agent> <revision> <out-dir>}"
+revision="${3:?usage: guest/build-bundle <modules-dir> <agent> <revision> <out-dir>}"
+out="${4:?usage: guest/build-bundle <modules-dir> <agent> <revision> <out-dir>}"
+
+guest="$(cd "$(dirname "$0")" && pwd)"
+name="freebsd-15.1-arm64-guest-$revision"
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+staging="$(mktemp -d)"
+trap 'rm -rf "$staging"' EXIT
+
+cp -R "$guest/bundle/." "$staging/"
+mkdir -p "$staging/boot/modules" "$staging/usr/local/sbin"
+for module in fusefs vtfs virtiofs; do
+  install -m 0555 "$modules/$module.ko" "$staging/boot/modules/$module.ko"
+done
+install -m 0555 "$agent" "$staging/usr/local/sbin/containerization-freebsd-agent"
+chmod 0555 "$staging/usr/local/etc/rc.d/cfbsd_agent"
+chmod 0444 "$staging/boot/loader.conf.d/containerization-freebsd.conf"
+
+# Files only: extracting a directory entry over /usr or /boot would reset its
+# mode and times. tar creates any missing parents.
+(cd "$staging" && find boot usr -type f | LC_ALL=C sort) >"$staging.list"
+tar -C "$staging" --no-recursion --owner=0 --group=0 --numeric-owner --mtime=@0 -T "$staging.list" -cf - |
+  xz -9 -T1 >"$out/$name.tar.xz"
+rm "$staging.list"
+
+cd "$out"
+if command -v sha256sum >/dev/null; then
+  sha256sum "$name.tar.xz" >"$name.tar.xz.sha256"
+else
+  shasum -a 256 "$name.tar.xz" >"$name.tar.xz.sha256"
+fi
+tar -tvJf "$name.tar.xz"
+cat "$name.tar.xz.sha256"

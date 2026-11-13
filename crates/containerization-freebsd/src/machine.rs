@@ -1,7 +1,7 @@
 //! A FreeBSD guest's virtual machine: the devices it gets, and the calls that
 //! drive it.
 
-use crate::console::{self, Console};
+use crate::agent::Agent;
 use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]
 use crate::memory::Memory;
@@ -50,7 +50,7 @@ pub struct Layout {
 }
 
 pub struct Machine {
-  pub console: Console,
+  pub agent: Agent,
   #[cfg_attr(not(feature = "kernel-messages"), allow(dead_code))]
   debug: DebugDevices,
   machine: VirtualMachine,
@@ -220,7 +220,7 @@ impl Layout {
     })?;
 
     Ok(Machine {
-      console: Console::new(output, input),
+      agent: Agent::new(output, input),
       debug,
       machine,
       queue,
@@ -307,13 +307,16 @@ impl Machine {
   }
 
   /// Restores a state `save` wrote, into a machine of the same layout that
-  /// has not started. It is left paused.
+  /// has not started. It is left paused; once resumed, its agent answers
+  /// this machine's Hello, already sent.
   pub fn restore(&self, path: &Path) -> Result<f64> {
     let url = url(path)?;
 
-    self.completed("restore the machine's state", |machine, done| {
+    let seconds = self.completed("restore the machine's state", |machine, done| {
       machine.restore_machine_state_from(&url, done)
-    })
+    })?;
+    self.agent.rejoin()?;
+    Ok(seconds)
   }
 
   pub fn state(&self) -> VirtualMachineState {
@@ -322,31 +325,17 @@ impl Machine {
     on_queue(&self.queue, || machine.state())
   }
 
-  /// Waits for the guest's console to start, and returns the seconds since
-  /// its kernel booted that the guest reports.
-  pub fn wait_ready(&self, timeout: Duration) -> Result<u64> {
-    let line = self
-      .console
-      .wait_for(console::READY, timeout)
-      .ok_or_else(|| {
-        Error::Timeout(format!(
-          "the guest's console did not start within {}s",
-          timeout.as_secs()
-        ))
-      })?;
+  /// Waits for a session with the guest's agent; returns the seconds it took.
+  pub fn wait_ready(&self, timeout: Duration) -> Result<f64> {
+    let started = Instant::now();
 
-    Ok(
-      line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|seconds| seconds.parse().ok())
-        .unwrap_or_default(),
-    )
+    self.agent.wait_ready(timeout)?;
+    Ok(started.elapsed().as_secs_f64())
   }
 
   /// Asks the guest to power off, and waits for it to.
-  pub fn shut_down(&mut self, timeout: Duration) -> Result<f64> {
-    self.console.send("shutdown -p now")?;
+  pub fn shut_down(&self, timeout: Duration) -> Result<f64> {
+    self.agent.launch(&["shutdown", "-p", "now"])?;
     self.wait_stopped(timeout)
   }
 

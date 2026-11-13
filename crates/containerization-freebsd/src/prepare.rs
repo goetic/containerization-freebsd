@@ -1,7 +1,6 @@
 //! A guest's first boot from FreeBSD's VM image: what makes a base that
 //! later machines clone or restore.
 
-use crate::console;
 use crate::error::{Error, Result};
 use crate::image;
 use crate::machine::{LOADER_ENV, Layout};
@@ -10,7 +9,10 @@ use std::time::Duration;
 
 /// The seed volume's user-data, which nuageinit runs on the first boot.
 const FIRST_BOOT: &str = include_str!("../../../guest/first-boot.sh");
-const FIRST_BOOT_DONE: &str = "firstboot-done";
+/// The guest bundle's name on the seed volume, where `FIRST_BOOT` finds it.
+const BUNDLE: &str = "bundle.tar.xz";
+/// A first boot that upgrades reboots once, and the agent starts again.
+const BOOTS: usize = 3;
 
 /// What a guest's first boot brings up to date.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,10 +26,10 @@ pub enum Upgrade {
 }
 
 /// Clones `base` into `directory` as a disk of `size` bytes, boots it once
-/// with a seed volume that installs the console, waits for the first boot to
-/// finish, and powers it off. The layout boots the prepared disk again; it
-/// has no seed or network.
-pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade) -> Result<Layout> {
+/// with a seed volume that installs `bundle` (the guest bundle: the agent and
+/// the virtiofs modules), waits for the first boot to finish, and powers it
+/// off. The layout boots the prepared disk again; it has no seed or network.
+pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundle: &Path) -> Result<Layout> {
   std::fs::create_dir_all(directory).map_err(Error::io(format!("making {}", directory.display())))?;
 
   let disk = directory.join("disk.raw");
@@ -36,26 +38,15 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade) -> Re
 
   let iso = directory.join("seed.iso");
   let staging = directory.join("seed");
-  seed(directory, &staging, &iso)?;
+  seed(directory, &staging, &iso, bundle)?;
 
   let mut layout = Layout::first(directory, disk)?;
   layout.nat = upgrade == Upgrade::Latest;
   layout.seed = Some(iso.clone());
 
-  let mut machine = layout.machine("containerization-freebsd-prepare")?;
+  let machine = layout.machine("containerization-freebsd-prepare")?;
   machine.start()?;
-  machine.wait_ready(Duration::from_secs(600))?;
-
-  // rc deletes /firstboot only when it finishes, after rc.local starts the
-  // console, and reboots then if the package upgrade installed anything.
-  // Powered off sooner, the next boot is a first boot again.
-  machine.console.send(&format!(
-    "while [ -e /firstboot ]; do sleep 1; done; echo {FIRST_BOOT_DONE}"
-  ))?;
-  machine
-    .console
-    .wait_for_any(&[FIRST_BOOT_DONE, console::READY], Duration::from_secs(900))
-    .ok_or_else(|| Error::Timeout("the first boot's rc did not finish within 900s".to_string()))?;
+  wait_first_boot(&machine)?;
   machine.shut_down(Duration::from_secs(120))?;
   drop(machine);
 
@@ -67,7 +58,28 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade) -> Re
   Ok(layout)
 }
 
-fn seed(directory: &Path, staging: &Path, iso: &Path) -> Result<()> {
+/// Waits for rc to delete /firstboot, which it does only when it finishes,
+/// after the seed's script starts the agent, and then reboots if the package
+/// upgrade installed anything. Powered off sooner, the next boot is a first
+/// boot again.
+fn wait_first_boot(machine: &crate::Machine) -> Result<()> {
+  let wait = ["sh", "-c", "while [ -e /firstboot ]; do sleep 1; done"];
+
+  for _ in 0..BOOTS {
+    machine.wait_ready(Duration::from_secs(600))?;
+    match machine.agent.check(&wait, Duration::from_secs(900)) {
+      Ok(_) => return Ok(()),
+      // The upgrade's reboot.
+      Err(Error::SessionEnded(_)) => {}
+      Err(error) => return Err(error),
+    }
+  }
+  Err(Error::Guest(format!(
+    "the first boot did not finish within {BOOTS} boots"
+  )))
+}
+
+fn seed(directory: &Path, staging: &Path, iso: &Path, bundle: &Path) -> Result<()> {
   let meta = directory.join("meta-data");
   let user = directory.join("user-data");
   let instance = std::time::SystemTime::now()
@@ -81,7 +93,11 @@ fn seed(directory: &Path, staging: &Path, iso: &Path) -> Result<()> {
   .map_err(Error::io("writing meta-data"))?;
   std::fs::write(&user, FIRST_BOOT).map_err(Error::io("writing user-data"))?;
 
-  let result = image::seed(staging, iso, &[("meta-data", &meta), ("user-data", &user)]);
+  let result = image::seed(
+    staging,
+    iso,
+    &[("meta-data", &meta), ("user-data", &user), (BUNDLE, bundle)],
+  );
   let _ = std::fs::remove_file(&meta);
   let _ = std::fs::remove_file(&user);
   result

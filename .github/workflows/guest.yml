@@ -1,15 +1,18 @@
 # Builds the guest bundle for FreeBSD 15.1 arm64 on Linux arm64 runners: the
 # virtiofs modules through guest/build-modules, the agent through
-# guest/build-agent.
+# guest/build-agent, and the bundle of both through guest/build-bundle.
 #
-# Releases come later: a bundle also carries the agent's rc.d script, and a
-# release is never overwritten, so none is cut without it.
+# Pushing a tag guest-15.1-r<N> publishes that bundle as a GitHub
+# pre-release, replacing any earlier one. Releases are never overwritten: a
+# tag that already has one fails. Once the integration suite has booted it,
+# promote it by hand (`gh release edit <tag> --prerelease=false`).
 
 name: guest
 
 on:
   push:
     branches: [main]
+    tags: ["guest-15.1-r*"]
     paths: &inputs
       - "guest/**"
       - "crates/containerization-freebsd-agent/**"
@@ -94,3 +97,62 @@ jobs:
           name: freebsd-15.1-arm64-agent
           path: agent/containerization-freebsd-agent
           if-no-files-found: error
+
+  bundle:
+    name: bundle (15.1, arm64)
+    needs: [modules, agent]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: freebsd-15.1-arm64-virtiofs-modules
+          path: modules
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: freebsd-15.1-arm64-agent
+          path: agent
+
+      # r<N> from a release tag; otherwise the commit, for bundles that are
+      # never released.
+      - name: Package
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/guest-15.1-r*) revision="${GITHUB_REF_NAME#guest-15.1-}" ;;
+            *) revision="$(git rev-parse --short HEAD)" ;;
+          esac
+          guest/build-bundle modules agent/containerization-freebsd-agent "$revision" bundle
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-15.1-arm64-guest
+          path: bundle/*
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/guest-15.1-r')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" bundle/* --prerelease \
+            --title "Guest bundle $GITHUB_REF_NAME" \
+            --notes "The virtiofs modules and the guest agent for FreeBSD 15.1 arm64, built from $GITHUB_SHA."
+
+      # One pre-release at a time: the new one replaces the others. Their
+      # tags stay; promoted releases are never touched.
+      - name: Delete older pre-releases
+        if: startsWith(github.ref, 'refs/tags/guest-15.1-r')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName' |
+            { grep '^guest-' || true; } |
+            while read -r tag; do
+              [ "$tag" = "$GITHUB_REF_NAME" ] || gh release delete "$tag" --yes
+            done

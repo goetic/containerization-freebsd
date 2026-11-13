@@ -21,6 +21,9 @@ pub enum Error {
     action: String,
     error: std::io::Error,
   },
+  /// The guest agent's session ended (as when the guest reboots) while what
+  /// the message names was waiting on it.
+  SessionEnded(String),
   Timeout(String),
   Virtualization {
     action: String,
@@ -52,6 +55,7 @@ impl fmt::Display for Error {
       }
       Self::Guest(message) | Self::Timeout(message) => formatter.write_str(message),
       Self::Io { action, error } => write!(formatter, "{action}: {error}"),
+      Self::SessionEnded(what) => write!(formatter, "the guest agent's session ended while {what}"),
       Self::Virtualization { action, error } => write!(formatter, "{action}: {error}"),
     }
   }
@@ -62,7 +66,7 @@ impl std::error::Error for Error {
     match self {
       Self::Io { error, .. } => Some(error),
       Self::Virtualization { error, .. } => Some(error),
-      Self::Command { .. } | Self::Checksum { .. } | Self::Guest(_) | Self::Timeout(_) => None,
+      Self::Command { .. } | Self::Checksum { .. } | Self::Guest(_) | Self::SessionEnded(_) | Self::Timeout(_) => None,
     }
   }
 }

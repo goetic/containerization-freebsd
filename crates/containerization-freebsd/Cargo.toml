@@ -11,12 +11,14 @@ rust-version.workspace = true
 version = "0.1.0"
 
 [dependencies]
+containerization-freebsd-protocol.workspace = true
 dispatch2.workspace = true
 url.workspace = true
 virtualization.workspace = true
 xz2.workspace = true
 
 [dev-dependencies]
+containerization-freebsd-agent = { path = "../containerization-freebsd-agent" }
 tempfile = "3"
 
 [features]

@@ -10,6 +10,11 @@ pub const RELEASE: &str = "15.1-RELEASE";
 pub const IMAGE: &str = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.raw.xz";
 /// The decompressed image's name in the cache `base_disk` keeps.
 pub const BASE_DISK: &str = "base.raw";
+/// The guest bundle for `RELEASE`: the agent and the virtiofs modules, as
+/// this repository's CI publishes them.
+pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r1.tar.xz";
+const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r1/freebsd-15.1-arm64-guest-r1.tar.xz";
+const BUNDLE_SHA256: &str = "";
 
 fn run(command: &mut Command) -> Result<String> {
   let description = format!("{command:?}");
@@ -107,6 +112,18 @@ fn base_disk_from(directory: &str, cache: &Path) -> Result<PathBuf> {
   std::fs::rename(&partial, &raw).map_err(Error::io("moving the base disk into place"))?;
 
   Ok(raw)
+}
+
+/// The guest bundle in `cache`, downloaded and verified once.
+pub fn bundle(cache: &Path) -> Result<PathBuf> {
+  let path = cache.join(BUNDLE);
+
+  if !path.exists() {
+    std::fs::create_dir_all(cache).map_err(Error::io(format!("making {}", cache.display())))?;
+    fetch(BUNDLE_URL, &path)?;
+    verify(&path, BUNDLE_SHA256)?;
+  }
+  Ok(path)
 }
 
 /// The sha256 a `CHECKSUM.SHA256` lists for `name`: `SHA256 (name) = …`.
