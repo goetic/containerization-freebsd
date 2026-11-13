@@ -54,7 +54,9 @@ if [ ! -e "$sysroot/.complete" ]; then
   touch "$sysroot/.complete"
 fi
 
-linker="$work/link"
+# rustc picks the linker's argument style from its name: one ending in -clang
+# gets a C compiler's (-Wl,--as-needed); one named link gets ld's.
+linker="$work/$target-clang"
 cat >"$linker" <<EOF
 #!/bin/sh
 exec "$cross_bindir/clang" --target=$target --sysroot="$sysroot" -fuse-ld=lld "\$@"
