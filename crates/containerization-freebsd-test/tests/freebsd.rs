@@ -63,12 +63,44 @@ fn prepares_boots_and_restores() {
     assert!(ran.stdout.contains(module), "{module} is not loaded: {ran:?}");
   }
 
-  // A clean base: saved before any share is mounted.
+  cold
+    .mount_share("shared", "/mnt/shared")
+    .expect("mount the share");
+  let ran = cold
+    .agent
+    .check(
+      &sh("cat /mnt/shared/from-host && echo written in the guest > /mnt/shared/from-guest"),
+      SECONDS,
+    )
+    .expect("use the share");
+  assert_eq!(ran.lines(), ["written on the host"]);
+  assert_eq!(
+    std::fs::read_to_string(shared.join("from-guest")).expect("read the guest's file"),
+    "written in the guest\n"
+  );
+
+  // Saving unmounts the share, which it can't while the share is in use.
   let state = work.join("state.vzvmsave");
+  cold
+    .agent
+    .check(
+      &sh("(cd /mnt/shared && touch /tmp/busy && exec sleep 30) >/dev/null 2>&1 & while [ ! -e /tmp/busy ]; do sleep 0.1; done"),
+      SECONDS,
+    )
+    .expect("use the share in the background");
+  cold.save(&state).expect_err("save with the share in use");
+  cold
+    .agent
+    .check(
+      &sh("pkill -x sleep; while pgrep -x sleep >/dev/null; do sleep 0.1; done"),
+      SECONDS,
+    )
+    .expect("stop using the share");
   cold.save(&state).expect("save");
   cold.stop().expect("stop");
   drop(cold);
 
+  // Mounting it again is a second mount in the guest's boot.
   let restored = layout.machine("restored").expect("make the machine");
   restored.restore(&state).expect("restore");
   restored.resume().expect("resume");
@@ -77,22 +109,15 @@ fn prepares_boots_and_restores() {
     .expect("the agent answers after restoring");
   restored
     .mount_share("shared", "/mnt/shared")
-    .expect("mount the share");
+    .expect("mount the share again");
   let ran = restored
     .agent
     .check(
-      &sh("echo restored; cat /mnt/shared/from-host && echo written in the guest > /mnt/shared/from-guest"),
+      &sh("echo restored; cat /mnt/shared/from-host /mnt/shared/from-guest"),
       SECONDS,
     )
     .expect("use the share after restoring");
-  assert_eq!(ran.lines(), ["restored", "written on the host"]);
-  assert_eq!(
-    std::fs::read_to_string(shared.join("from-guest")).expect("read the guest's file"),
-    "written in the guest\n"
-  );
-  restored
-    .save(&work.join("mounted.vzvmsave"))
-    .expect_err("save with a share mounted");
+  assert_eq!(ran.lines(), ["restored", "written on the host", "written in the guest"]);
 
   let terminal = restored
     .agent

@@ -10,8 +10,10 @@
   guest's TCP ports.
 - Preparing a base installs the guest bundle: the agent, and the virtiofs
   modules, loaded at every boot.
-- Mounts shared host directories in the guest. Saving refuses while one is
-  mounted, so save bases first and mount shares after restoring.
+- Mounts shared host directories in the guest. Saving unmounts them, and
+  fails if one is in use; mount them again after restoring.
+- Fixes a second mount of a share in one boot hanging, with a patch of our
+  own to the virtiofs modules.
 - Preparing a base can skip the first boot's online upgrade, taking seconds
   instead of minutes.
 - A protocol for the coming guest agent: commands, terminals, port relays and

@@ -41,6 +41,7 @@ name = "cfbsd"
 # (CROSS_BINDIR=/usr/lib/llvm-19/bin).
 [image]
 packages = [
+    "bc",
     "build-essential",
     "clang-19",
     "file",

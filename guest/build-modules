@@ -2,8 +2,8 @@
 #
 # Builds the virtiofs modules (fusefs.ko, vtfs.ko, virtiofs.ko) for FreeBSD
 # 15.1 arm64, from a non-FreeBSD host: FreeBSD's source at the commit the
-# patches were rebased onto, plus guest/virtiofs-15.1.patch, plus
-# guest/virtiofs-makefile.patch.
+# patches were rebased onto, plus guest/virtiofs-15.1.patch, then our
+# guest/virtiofs-makefile.patch and guest/virtiofs-remount.patch.
 #
 #   guest/build-modules <work-dir> <out-dir>
 #
@@ -60,6 +60,7 @@ git -C "$src" clean --quiet -fdx
 # Upstream's patch has trailing whitespace, which is not ours to fix.
 git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-15.1.patch"
 git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-makefile.patch"
+git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-remount.patch"
 
 jobs="$(getconf _NPROCESSORS_ONLN)"
 modules="fusefs virtio/fs virtiofs"

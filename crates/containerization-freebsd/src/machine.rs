@@ -297,27 +297,20 @@ impl Machine {
     })
   }
 
-  /// Pauses the running machine and saves its state to `path`, leaving it
-  /// paused. Fails if the guest has a share mounted, so save bases first and
-  /// mount shares after restoring.
+  /// Unmounts the guest's shares, pauses the running machine, and saves its
+  /// state to `path`, leaving it paused. Fails if a share is in use. Mount
+  /// shares again after restoring.
   ///
-  /// A share mounted across a save goes stale: the host's virtio-fs server
-  /// restarts with the restored machine, forgetting the files the guest
-  /// cached, so each fails once. Nor can it be unmounted first: FreeBSD's
-  /// virtiofs hangs on a second mount of a share in the same boot.
+  /// A share mounted across a save would go stale: the host's virtio-fs
+  /// server restarts with the restored machine, forgetting the files the
+  /// guest cached, so each would fail once.
   pub fn save(&self, path: &Path) -> Result<f64> {
     let started = Instant::now();
     let url = url(path)?;
 
-    let mounted = self
+    self
       .agent
-      .check(&["mount", "-t", "virtiofs"], Duration::from_secs(60))?;
-    if !mounted.stdout.trim().is_empty() {
-      return Err(Error::Guest(format!(
-        "the guest has shares mounted, which a restore would leave stale: {}",
-        mounted.stdout.trim()
-      )));
-    }
+      .check(&["umount", "-A", "-t", "virtiofs"], Duration::from_secs(60))?;
     self.pause()?;
     self.completed("save the machine's state", |machine, done| {
       machine.save_machine_state_to(&url, done)

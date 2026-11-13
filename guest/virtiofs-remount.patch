@@ -1,0 +1,20 @@
+Applied after virtiofs-makefile.patch. Unmounting tears the session down
+through vtfs_drain, which turns the device's virtqueue interrupts off, and
+nothing turned them on again. A second mount of the share in the same boot
+then had its requests answered but never completed: mount succeeded, since
+it sends FUSE_INIT without waiting, and the first file operation hung.
+Registering a session's callbacks, which every mount does, turns them back
+on; the queues are empty then, as the teardown drained them.
+
+diff --git a/sys/dev/virtio/fs/virtio_fs.c b/sys/dev/virtio/fs/virtio_fs.c
+--- a/sys/dev/virtio/fs/virtio_fs.c
++++ b/sys/dev/virtio/fs/virtio_fs.c
+@@ -531,6 +531,8 @@ vtfs_register_cb(struct vtfs_softc *sc, vtfs_fuse_cb forget_cb,
+ 			fsq->vtfsq_cb = forget_cb;
+ 		else
+ 			fsq->vtfsq_cb = regular_cb;
++		/* A previous session's teardown (vtfs_drain) turned them off. */
++		virtqueue_enable_intr(fsq->vtfsq_vq);
+ 		FSQ_UNLOCK(fsq);
+ 	}
+ }
