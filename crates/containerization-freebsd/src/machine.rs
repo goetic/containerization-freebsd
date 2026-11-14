@@ -26,6 +26,10 @@ use virtualization::{
 pub const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\n";
 
 /// A host directory the guest mounts with `Machine::mount_share`.
+///
+/// On a case-insensitive volume, macOS's default, names differing only in
+/// case are one file. FreeBSD's base has such pairs, like `/usr/bin/cc` and
+/// `CC`, so a FreeBSD tree extracted onto such a share loses one of each.
 #[derive(Clone, Debug)]
 pub struct Share {
   pub tag: String,

@@ -1,7 +1,7 @@
 //! Boots FreeBSD's VM image: its first boot, which installs the guest
 //! bundle, a cold boot of the prepared disk, and a restore of its saved
-//! state; and jails on ZFS clones, on a disk of their own. Run signed,
-//! through `bin/dev/test-integration`.
+//! state; jails on ZFS clones, on a disk of their own; and a build-sized
+//! workload on a share. Run signed, through `bin/dev/test-integration`.
 
 use containerization_freebsd::{
   Builder, Disk, Exec, Exit, Jail, Network, Output, Share, Step, Upgrade, WindowSize, Zfs, image,
@@ -332,6 +332,142 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       SECONDS,
     )
     .expect("only the steps that built have datasets");
+
+  machine
+    .shut_down(Duration::from_secs(120))
+    .expect("power off");
+}
+
+/// Counts what is under `path`, itself included, as find(1) does.
+fn entries(path: &std::path::Path) -> usize {
+  let children = std::fs::read_dir(path)
+    .map(|children| {
+      children
+        .map(|child| {
+          let child = child.expect("read a directory entry");
+          let kind = child.file_type().expect("read an entry's type");
+          if kind.is_dir() { entries(&child.path()) } else { 1 }
+        })
+        .sum()
+    })
+    .unwrap_or(0);
+
+  1 + children
+}
+
+/// A C program of 64 files, built in parallel, which prints 2016.
+fn write_project(project: &std::path::Path) {
+  const UNITS: usize = 64;
+
+  std::fs::create_dir_all(project).expect("make the project");
+  let mut main = String::from("#include <stdio.h>\n");
+  let mut sum = String::new();
+  let mut objects = String::from("main.o");
+  for unit in 0..UNITS {
+    std::fs::write(
+      project.join(format!("unit{unit}.c")),
+      format!("int unit{unit}(void) {{ return {unit}; }}\n"),
+    )
+    .expect("write a unit");
+    main.push_str(&format!("int unit{unit}(void);\n"));
+    sum.push_str(&format!("  sum += unit{unit}();\n"));
+    objects.push_str(&format!(" unit{unit}.o"));
+  }
+  main.push_str(&format!(
+    "int main(void) {{\n  int sum = 0;\n{sum}  printf(\"%d\\n\", sum);\n  return 0;\n}}\n"
+  ));
+  std::fs::write(project.join("main.c"), main).expect("write main");
+  std::fs::write(
+    project.join("Makefile"),
+    format!("program: {objects}\n\tcc -o $@ {objects}\n"),
+  )
+  .expect("write the Makefile");
+}
+
+#[test]
+fn runs_a_build_sized_workload_on_a_share() {
+  let work = work("runs_a_build_sized_workload_on_a_share");
+  let shared = work.join("shared");
+  write_project(&shared.join("project"));
+
+  let mut layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
+    .expect("prepare the base");
+  let userland = userland();
+  layout.shares.push(Share {
+    tag: "shared".into(),
+    path: shared.clone(),
+    read_only: false,
+  });
+  layout.shares.push(Share {
+    tag: "userland".into(),
+    path: userland.parent().expect("the cache").to_path_buf(),
+    read_only: true,
+  });
+
+  let machine = layout.machine("workload").expect("make the machine");
+  machine.start().expect("start");
+  machine
+    .wait_ready(Duration::from_secs(300))
+    .expect("the agent starts");
+  machine
+    .mount_share("shared", "/mnt/shared")
+    .expect("mount the share");
+  machine
+    .mount_share("userland", "/mnt/userland")
+    .expect("mount the userland's share");
+
+  // Many files: the userland, extracted onto the share, less the 45 names
+  // that collide on the Mac's case-insensitive volume (cc and CC, mail and
+  // Mail, and man pages).
+  let extract = format!(
+    "mkdir /mnt/shared/tree && tar -xf /mnt/userland/{} -C /mnt/shared/tree \
+     --exclude ./usr/share/man --exclude ./usr/share/openssl/man --exclude ./usr/bin/CC --exclude ./usr/bin/mail \
+     && find /mnt/shared/tree | wc -l",
+    image::USERLAND
+  );
+  let ran = machine
+    .agent
+    .check(&sh(&extract), Duration::from_secs(600))
+    .expect("extract onto the share");
+  let in_guest: usize = ran.stdout.trim().parse().expect("a count");
+  let tree = shared.join("tree");
+  assert_eq!(entries(&tree), in_guest, "the host sees what the guest wrote");
+  let guest_sum = machine
+    .agent
+    .check(&["sha256", "-q", "/mnt/shared/tree/bin/sh"], SECONDS)
+    .expect("checksum in the guest")
+    .stdout;
+  let host_sum = std::process::Command::new("shasum")
+    .args(["-a", "256"])
+    .arg(tree.join("bin/sh"))
+    .output()
+    .expect("checksum on the host")
+    .stdout;
+  assert_eq!(
+    guest_sum.trim(),
+    String::from_utf8_lossy(&host_sum)
+      .split_whitespace()
+      .next()
+      .unwrap_or_default()
+  );
+
+  // A parallel build on the share, whose linker writes through mmap.
+  let ran = machine
+    .agent
+    .check(
+      &sh("make -C /mnt/shared/project -j4 >/dev/null && /mnt/shared/project/program"),
+      Duration::from_secs(300),
+    )
+    .expect("build on the share");
+  assert_eq!(ran.lines(), ["2016"]);
+  assert!(shared.join("project/program").exists());
+
+  // Deleting it all again.
+  machine
+    .agent
+    .check(&["rm", "-rf", "/mnt/shared/tree"], Duration::from_secs(600))
+    .expect("delete from the share");
+  assert!(!tree.exists(), "the host sees the tree gone");
 
   machine
     .shut_down(Duration::from_secs(120))
