@@ -4,6 +4,7 @@
 //! ZFS and jails in the guest.
 
 pub mod agent;
+pub mod build;
 mod error;
 pub mod image;
 pub mod jail;
@@ -15,8 +16,9 @@ pub mod prepare;
 pub mod zfs;
 
 pub use agent::{Agent, Exec, Exit, Output, Process, Ran, Relay, WindowSize};
+pub use build::{Builder, Built, Step};
 pub use error::{Error, Result};
-pub use jail::Jail;
+pub use jail::{Jail, Network};
 pub use machine::{Disk, Layout, Machine, Share};
 pub use prepare::{Upgrade, prepare};
 pub use zfs::Zfs;

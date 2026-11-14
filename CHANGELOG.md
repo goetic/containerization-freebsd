@@ -17,7 +17,10 @@
 - Attaches extra disks, found in the guest by their identifiers.
 - Downloads 15.1's base system, pinned, as the userland for jails.
 - ZFS in the guest: pools, datasets, snapshots and clones. Jails on any
-  path in the guest, with processes run in them through the agent.
+  path in the guest, with processes run in them through the agent, and no
+  network, the guest's, or their own behind pf's NAT.
+- Cached builds: each step runs in a jail on a clone of the step before, and
+  is snapshotted, so a step built before is skipped.
 - Preparing a base can skip the first boot's online upgrade, taking seconds
   instead of minutes.
 - A protocol for the coming guest agent: commands, terminals, port relays and

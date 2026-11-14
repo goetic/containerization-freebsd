@@ -3,7 +3,9 @@
 //! state; and jails on ZFS clones, on a disk of their own. Run signed,
 //! through `bin/dev/test-integration`.
 
-use containerization_freebsd::{Disk, Exec, Exit, Jail, Output, Share, Upgrade, WindowSize, Zfs, image};
+use containerization_freebsd::{
+  Builder, Disk, Exec, Exit, Jail, Network, Output, Share, Step, Upgrade, WindowSize, Zfs, image,
+};
 use containerization_freebsd_test::{base_disk, bundle, userland};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -163,6 +165,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   };
   image::create_disk(&images.path, 8 << 30).expect("make the images disk");
   layout.disks.push(images);
+  layout.nat = true;
   let userland = userland();
   layout.shares.push(Share {
     tag: "userland".into(),
@@ -200,7 +203,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .mountpoint("images/jails/first")
     .expect("find the clone");
 
-  let jail = Jail::start(&machine.agent, "first", &root, &["mount.devfs"]).expect("start a jail");
+  let jail = Jail::start(&machine.agent, "first", &root, Network::None, &["mount.devfs"]).expect("start a jail");
   let ran = jail
     .check(&["freebsd-version", "-u"], SECONDS)
     .expect("run a command in the jail");
@@ -234,10 +237,101 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("the userland does not");
 
   jail.stop().expect("stop the jail");
+
+  // Each way to the network, tried by pinging the guest's gateway: only pf's
+  // NAT gets a NAT jail an answer, as the gateway has no route to 10.66/16.
+  let gateway = machine
+    .agent
+    .check(&sh("route -n get default | awk '/gateway:/ { print $2 }'"), SECONDS)
+    .expect("find the guest's gateway")
+    .stdout
+    .trim()
+    .to_string();
+  for (network, reaches) in [(Network::None, false), (Network::Inherit, true), (Network::Nat, true)] {
+    let jail = Jail::start(
+      &machine.agent,
+      "first",
+      &root,
+      network,
+      &["mount.devfs", "allow.raw_sockets"],
+    )
+    .unwrap_or_else(|error| panic!("start a jail with {network:?}: {error}"));
+    let ran = jail
+      .run(&["ping", "-c", "1", "-t", "5", &gateway], SECONDS)
+      .unwrap_or_else(|error| panic!("ping with {network:?}: {error}"));
+    assert_eq!(ran.exit == Exit::Code(0), reaches, "{network:?}: {ran:?}");
+    jail
+      .stop()
+      .unwrap_or_else(|error| panic!("stop the jail with {network:?}: {error}"));
+  }
+  machine
+    .agent
+    .check(&sh("! ifconfig -g epair | grep -q ."), SECONDS)
+    .expect("no epairs left behind");
+
   zfs
     .destroy("images/jails/first")
     .expect("destroy the clone");
   assert!(!zfs.exists("images/jails/first").expect("list datasets"));
+
+  // Cached builds: each step a snapshot, a step built before skipped.
+  let builder = Builder::new(&machine.agent, "images/builds");
+  let steps = [
+    Step::new("echo one > /one; echo building"),
+    Step {
+      network: Network::None,
+      ..Step::new("cat /one > /two")
+    },
+  ];
+  let mut printed = Vec::new();
+  let first = builder
+    .build("images/userland@base", &steps, &mut |bytes| {
+      printed.extend_from_slice(bytes)
+    })
+    .expect("build");
+  assert_eq!((first.ran, first.cached), (2, 0));
+  assert!(String::from_utf8_lossy(&printed).contains("building"), "{printed:?}");
+  let again = builder
+    .build("images/userland@base", &steps, &mut |_| {})
+    .expect("build again");
+  assert_eq!((again.ran, again.cached), (0, 2));
+  assert_eq!(again.snapshot, first.snapshot);
+
+  let built = first.snapshot.split('@').next().expect("a dataset");
+  let built = zfs.mountpoint(built).expect("find the build");
+  machine
+    .agent
+    .check(&sh(&format!("[ \"$(cat {built}/two)\" = one ]")), SECONDS)
+    .expect("each step builds on the one before");
+  machine
+    .agent
+    .check(&["test", "!", "-e", &format!("{built}/etc/resolv.conf")], SECONDS)
+    .expect("the guest's resolver is not built in");
+
+  // A changed step builds again from there on; one that fails leaves nothing.
+  let changed = builder
+    .build(
+      "images/userland@base",
+      &[steps[0].clone(), Step::new("echo changed > /two")],
+      &mut |_| {},
+    )
+    .expect("build a changed step");
+  assert_eq!((changed.ran, changed.cached), (1, 1));
+  let failed = builder
+    .build(
+      "images/userland@base",
+      &[steps[0].clone(), Step::new("exit 3")],
+      &mut |_| {},
+    )
+    .expect_err("build a failing step");
+  assert!(failed.to_string().contains("step 2 of 2"), "{failed}");
+  machine
+    .agent
+    .check(
+      &sh("[ $(zfs list -H -r -d 1 -o name images/builds | wc -l) -eq 4 ]"),
+      SECONDS,
+    )
+    .expect("only the steps that built have datasets");
 
   machine
     .shut_down(Duration::from_secs(120))
