@@ -12,7 +12,13 @@ use std::{fmt, mem};
 pub const CONTROL: u32 = 0;
 
 /// The version this crate speaks, which the other side's must match.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
+
+/// The most bytes the host may have written to the console that the agent
+/// hasn't yet said it Received. FreeBSD's virtio console drops what overflows
+/// the guest tty's input queue, which at 115200 baud, the fastest the console
+/// allows, holds 23,040 bytes.
+pub const WINDOW: usize = 16 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -222,11 +228,13 @@ impl Mux {
     Ok((channel, frame))
   }
 
-  /// Ping or Pong on [`CONTROL`], or a message on an open channel.
+  /// Ping, Pong or, from the guest, Received on [`CONTROL`]; or a message on
+  /// an open channel.
   pub fn send(&mut self, channel: u32, message: Message) -> Result<Frame, Error> {
     if channel == CONTROL {
       return match message {
         Message::Ping(_) | Message::Pong(_) => Ok(message.frame(CONTROL)),
+        Message::Received(_) if self.side == Side::Guest => Ok(message.frame(CONTROL)),
         _ => Err(not_allowed(channel, &message)),
       };
     }
@@ -249,6 +257,7 @@ impl Mux {
       match message {
         Message::Hello { version, answer } => self.hear_hello(version, answer)?,
         Message::Ping(_) | Message::Pong(_) => {}
+        Message::Received(_) if self.side == Side::Host => {}
         _ => return Err(not_allowed(channel, &message)),
       }
       return Ok((channel, message));

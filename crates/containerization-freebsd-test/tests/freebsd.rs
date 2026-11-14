@@ -29,6 +29,20 @@ fn sh(script: &str) -> [&str; 3] {
   ["sh", "-c", script]
 }
 
+fn host_sha256(path: &std::path::Path) -> String {
+  let output = std::process::Command::new("shasum")
+    .args(["-a", "256"])
+    .arg(path)
+    .output()
+    .expect("checksum on the host");
+
+  String::from_utf8_lossy(&output.stdout)
+    .split_whitespace()
+    .next()
+    .unwrap_or_default()
+    .to_string()
+}
+
 #[test]
 fn prepares_boots_and_restores() {
   let work = work("prepares_boots_and_restores");
@@ -58,6 +72,31 @@ fn prepares_boots_and_restores() {
     .check(&["freebsd-version", "-k"], SECONDS)
     .expect("run a command");
   assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
+
+  // Input many windows long, which the console would drop if the host
+  // outpaced the agent.
+  let input: Vec<u8> = (0..16usize << 20)
+    .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+    .collect();
+  std::fs::write(work.join("input"), &input).expect("write the input");
+  let checksum = cold
+    .agent
+    .spawn(Exec {
+      argv: vec!["sha256".into(), "-q".into()],
+      ..Exec::default()
+    })
+    .expect("start a checksum");
+  checksum.write(&input).expect("stream the input");
+  checksum.close_input().expect("end the input");
+  let mut sum = Vec::new();
+  loop {
+    match checksum.recv().expect("its output") {
+      Output::Stdout(bytes) => sum.extend(bytes),
+      Output::Stderr(bytes) => panic!("{}", String::from_utf8_lossy(&bytes)),
+      Output::Exited(exit) => break assert_eq!(exit, Exit::Code(0)),
+    }
+  }
+  assert_eq!(String::from_utf8_lossy(&sum).trim(), host_sha256(&work.join("input")));
 
   // rc loaded the bundle's modules: ours, not the stock fusefs.
   let ran = cold
@@ -522,19 +561,7 @@ fn runs_a_build_sized_workload_on_a_share() {
     .check(&["sha256", "-q", "/mnt/shared/tree/bin/sh"], SECONDS)
     .expect("checksum in the guest")
     .stdout;
-  let host_sum = std::process::Command::new("shasum")
-    .args(["-a", "256"])
-    .arg(tree.join("bin/sh"))
-    .output()
-    .expect("checksum on the host")
-    .stdout;
-  assert_eq!(
-    guest_sum.trim(),
-    String::from_utf8_lossy(&host_sum)
-      .split_whitespace()
-      .next()
-      .unwrap_or_default()
-  );
+  assert_eq!(guest_sum.trim(), host_sha256(&tree.join("bin/sh")));
 
   // A parallel build on the share, whose linker writes through mmap.
   let ran = machine

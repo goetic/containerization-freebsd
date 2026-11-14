@@ -5,9 +5,16 @@
 //! Hello the agent reads ends its session and what that session ran, so one
 //! sent on a timer could arrive after the session it was meant to start,
 //! and end it.
+//!
+//! The guest drops console bytes it has no room for, so the host keeps at
+//! most `WINDOW` of them unreceived, writing frames in slices that fit. One
+//! thread reads the console and counts what the agent Received; another
+//! handles the rest, so a writer waiting for room never holds up the count.
 
 use crate::error::{Error, Result};
-use containerization_freebsd_protocol::{Decoder, Frame, Message, Mux, Side, Skipped, VersionMismatch};
+use containerization_freebsd_protocol::{
+  CONTROL, Decoder, Frame, Message, Mux, Side, Skipped, VersionMismatch, WINDOW,
+};
 use std::collections::HashMap;
 use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,10 +24,11 @@ use std::time::{Duration, Instant};
 
 pub use containerization_freebsd_protocol::{Exec, Exit, WindowSize};
 
-/// How long the agent has to start a process or connect a relay.
+/// How long the agent has to start a process or connect a relay, and to read
+/// the console when the host has a window's worth unreceived.
 const OPENING: Duration = Duration::from_secs(60);
-/// Data goes in frames of at most this, well under MAX_PAYLOAD.
-const CHUNK: usize = 64 << 10;
+/// Data goes in frames of at most this, so channels take turns on the console.
+const CHUNK: usize = WINDOW / 2;
 
 pub struct Agent {
   shared: Arc<Shared>,
@@ -82,26 +90,53 @@ struct Shared {
 struct State {
   mux: Mux,
   console: PipeWriter,
+  credit: Arc<Credit>,
   /// Where each open channel's messages go.
   channels: HashMap<u32, mpsc::Sender<Message>>,
   mismatch: Option<VersionMismatch>,
   closed: bool,
 }
 
+/// What the console reader hands the thread that handles it.
+enum Event {
+  /// Bytes as read, for the console text before a session.
+  Read(Vec<u8>),
+  Frame(Frame),
+  Skipped,
+}
+
+/// The console bytes the host has written that the agent hasn't yet said it
+/// Received.
+#[derive(Default)]
+struct Credit {
+  window: Mutex<Window>,
+  changed: Condvar,
+}
+
+#[derive(Default)]
+struct Window {
+  unreceived: usize,
+  closed: bool,
+}
+
 impl Agent {
   pub(crate) fn new(output: PipeReader, input: PipeWriter) -> Self {
+    let credit = Arc::new(Credit::default());
     let shared = Arc::new(Shared {
       state: Mutex::new(State {
         mux: Mux::new(Side::Host),
         console: input,
+        credit: credit.clone(),
         channels: HashMap::new(),
         mismatch: None,
         closed: false,
       }),
       changed: Condvar::new(),
     });
-    let reader = shared.clone();
-    std::thread::spawn(move || read(output, &reader));
+    let (events, queue) = mpsc::channel();
+    std::thread::spawn(move || read(output, &credit, &events));
+    let handler = shared.clone();
+    std::thread::spawn(move || handle(&queue, &handler));
 
     Self { shared }
   }
@@ -408,11 +443,20 @@ impl Shared {
 }
 
 impl State {
+  /// Writes `frame` as the window makes room for it.
   fn write(&mut self, frame: &Frame) -> Result<()> {
-    self
-      .console
-      .write_all(&frame.to_bytes())
-      .map_err(Error::io("writing to the guest agent"))
+    let bytes = frame.to_bytes();
+    let mut rest = bytes.as_slice();
+
+    while !rest.is_empty() {
+      let (now, later) = rest.split_at(self.credit.take(rest.len())?);
+      self
+        .console
+        .write_all(now)
+        .map_err(Error::io("writing to the guest agent"))?;
+      rest = later;
+    }
+    Ok(())
   }
 
   /// Starts a session; ends any there was, and what it ran.
@@ -438,6 +482,8 @@ impl State {
         false
       }
       Ok((_, Message::Hello { answer: true, .. })) => true,
+      // The console reader counted it.
+      Ok((_, Message::Received(_))) => false,
       Ok((_, Message::Ping(number))) => {
         if let Ok(pong) = self.mux.send(channel, Message::Pong(number)) {
           let _ = self.write(&pong);
@@ -463,33 +509,111 @@ impl State {
   }
 }
 
-fn read(mut output: PipeReader, shared: &Shared) {
+impl Credit {
+  /// Room for up to `wanted` more bytes, counted as written, as soon as there
+  /// is any.
+  fn take(&self, wanted: usize) -> Result<usize> {
+    let window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut window = self
+      .changed
+      .wait_timeout_while(window, OPENING, |window| !window.closed && window.unreceived >= WINDOW)
+      .unwrap_or_else(PoisonError::into_inner)
+      .0;
+
+    if window.closed {
+      return Err(Error::Guest("the console closed".to_string()));
+    }
+    if window.unreceived >= WINDOW {
+      return Err(Error::Timeout(format!(
+        "the guest agent read none of the console's last {} bytes within {}s",
+        window.unreceived,
+        OPENING.as_secs()
+      )));
+    }
+    let room = (WINDOW - window.unreceived).min(wanted);
+    window.unreceived += room;
+    Ok(room)
+  }
+
+  /// Counts what `frame`, from the agent, says of the console.
+  fn hear(&self, frame: &Frame) {
+    if frame.channel != CONTROL {
+      return;
+    }
+    let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+
+    match Message::from_frame(frame.clone()) {
+      Ok(Message::Received(bytes)) => {
+        window.unreceived = window.unreceived.saturating_sub(bytes as usize);
+      }
+      // A new agent, or one starting over: what the old one never read is
+      // gone, or the agent has read past it.
+      Ok(Message::Hello { .. }) => window.unreceived = 0,
+      _ => return,
+    }
+    self.changed.notify_all();
+  }
+
+  fn close(&self) {
+    self
+      .window
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .closed = true;
+    self.changed.notify_all();
+  }
+}
+
+/// Reads the console, counting what the agent Received, and hands the rest
+/// on. Never waits on the session's state, which a writer holds while it
+/// waits for room.
+fn read(mut output: PipeReader, credit: &Credit, events: &mpsc::Sender<Event>) {
   let mut decoder = Decoder::new();
   let mut buffer = vec![0; 64 << 10];
-  let mut line = Vec::new();
 
   while let Ok(read @ 1..) = output.read(&mut buffer) {
-    // Before a session, console text is the guest explaining why there is
-    // none, such as first-boot.sh failing.
-    if !shared.lock().mux.in_session() {
-      echo(&mut line, &buffer[..read]);
-    }
+    let _ = events.send(Event::Read(buffer[..read].to_vec()));
     decoder.push(&buffer[..read]);
 
     while let Some(decoded) = decoder.decode() {
-      let mut state = shared.lock();
-      let changed = match decoded {
-        Ok(frame) => state.receive(frame),
-        // Frames were lost mid-session: start over.
-        Err(Skipped(_)) if state.mux.in_session() => {
-          let _ = state.hello();
-          false
+      let event = match decoded {
+        Ok(frame) => {
+          credit.hear(&frame);
+          Event::Frame(frame)
         }
-        Err(Skipped(_)) => false,
+        Err(Skipped(_)) => Event::Skipped,
       };
-      if changed {
-        shared.changed.notify_all();
+      let _ = events.send(event);
+    }
+  }
+  credit.close();
+}
+
+/// Handles what the console brings, until it closes.
+fn handle(queue: &Receiver<Event>, shared: &Shared) {
+  let mut line = Vec::new();
+
+  for event in queue {
+    let mut state = shared.lock();
+    let changed = match event {
+      // Before a session, console text is the guest explaining why there is
+      // none, such as first-boot.sh failing.
+      Event::Read(bytes) => {
+        if !state.mux.in_session() {
+          echo(&mut line, &bytes);
+        }
+        false
       }
+      Event::Frame(frame) => state.receive(frame),
+      // Frames were lost mid-session: start over.
+      Event::Skipped if state.mux.in_session() => {
+        let _ = state.hello();
+        false
+      }
+      Event::Skipped => false,
+    };
+    if changed {
+      shared.changed.notify_all();
     }
   }
 
@@ -656,6 +780,29 @@ mod tests {
     process.close_input().unwrap();
 
     assert_eq!(finish(&process), ("fed\n".to_string(), Exit::Code(0)));
+  }
+
+  #[test]
+  fn feeds_input_many_windows_long() {
+    let agent = started();
+    let input = vec![b'x'; 300 * WINDOW + 1];
+
+    let process = agent.spawn(command(&["wc", "-c"])).unwrap();
+    process.write(&input).unwrap();
+    process.close_input().unwrap();
+
+    let (output, exit) = finish(&process);
+    assert_eq!((output.trim(), exit), (input.len().to_string().as_str(), Exit::Code(0)));
+  }
+
+  #[test]
+  fn sends_a_frame_longer_than_the_window() {
+    let agent = started();
+    let argument = "y".repeat(4 * WINDOW);
+
+    let ran = agent.check(&["printf", "%s", &argument], PATIENCE).unwrap();
+
+    assert_eq!(ran.stdout, argument);
   }
 
   #[test]

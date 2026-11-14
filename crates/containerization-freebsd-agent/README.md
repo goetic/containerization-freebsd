@@ -14,6 +14,9 @@ the host will.
 
 ## Behaviour
 
+- **Console:** raw, at 115200 baud for the largest input queue FreeBSD gives
+  it. After each read, the agent tells the host how many bytes it Received,
+  so the host may send that many more.
 - **Sessions:** the agent announces itself at startup and after losing frames.
   A new session kills the process groups of the old session's
   channels.

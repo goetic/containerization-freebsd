@@ -17,6 +17,9 @@ struct Host {
   mux: Mux,
   console: UnixStream,
   frames: Receiver<Frame>,
+  /// The console bytes written, and those the agent says it Received.
+  written: usize,
+  received: usize,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +60,8 @@ impl Host {
       mux: Mux::new(Side::Host),
       console,
       frames,
+      written: 0,
+      received: 0,
     };
     assert_eq!(host.next(), (CONTROL, announcement()));
     host.hello();
@@ -82,19 +87,27 @@ impl Host {
   }
 
   fn write(&mut self, frame: &Frame) {
-    self.console.write_all(&frame.to_bytes()).unwrap();
+    let bytes = frame.to_bytes();
+    self.console.write_all(&bytes).unwrap();
+    self.written += bytes.len();
   }
 
-  /// The agent's next message.
+  /// The agent's next message, past those saying what it Received.
   fn next(&mut self) -> (u32, Message) {
-    let frame = self
-      .frames
-      .recv_timeout(PATIENCE)
-      .expect("the agent sends a frame");
-    self
-      .mux
-      .receive(frame)
-      .expect("the agent sends only what it may")
+    loop {
+      let frame = self
+        .frames
+        .recv_timeout(PATIENCE)
+        .expect("the agent sends a frame");
+      match self
+        .mux
+        .receive(frame)
+        .expect("the agent sends only what it may")
+      {
+        (CONTROL, Message::Received(bytes)) => self.received += bytes as usize,
+        next => return next,
+      }
+    }
   }
 
   fn open(&mut self, message: Message) -> u32 {
@@ -222,6 +235,19 @@ fn feeds_stdin_until_eof() {
 
   assert_eq!(finished.output, "one\ntwo\n");
   assert_eq!(finished.exit, Some(Exit::Code(0)));
+}
+
+#[test]
+fn says_it_received_every_byte_it_read() {
+  let mut host = Host::start();
+
+  let channel = host.exec(command(&["cat"]));
+  host.send(channel, Message::Data(vec![b'x'; 100_000]));
+  host.send(channel, Message::Eof);
+  host.finish(channel);
+
+  // It says so before acting on what it read, so before the process exits.
+  assert_eq!(host.received, host.written);
 }
 
 #[test]

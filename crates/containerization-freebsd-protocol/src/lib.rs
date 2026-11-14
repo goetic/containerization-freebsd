@@ -12,9 +12,12 @@
 //! A session starts with the host's Hello, which the agent answers with its
 //! own; both must name the same [`VERSION`]. An agent with no session, just
 //! started or having lost frames, announces itself with a Hello, and the host
-//! starts one. Channel 0 carries Hello, Ping and Pong. The host opens channels
-//! with Exec, for a process on pipes or a pty, and Connect, for a relay to a guest
-//! TCP port. The opener sends Data (stdin, or relay bytes), Resize and Signal.
+//! starts one. Channel 0 carries Hello, Ping and Pong, and the agent's
+//! Received: how much of the console it has read. The console drops bytes it
+//! can't hold, so the host keeps at most [`WINDOW`] bytes unreceived. The
+//! host opens channels with Exec, for a process on pipes or a pty, and
+//! Connect, for a relay to a guest TCP port. The opener sends Data (stdin, or
+//! relay bytes), Resize and Signal.
 //! The runner answers Opened, then Data (stdout), Stderr and Exited. Eof ends
 //! the sender's Data, and a relay closes once both ends have sent it. Error
 //! closes any channel.
@@ -25,4 +28,4 @@ pub mod mux;
 
 pub use frame::{Decoder, Frame, MAGIC, MAX_PAYLOAD, Skipped};
 pub use message::{DecodeError, Exec, Exit, Message, WindowSize};
-pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch};
+pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch, WINDOW};

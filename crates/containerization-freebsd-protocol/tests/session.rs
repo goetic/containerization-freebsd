@@ -86,6 +86,29 @@ fn passes_only_control_messages_before_the_hellos() {
   // A ping finds out whether the agent is there at all.
   let ping = host.send(CONTROL, Message::Ping(1)).unwrap();
   assert_eq!(deliver(&mut guest, [ping]), [(CONTROL, Message::Ping(1))]);
+  // The agent reads the console whether or not there is a session.
+  let received = guest.send(CONTROL, Message::Received(64)).unwrap();
+  assert_eq!(deliver(&mut host, [received]), [(CONTROL, Message::Received(64))]);
+}
+
+#[test]
+fn lets_only_the_guest_say_what_it_received() {
+  let (mut host, mut guest) = session();
+
+  assert_eq!(
+    host.send(CONTROL, Message::Received(1)).unwrap_err(),
+    not_allowed(CONTROL, "received")
+  );
+  assert_eq!(
+    guest
+      .receive(Message::Received(1).frame(CONTROL))
+      .unwrap_err(),
+    not_allowed(CONTROL, "received")
+  );
+  assert_eq!(
+    guest.send(2, Message::Received(1)).unwrap_err(),
+    Error::UnknownChannel(2)
+  );
 }
 
 #[test]

@@ -28,6 +28,9 @@
   instead of minutes.
 - A protocol for the guest agent: commands, terminals and port relays, side
   by side over the one console, and recovering from corrupted bytes.
+- Fixes the session ending when input outpaced the agent: FreeBSD's console
+  drops what its tty can't hold, so the agent says what it has read, and the
+  host keeps at most 16 KiB unread. Protocol version 2, in guest bundle r4.
 - The `kernel-messages` feature shows boot messages when the console stays
   silent. Off by default: it breaks saving.
 - Adds patches for virtiofs shared folders in FreeBSD 15.1 guests.

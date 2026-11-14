@@ -19,8 +19,9 @@ fn check(result: libc::c_int) -> io::Result<libc::c_int> {
   }
 }
 
-/// Puts a terminal in raw mode: bytes pass as they are, with no echo, line
-/// editing or signals.
+/// Puts a terminal in raw mode, at 115200 baud: bytes pass as they are, with
+/// no echo, line editing or signals. FreeBSD sizes a tty's input queue by its
+/// speed: 23,040 bytes at 115200, against 1,920 at the default 9600.
 pub fn make_raw(terminal: &impl AsFd) -> io::Result<()> {
   let fd = terminal.as_fd().as_raw_fd();
   let mut termios = MaybeUninit::<libc::termios>::uninit();
@@ -31,6 +32,7 @@ pub fn make_raw(terminal: &impl AsFd) -> io::Result<()> {
     check(libc::tcgetattr(fd, termios.as_mut_ptr()))?;
     let mut termios = termios.assume_init();
     libc::cfmakeraw(&mut termios);
+    check(libc::cfsetspeed(&mut termios, libc::B115200))?;
     check(libc::tcsetattr(fd, libc::TCSANOW, &termios))?;
   }
   Ok(())

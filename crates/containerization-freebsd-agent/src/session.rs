@@ -165,6 +165,10 @@ impl<W: Write> Agent<W> {
   }
 
   fn console(&mut self, bytes: &[u8]) -> io::Result<()> {
+    // These bytes have left the tty's input queue, so the host may send as
+    // many more.
+    let read = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    self.send(CONTROL, Message::Received(read))?;
     self.decoder.push(bytes);
 
     while let Some(decoded) = self.decoder.decode() {
