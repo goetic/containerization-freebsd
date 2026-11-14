@@ -1,10 +1,12 @@
 //! Boots FreeBSD's VM image: its first boot, which installs the guest
 //! bundle, a cold boot of the prepared disk, and a restore of its saved
-//! state; jails on ZFS clones, on a disk of their own; and a build-sized
-//! workload on a share. Run signed, through `bin/dev/test-integration`.
+//! state; jails, builds and containers on ZFS clones, on their own disk; and
+//! a build-sized workload on a share. Run signed, through
+//! `bin/dev/test-integration`.
 
 use containerization_freebsd::{
-  Builder, Disk, Exec, Exit, Jail, Network, Output, Share, Step, Upgrade, WindowSize, Zfs, image,
+  Builder, Configuration, Containers, Disk, Dns, Exec, Exit, Host, Jail, Network, Output, Share, Step, Upgrade,
+  WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, userland};
 use std::path::PathBuf;
@@ -332,6 +334,89 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       SECONDS,
     )
     .expect("only the steps that built have datasets");
+
+  // Containers: a main process that stops cleanly on SIGTERM, in its own
+  // jail with its own hostname, resolver and hosts.
+  let containers = Containers::new(&machine.agent, "images/containers");
+  let mut web = containers
+    .create(
+      "web",
+      "images/userland@base",
+      Configuration {
+        process: Exec {
+          argv: vec![
+            "sh".into(),
+            "-c".into(),
+            "trap 'echo stopping; exit 3' TERM; echo started; while :; do sleep 0.1; done".into(),
+          ],
+          ..Exec::default()
+        },
+        hostname: Some("web.test".into()),
+        network: Network::Nat,
+        dns: Some(Dns {
+          nameservers: vec!["192.0.2.53".into()],
+          search: vec!["test".into()],
+          ..Dns::default()
+        }),
+        hosts: vec![Host {
+          address: "192.0.2.1".into(),
+          names: vec!["db.test".into(), "db".into()],
+        }],
+        ..Configuration::default()
+      },
+    )
+    .expect("create a container");
+  assert_eq!(containers.list().expect("list containers"), ["web"]);
+  web.start().expect("start its main process");
+  let main = web.process().expect("its main process");
+  assert_eq!(main.recv().expect("its output"), Output::Stdout(b"started\n".to_vec()));
+
+  let ran = web
+    .check(&sh("hostname; cat /etc/resolv.conf; getent hosts db"), SECONDS)
+    .expect("run a command in the container");
+  let lines = ran.lines();
+  assert_eq!(
+    lines[..3],
+    ["web.test", "search test", "nameserver 192.0.2.53"],
+    "{ran:?}"
+  );
+  assert_eq!(
+    lines[3].split_whitespace().collect::<Vec<_>>(),
+    ["192.0.2.1", "db.test", "db"]
+  );
+
+  // Stderr is ignored: sh reports there its sleep dying of SIGTERM.
+  web.stop().expect("stop the container");
+  let mut stdout = Vec::new();
+  let exit = loop {
+    match main.recv().expect("its last output") {
+      Output::Stdout(bytes) => stdout.extend(bytes),
+      Output::Stderr(_) => {}
+      Output::Exited(exit) => break exit,
+    }
+  };
+  assert_eq!((stdout.as_slice(), exit), (&b"stopping\n"[..], Exit::Code(3)));
+  web.delete().expect("delete the container");
+
+  // One whose handle is gone, deleted by id.
+  drop(
+    containers
+      .create("left", "images/userland@base", Configuration::default())
+      .expect("create another container"),
+  );
+  containers
+    .delete("left")
+    .expect("delete the container by id");
+  assert!(containers.list().expect("list containers").is_empty());
+  assert!(
+    Jail::find(&machine.agent, "left")
+      .expect("look for its jail")
+      .is_none()
+  );
+  machine
+    .agent
+    .check(&sh("! ifconfig -g epair | grep -q ."), SECONDS)
+    .expect("no epairs left behind");
 
   machine
     .shut_down(Duration::from_secs(120))

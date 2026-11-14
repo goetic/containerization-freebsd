@@ -17,6 +17,9 @@ pub enum Error {
   },
   /// The guest did something other than what it was expected to.
   Guest(String),
+  /// An invalid request, such as an id no jail can take, or starting a
+  /// container twice.
+  Invalid(String),
   Io {
     action: String,
     error: std::io::Error,
@@ -53,7 +56,7 @@ impl fmt::Display for Error {
       Self::Checksum { path, actual, expected } => {
         write!(formatter, "{} has sha256 {actual}, expected {expected}", path.display())
       }
-      Self::Guest(message) | Self::Timeout(message) => formatter.write_str(message),
+      Self::Guest(message) | Self::Invalid(message) | Self::Timeout(message) => formatter.write_str(message),
       Self::Io { action, error } => write!(formatter, "{action}: {error}"),
       Self::SessionEnded(what) => write!(formatter, "the guest agent's session ended while {what}"),
       Self::Virtualization { action, error } => write!(formatter, "{action}: {error}"),
@@ -66,7 +69,12 @@ impl std::error::Error for Error {
     match self {
       Self::Io { error, .. } => Some(error),
       Self::Virtualization { error, .. } => Some(error),
-      Self::Command { .. } | Self::Checksum { .. } | Self::Guest(_) | Self::SessionEnded(_) | Self::Timeout(_) => None,
+      Self::Command { .. }
+      | Self::Checksum { .. }
+      | Self::Guest(_)
+      | Self::Invalid(_)
+      | Self::SessionEnded(_)
+      | Self::Timeout(_) => None,
     }
   }
 }

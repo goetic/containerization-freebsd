@@ -73,6 +73,35 @@ impl<'a> Zfs<'a> {
     self.check(&["zfs", "destroy", "-r", name], QUICK)
   }
 
+  /// The full names of the datasets directly under `dataset`.
+  pub fn children(&self, dataset: &str) -> Result<Vec<String>> {
+    let ran = self.agent.check(
+      &[
+        "zfs",
+        "list",
+        "-H",
+        "-o",
+        "name",
+        "-t",
+        "filesystem",
+        "-r",
+        "-d",
+        "1",
+        dataset,
+      ],
+      QUICK,
+    )?;
+
+    Ok(
+      ran
+        .lines()
+        .into_iter()
+        .filter(|name| *name != dataset)
+        .map(str::to_string)
+        .collect(),
+    )
+  }
+
   /// Where `dataset` is mounted.
   pub fn mountpoint(&self, dataset: &str) -> Result<String> {
     let ran = self

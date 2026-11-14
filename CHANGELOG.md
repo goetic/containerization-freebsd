@@ -21,6 +21,9 @@
   network, the guest's, or their own behind pf's NAT.
 - Cached builds: each step runs in a jail on a clone of the step before, and
   is snapshotted, so a step built before is skipped.
+- Containers: each a jail on its own clone, with a main process, others run
+  beside it, and its own hostname, network, resolver and hosts. Many share a
+  machine, under a manager that lists them and deletes those left behind.
 - Preparing a base can skip the first boot's online upgrade, taking seconds
   instead of minutes.
 - A protocol for the guest agent: commands, terminals and port relays, side

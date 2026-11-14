@@ -1,6 +1,6 @@
 //! FreeBSD jails in the guest, through its agent.
 
-use crate::agent::{Agent, Exec, Process, Ran};
+use crate::agent::{Agent, Exec, Exit, Process, Ran};
 use crate::error::{Error, Result};
 use std::time::Duration;
 
@@ -61,17 +61,24 @@ pub struct Jail<'a> {
 }
 
 impl<'a> Jail<'a> {
-  /// Starts a persistent jail named `name`, with that hostname, rooted at
-  /// `path` in the guest. `parameters` are jail(8)'s, as `key=value` or a
-  /// bare flag such as `mount.devfs`. A jail with a network gets the
-  /// guest's resolver configuration if it has none of its own.
+  /// Starts a persistent jail named `name`, rooted at `path` in the guest,
+  /// with that hostname unless `parameters` give one. `parameters` are
+  /// jail(8)'s, as `key=value` or a bare flag such as `mount.devfs`. A jail
+  /// with a network gets the guest's resolver configuration if it has none
+  /// of its own.
   pub fn start(agent: &'a Agent, name: &str, path: &str, network: Network, parameters: &[&str]) -> Result<Self> {
     let (name_parameter, path_parameter, hostname) = (
       format!("name={name}"),
       format!("path={path}"),
       format!("host.hostname={name}"),
     );
-    let mut argv = vec!["jail", "-c", &name_parameter, &path_parameter, &hostname, "persist"];
+    let mut argv = vec!["jail", "-c", &name_parameter, &path_parameter, "persist"];
+    if !parameters
+      .iter()
+      .any(|parameter| parameter.starts_with("host.hostname="))
+    {
+      argv.push(&hostname);
+    }
 
     let epair = match network {
       Network::None => None,
@@ -97,17 +104,13 @@ impl<'a> Jail<'a> {
     }
     let jail = Self::running(agent, name);
 
-    if let Some(epair) = &epair {
-      let inside = format!("{}b", epair.name);
-      agent.check(
-        &["sh", "-c", NAT_JAIL, "sh", name, &inside, &epair.address, GATEWAY],
-        QUICK,
-      )?;
+    match jail.configure(path, network, epair.as_ref()) {
+      Ok(()) => Ok(jail),
+      Err(error) => {
+        let _ = jail.stop();
+        Err(error)
+      }
     }
-    if network != Network::None {
-      agent.check(&["sh", "-c", RESOLVER, "sh", path], QUICK)?;
-    }
-    Ok(jail)
   }
 
   /// One already running, such as after a restore.
@@ -116,6 +119,13 @@ impl<'a> Jail<'a> {
       agent,
       name: name.to_string(),
     }
+  }
+
+  /// The running jail named `name`, if any.
+  pub fn find(agent: &'a Agent, name: &str) -> Result<Option<Self>> {
+    let ran = agent.run(&["jls", "-j", name, "jid"], QUICK)?;
+
+    Ok((ran.exit == Exit::Code(0)).then(|| Self::running(agent, name)))
   }
 
   pub fn name(&self) -> &str {
@@ -186,6 +196,24 @@ impl<'a> Jail<'a> {
     // destroys both.
     for inside in epairs {
       self.agent.check(&["ifconfig", &inside, "destroy"], QUICK)?;
+    }
+    Ok(())
+  }
+
+  /// Sets up a new NAT jail's end of `epair`, and a networked jail's
+  /// resolver.
+  fn configure(&self, path: &str, network: Network, epair: Option<&Epair>) -> Result<()> {
+    if let Some(epair) = epair {
+      let inside = format!("{}b", epair.name);
+      self.agent.check(
+        &["sh", "-c", NAT_JAIL, "sh", &self.name, &inside, &epair.address, GATEWAY],
+        QUICK,
+      )?;
+    }
+    if network != Network::None {
+      self
+        .agent
+        .check(&["sh", "-c", RESOLVER, "sh", path], QUICK)?;
     }
     Ok(())
   }
