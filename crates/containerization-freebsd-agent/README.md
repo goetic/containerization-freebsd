@@ -22,6 +22,5 @@ the host will.
   holds its output open stays open until that child exits.
 - **Terminals:** Eof is ignored; ^D, sent as Data, ends a terminal's input.
 - **Connect:** relays to 127.0.0.1, or failing that ::1.
-- **HostCommand:** not implemented yet.
 
 Unsafe code is confined to `src/sys.rs`.

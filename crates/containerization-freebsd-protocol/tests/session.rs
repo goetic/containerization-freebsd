@@ -71,11 +71,6 @@ fn opens_nothing_when_the_versions_differ() {
   assert_eq!(guest.receive(newer(false)).unwrap_err(), mismatch);
 
   assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NoSession);
-  let request = Message::HostCommand {
-    name: "test".into(),
-    args: Vec::new(),
-  };
-  assert_eq!(guest.open(request).unwrap_err(), Error::NoSession);
 }
 
 #[test]
@@ -244,27 +239,14 @@ fn closes_a_process_when_it_exits_not_when_its_output_ends() {
 }
 
 #[test]
-fn lets_only_the_guest_ask_for_host_commands() {
+fn lets_only_the_host_open_channels() {
   let (mut host, mut guest) = session();
-  let request = Message::HostCommand {
-    name: "test".into(),
-    args: vec!["-q".into()],
-  };
 
-  let (channel, open) = guest.open(request.clone()).unwrap();
-  assert_eq!(channel, 1);
-  assert_eq!(deliver(&mut host, [open]), [(channel, request.clone())]);
-  let mut send = |message| host.send(channel, message).unwrap();
-  let frames = [
-    send(Message::Opened),
-    send(Message::Data(b"ok\n".to_vec())),
-    send(Message::Exited(Exit::Code(0))),
-  ];
-  deliver(&mut guest, frames);
-  assert!(!guest.is_open(channel) && !host.is_open(channel));
-
-  assert_eq!(host.open(request).unwrap_err(), not_allowed(2, "host command"));
-  assert_eq!(guest.open(exec(&["true"], None)).unwrap_err(), not_allowed(3, "exec"));
+  assert_eq!(guest.open(exec(&["true"], None)).unwrap_err(), not_allowed(1, "exec"));
+  assert_eq!(
+    guest.open(Message::Connect { port: 22 }).unwrap_err(),
+    not_allowed(1, "connect")
+  );
   // Nor can either pass off its own opening as the other's.
   assert_eq!(
     host.receive(exec(&["true"], None).frame(3)).unwrap_err(),

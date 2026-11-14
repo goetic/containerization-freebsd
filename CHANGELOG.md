@@ -23,9 +23,8 @@
   is snapshotted, so a step built before is skipped.
 - Preparing a base can skip the first boot's online upgrade, taking seconds
   instead of minutes.
-- A protocol for the coming guest agent: commands, terminals, port relays and
-  host commands, side by side over the one console, and recovering from
-  corrupted bytes.
+- A protocol for the guest agent: commands, terminals and port relays, side
+  by side over the one console, and recovering from corrupted bytes.
 - The `kernel-messages` feature shows boot messages when the console stays
   silent. Off by default: it breaks saving.
 - Adds patches for virtiofs shared folders in FreeBSD 15.1 guests.

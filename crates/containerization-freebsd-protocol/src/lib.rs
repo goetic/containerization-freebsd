@@ -14,8 +14,7 @@
 //! started or having lost frames, announces itself with a Hello, and the host
 //! starts one. Channel 0 carries Hello, Ping and Pong. The host opens channels
 //! with Exec, for a process on pipes or a pty, and Connect, for a relay to a guest
-//! TCP port; the guest opens them with HostCommand, asking the host to run a
-//! command. The opener sends Data (stdin, or relay bytes), Resize and Signal.
+//! TCP port. The opener sends Data (stdin, or relay bytes), Resize and Signal.
 //! The runner answers Opened, then Data (stdout), Stderr and Exited. Eof ends
 //! the sender's Data, and a relay closes once both ends have sent it. Error
 //! closes any channel.

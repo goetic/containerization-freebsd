@@ -1,7 +1,8 @@
 //! A session's channels, from one side: who may send what, and when.
 //!
-//! Channel 0 is control. The host opens even channels and the guest odd ones,
-//! so either opens without asking the other.
+//! Channel 0 is control. The host opens even channels; odd ones are the
+//! guest's, so it could open channels without asking, though nothing it sends
+//! opens one yet.
 
 use crate::frame::{Frame, MAX_PAYLOAD};
 use crate::message::{DecodeError, Message};
@@ -46,7 +47,6 @@ impl Side {
   fn opens(self, message: &Message) -> bool {
     match message {
       Message::Exec(_) | Message::Connect { .. } => self == Self::Host,
-      Message::HostCommand { .. } => self == Self::Guest,
       _ => false,
     }
   }
@@ -80,7 +80,6 @@ pub enum Error {
 enum Kind {
   Exec { pty: bool },
   Relay,
-  HostCommand,
 }
 
 impl Kind {
@@ -90,7 +89,6 @@ impl Kind {
         pty: exec.pty.is_some(),
       }),
       Message::Connect { .. } => Some(Self::Relay),
-      Message::HostCommand { .. } => Some(Self::HostCommand),
       _ => None,
     }
   }
@@ -210,8 +208,7 @@ impl Mux {
     .frame(CONTROL)
   }
 
-  /// Opens a channel with Exec or Connect from the host, or HostCommand from
-  /// the guest.
+  /// Opens a channel with Exec or Connect, which only the host opens.
   pub fn open(&mut self, message: Message) -> Result<(u32, Frame), Error> {
     self.require_session()?;
     let channel = self.free_channel();
@@ -401,17 +398,10 @@ mod tests {
     let mut guest = Mux::new(Side::Guest);
     guest.receive(host.hello()).unwrap();
     host.receive(guest.hello()).unwrap();
-    let open = |mux: &mut Mux, message: &Message| mux.open(message.clone()).unwrap().0;
-    let exec = Message::Exec(Exec::default());
-    let command = Message::HostCommand {
-      name: "test".into(),
-      args: Vec::new(),
-    };
+    let open = |mux: &mut Mux| mux.open(Message::Exec(Exec::default())).unwrap().0;
 
-    assert_eq!(open(&mut host, &exec), 2);
+    assert_eq!(open(&mut host), 2);
     host.next = u32::MAX - 1;
-    guest.next = u32::MAX;
-    assert_eq!([open(&mut host, &exec), open(&mut host, &exec)], [u32::MAX - 1, 4]);
-    assert_eq!([open(&mut guest, &command), open(&mut guest, &command)], [u32::MAX, 1]);
+    assert_eq!([open(&mut host), open(&mut host)], [u32::MAX - 1, 4]);
   }
 }

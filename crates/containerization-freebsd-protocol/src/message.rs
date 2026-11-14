@@ -24,11 +24,6 @@ pub enum Message {
   Connect {
     port: u16,
   },
-  /// Asks the host to run a command it declares. Opens a channel, from the guest.
-  HostCommand {
-    name: String,
-    args: Vec<String>,
-  },
   /// The runner started the process, or connected the relay.
   Opened,
   /// From the opener, stdin or relay bytes; from the runner, stdout or relay bytes.
@@ -80,7 +75,6 @@ mod kind {
   pub const PONG: u8 = 0x03;
   pub const EXEC: u8 = 0x10;
   pub const CONNECT: u8 = 0x11;
-  pub const HOST_COMMAND: u8 = 0x12;
   pub const OPENED: u8 = 0x20;
   pub const DATA: u8 = 0x21;
   pub const STDERR: u8 = 0x22;
@@ -99,7 +93,6 @@ impl Message {
       Self::Pong(_) => "pong",
       Self::Exec(_) => "exec",
       Self::Connect { .. } => "connect",
-      Self::HostCommand { .. } => "host command",
       Self::Opened => "opened",
       Self::Data(_) => "data",
       Self::Stderr(_) => "stderr",
@@ -144,10 +137,6 @@ impl Message {
       Self::Connect { port } => {
         payload.u16(*port);
         kind::CONNECT
-      }
-      Self::HostCommand { name, args } => {
-        payload.string(name).strings(args);
-        kind::HOST_COMMAND
       }
       Self::Opened => kind::OPENED,
       Self::Data(bytes) => {
@@ -220,10 +209,6 @@ impl Message {
         pty: reader.option(Reader::window)?,
       }),
       kind::CONNECT => Self::Connect { port: reader.u16()? },
-      kind::HOST_COMMAND => Self::HostCommand {
-        name: reader.string()?,
-        args: reader.strings()?,
-      },
       kind::OPENED => Self::Opened,
       kind::EOF => Self::Eof,
       kind::RESIZE => Self::Resize(reader.window()?),
@@ -398,10 +383,6 @@ mod tests {
       }),
       Message::Exec(Exec::default()),
       Message::Connect { port: 8080 },
-      Message::HostCommand {
-        name: "test".into(),
-        args: vec!["-q".into()],
-      },
       Message::Opened,
       Message::Data(b"stdin".to_vec()),
       Message::Stderr(vec![0xFF]),
