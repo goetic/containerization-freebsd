@@ -50,7 +50,7 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
   /// Builds into datasets under `store`, such as `images/builds`, which it
-  /// creates if need be.
+  /// creates, mounted, if need be.
   pub fn new(agent: &'a Agent, store: &str) -> Self {
     Self {
       agent,
@@ -63,9 +63,7 @@ impl<'a> Builder<'a> {
   /// What they print goes to `output`. Builds into the same store must not
   /// run at once.
   pub fn build(&self, from: &str, steps: &[Step], output: &mut dyn FnMut(&[u8])) -> Result<Built> {
-    if !self.zfs.exists(&self.store)? {
-      self.zfs.create(&self.store)?;
-    }
+    self.zfs.create_mounted(&self.store)?;
     let mut built = Built {
       snapshot: from.to_string(),
       ran: 0,

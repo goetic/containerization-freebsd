@@ -57,6 +57,19 @@ impl<'a> Zfs<'a> {
     self.check(&["zfs", "create", "-p", dataset], QUICK)
   }
 
+  /// Creates `dataset` if need be, mounted: at `/<dataset>` if it would
+  /// inherit no mountpoint, as datasets under the pool of FreeBSD's VM image
+  /// do. Its children inherit the mountpoint.
+  pub fn create_mounted(&self, dataset: &str) -> Result<()> {
+    if !self.exists(dataset)? {
+      self.create(dataset)?;
+    }
+    if unmounted(&self.mountpoint(dataset)?) {
+      self.check(&["zfs", "set", &format!("mountpoint=/{dataset}"), dataset], QUICK)?;
+    }
+    Ok(())
+  }
+
   /// Snapshots `snapshot`, named `<dataset>@<name>`.
   pub fn snapshot(&self, snapshot: &str) -> Result<()> {
     self.check(&["zfs", "snapshot", snapshot], QUICK)
@@ -126,4 +139,9 @@ impl<'a> Zfs<'a> {
   fn succeeds(&self, argv: &[&str]) -> Result<bool> {
     Ok(matches!(self.agent.run(argv, QUICK)?.exit, crate::Exit::Code(0)))
   }
+}
+
+/// Whether a `mountpoint` property leaves a dataset where ZFS won't mount it.
+pub(crate) fn unmounted(mountpoint: &str) -> bool {
+  matches!(mountpoint, "none" | "legacy")
 }

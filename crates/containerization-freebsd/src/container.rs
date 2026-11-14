@@ -6,7 +6,7 @@
 use crate::agent::{Agent, Exec, Exit, Output, Process, Ran};
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
-use crate::zfs::Zfs;
+use crate::zfs::{Zfs, unmounted};
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
@@ -141,7 +141,8 @@ pub struct Containers<'a> {
 }
 
 impl<'a> Containers<'a> {
-  /// Containers under `store`, such as `images/containers`.
+  /// Containers under `store`, such as `images/containers`, which it
+  /// creates, mounted, if need be.
   pub fn new(agent: &'a Agent, store: &str) -> Self {
     Self {
       agent,
@@ -153,6 +154,7 @@ impl<'a> Containers<'a> {
   /// Creates container `id`, as `Container::create`, on a clone of the
   /// snapshot `from`.
   pub fn create(&self, id: &str, from: &str, configuration: Configuration) -> Result<Container<'a>> {
+    self.zfs.create_mounted(&self.store)?;
     Container::create(self.agent, id, from, &self.dataset(id), configuration)
   }
 
@@ -229,6 +231,11 @@ fn check_id(id: &str) -> Result<()> {
 /// Starts container `id`'s jail on `dataset`, and writes its files.
 fn set_up<'a>(agent: &'a Agent, id: &str, dataset: &str, configuration: &Configuration) -> Result<Jail<'a>> {
   let root = Zfs::new(agent).mountpoint(dataset)?;
+  if unmounted(&root) {
+    return Err(Error::Invalid(format!(
+      "{dataset} isn't mounted: give it, or a dataset it is under, a mountpoint"
+    )));
+  }
   let hostname = format!("host.hostname={}", configuration.hostname.as_deref().unwrap_or(id));
   let mut parameters = vec!["mount.devfs", hostname.as_str()];
   parameters.extend(configuration.parameters.iter().map(String::as_str));

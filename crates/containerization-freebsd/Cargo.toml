@@ -13,6 +13,9 @@ version = "0.1.0"
 [dependencies]
 containerization-freebsd-protocol.workspace = true
 dispatch2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 url.workspace = true
 virtualization.workspace = true
 xz2.workspace = true

@@ -24,6 +24,13 @@
 - Containers: each a jail on its own clone, with a main process, others run
   beside it, and its own hostname, network, resolver and hosts. Many share a
   machine, under a manager that lists them and deletes those left behind.
+- OCI images: pulls them from registries, with token or account
+  authentication and platform selection, into an OCI image layout on the
+  host, which lists, tags and deletes them. Checks each layer against the
+  image's config and unpacks it into a ZFS snapshot named by its chain id, so
+  images share layers. A container can run an image's default process.
+- Builds, containers and unpacked images can be stored under the pool of
+  FreeBSD's VM image, whose root dataset isn't mounted.
 - Preparing a base can skip the first boot's online upgrade, taking seconds
   instead of minutes.
 - A protocol for the guest agent: commands, terminals and port relays, side

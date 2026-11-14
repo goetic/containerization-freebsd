@@ -1,15 +1,16 @@
 //! Boots FreeBSD's VM image: its first boot, which installs the guest
 //! bundle, a cold boot of the prepared disk, and a restore of its saved
-//! state; jails, builds and containers on ZFS clones, on their own disk; and
-//! a build-sized workload on a share. Run signed, through
-//! `bin/dev/test-integration`.
+//! state; jails, builds and containers on ZFS clones, on their own disk; OCI
+//! images pulled, unpacked into ZFS and run; and a build-sized workload on a
+//! share. Run signed, through `bin/dev/test-integration`.
 
+use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
-  Builder, Configuration, Containers, Disk, Dns, Exec, Exit, Host, Jail, Network, Output, Share, Step, Upgrade,
-  WindowSize, Zfs, image,
+  Builder, Configuration, Containers, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Network, Output, Share, Step,
+  Unpacker, Upgrade, WindowSize, Zfs, image,
 };
-use containerization_freebsd_test::{base_disk, bundle, userland};
-use std::path::PathBuf;
+use containerization_freebsd_test::{base_disk, bundle, cache, userland};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DISK_SIZE: u64 = 24 << 30;
@@ -580,6 +581,233 @@ fn runs_a_build_sized_workload_on_a_share() {
     .check(&["rm", "-rf", "/mnt/shared/tree"], Duration::from_secs(600))
     .expect("delete from the share");
   assert!(!tree.exists(), "the host sees the tree gone");
+
+  machine
+    .shut_down(Duration::from_secs(120))
+    .expect("power off");
+}
+
+/// A layer of `files`, each a path and its contents, as a tarball owned by
+/// root and without the Mac's metadata, such as `com.apple.provenance`
+/// attributes, which FreeBSD can't restore.
+fn layer(work: &Path, name: &str, files: &[(&str, &str)]) -> Vec<u8> {
+  let staging = work.join(name);
+  let mut tops: Vec<&str> = Vec::new();
+  for (path, contents) in files {
+    let file = staging.join(path);
+    std::fs::create_dir_all(file.parent().expect("a directory")).expect("make the layer's directories");
+    std::fs::write(&file, contents).expect("write a layer's file");
+    let top = path.split('/').next().expect("a path");
+    if !tops.contains(&top) {
+      tops.push(top);
+    }
+  }
+
+  let tarball = work.join(format!("{name}.tar"));
+  let status = std::process::Command::new("tar")
+    .env("COPYFILE_DISABLE", "1")
+    .args([
+      "--no-mac-metadata",
+      "--no-xattrs",
+      "--no-acls",
+      "--uid",
+      "0",
+      "--gid",
+      "0",
+      "-cf",
+    ])
+    .arg(&tarball)
+    .arg("-C")
+    .arg(&staging)
+    .args(&tops)
+    .status()
+    .expect("run tar");
+  assert!(status.success(), "tar the layer");
+  std::fs::read(&tarball).expect("read the layer")
+}
+
+fn gzip(bytes: &[u8], work: &Path) -> Vec<u8> {
+  let path = work.join("gzip-input");
+  std::fs::write(&path, bytes).expect("write gzip's input");
+  let output = std::process::Command::new("gzip")
+    .args(["-c", "-n"])
+    .arg(&path)
+    .output()
+    .expect("run gzip");
+  assert!(output.status.success(), "gzip the layer");
+  output.stdout
+}
+
+/// `bytes` in the store, as a blob of `media_type`.
+fn blob(content: &ContentStore, media_type: &str, bytes: &[u8]) -> Descriptor {
+  Descriptor {
+    media_type: media_type.into(),
+    digest: content.ingest(bytes).expect("store a blob"),
+    size: bytes.len() as u64,
+    platform: None,
+    annotations: Default::default(),
+  }
+}
+
+#[test]
+fn pulls_unpacks_and_runs_oci_images() {
+  let work = work("pulls_unpacks_and_runs_oci_images");
+  let platform = Platform::default();
+  let store = ImageStore::new(&cache().join("images")).expect("open the image store");
+  let runtime = store
+    .pull("ghcr.io/freebsd/freebsd-runtime:15.1", &platform, None)
+    .expect("pull FreeBSD's runtime image");
+  let runtime_config = runtime.config(&platform).expect("its config");
+  let (_, runtime_manifest) = runtime.manifest(&platform).expect("its manifest");
+
+  // Two layers on the runtime's, the second hiding a file of the first, every
+  // file of a directory, and a file of the runtime's.
+  let added = layer(
+    &work,
+    "added",
+    &[
+      ("cfbsd/kept", "kept\n"),
+      ("cfbsd/gone", "gone\n"),
+      ("cfbsd/opaque/old", "old\n"),
+    ],
+  );
+  let hiding = layer(
+    &work,
+    "hiding",
+    &[
+      ("cfbsd/.wh.gone", ""),
+      ("cfbsd/opaque/.wh..wh..opq", ""),
+      ("cfbsd/opaque/new", "new\n"),
+      ("cfbsd/x.wh.y", "kept too\n"),
+      ("bin/.wh.freebsd-version", ""),
+    ],
+  );
+  let content = store.content();
+  let mut config = runtime_config.clone();
+  config
+    .rootfs
+    .diff_ids
+    .extend([sha256_digest(&added), sha256_digest(&hiding)]);
+  let mut manifest = runtime_manifest.clone();
+  manifest.config = blob(
+    content,
+    media_type::CONFIG,
+    &serde_json::to_vec(&config).expect("encode the config"),
+  );
+  manifest
+    .layers
+    .push(blob(content, media_type::LAYER, &added));
+  manifest
+    .layers
+    .push(blob(content, media_type::LAYER_GZIP, &gzip(&hiding, &work)));
+  let manifest = blob(
+    content,
+    media_type::MANIFEST,
+    &serde_json::to_vec(&manifest).expect("encode the manifest"),
+  );
+  let whiteouts = store
+    .create("localhost/cfbsd/whiteouts:1", manifest)
+    .expect("name the image");
+  let names: Vec<String> = store
+    .list()
+    .expect("list images")
+    .into_iter()
+    .map(|image| image.reference)
+    .collect();
+  for name in ["ghcr.io/freebsd/freebsd-runtime:15.1", "localhost/cfbsd/whiteouts:1"] {
+    assert!(names.iter().any(|listed| listed == name), "{name} in {names:?}");
+  }
+
+  let layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
+    .expect("prepare the base");
+  let machine = layout.machine("images").expect("make the machine");
+  machine.start().expect("start");
+  machine
+    .wait_ready(Duration::from_secs(300))
+    .expect("the agent starts");
+
+  // Each layer a snapshot, unpacked once whichever image it is in.
+  let unpacker = Unpacker::new(&machine.agent, "zroot/cfbsd/layers");
+  let base = unpacker
+    .unpack(&runtime, &platform)
+    .expect("unpack the runtime image");
+  assert_eq!((base.unpacked, base.cached), (1, 0));
+  let layered = unpacker
+    .unpack(&whiteouts, &platform)
+    .expect("unpack the image on it");
+  assert_eq!((layered.unpacked, layered.cached), (2, 1));
+  let again = unpacker
+    .unpack(&runtime, &platform)
+    .expect("unpack the runtime image again");
+  assert_eq!((again.snapshot.as_str(), again.unpacked), (base.snapshot.as_str(), 0));
+
+  // The image's own process: its shell, reading what it is sent.
+  let containers = Containers::new(&machine.agent, "zroot/cfbsd/containers");
+  let mut shell = containers
+    .create(
+      "runtime",
+      &base.snapshot,
+      Configuration {
+        process: runtime_config.process(),
+        network: Network::None,
+        ..Configuration::default()
+      },
+    )
+    .expect("create a container of the image");
+  shell.start().expect("start its shell");
+  let main = shell.process().expect("its shell");
+  main
+    .write(b"freebsd-version -u; exit 3\n")
+    .expect("give it commands");
+  main.close_input().expect("end its input");
+  let mut stdout = Vec::new();
+  let exit = loop {
+    match main.recv().expect("its output") {
+      Output::Stdout(bytes) => stdout.extend(bytes),
+      Output::Stderr(bytes) => panic!("{}", String::from_utf8_lossy(&bytes)),
+      Output::Exited(exit) => break exit,
+    }
+  };
+  assert!(
+    stdout.starts_with(b"15.1-RELEASE"),
+    "{}",
+    String::from_utf8_lossy(&stdout)
+  );
+  assert_eq!(exit, Exit::Code(3));
+  shell.delete().expect("delete the container");
+
+  let hidden = containers
+    .create(
+      "whiteouts",
+      &layered.snapshot,
+      Configuration {
+        network: Network::None,
+        ..Configuration::default()
+      },
+    )
+    .expect("create a container of the layered image");
+  let ran = hidden
+    .check(
+      &sh("cat /cfbsd/kept /cfbsd/x.wh.y; ls -A /cfbsd/opaque /cfbsd; test ! -e /bin/freebsd-version && echo hidden"),
+      SECONDS,
+    )
+    .expect("look at its files");
+  assert_eq!(
+    ran.lines(),
+    [
+      "kept",
+      "kept too",
+      "/cfbsd:",
+      "kept",
+      "opaque",
+      "x.wh.y",
+      "",
+      "/cfbsd/opaque:",
+      "new",
+      "hidden"
+    ]
+  );
+  hidden.delete().expect("delete the container");
 
   machine
     .shut_down(Duration::from_secs(120))

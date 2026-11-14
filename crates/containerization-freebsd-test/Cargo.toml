@@ -10,6 +10,7 @@ version = "0.1.0"
 
 [dependencies]
 containerization-freebsd.workspace = true
+serde_json.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
