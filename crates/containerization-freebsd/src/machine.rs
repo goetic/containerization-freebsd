@@ -33,6 +33,16 @@ pub struct Share {
   pub read_only: bool,
 }
 
+/// A raw disk image attached after the root disk, such as one holding a
+/// pool of images. `Machine::disk_device` finds it in the guest.
+#[derive(Clone, Debug)]
+pub struct Disk {
+  pub path: PathBuf,
+  /// At most 20 ASCII bytes: Virtualization's limit.
+  pub identifier: String,
+  pub read_only: bool,
+}
+
 /// Everything a boot of the same guest must find again.
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -43,6 +53,8 @@ pub struct Layout {
   pub nat: bool,
   /// A read-only volume attached after the disk, such as a NoCloud seed.
   pub seed: Option<PathBuf>,
+  /// Attached after the seed, in this order.
+  pub disks: Vec<Disk>,
   pub shares: Vec<Share>,
   pub variables: PathBuf,
   pub identifier: Vec<u8>,
@@ -88,6 +100,7 @@ impl Layout {
       memory: 4 << 30,
       nat: false,
       seed: None,
+      disks: Vec::new(),
       shares: Vec::new(),
       variables,
       identifier: GenericMachineIdentifier::new()
@@ -130,11 +143,29 @@ impl Layout {
       }
       None => None,
     };
+    let disks = self
+      .disks
+      .iter()
+      .map(|disk| {
+        VirtioBlockDeviceConfiguration::validate_block_device_identifier(&disk.identifier)
+          .map_err(failed("check the disk's identifier"))?;
+        let attachment =
+          DiskImageStorageDeviceAttachment::new(&url(&disk.path)?, disk.read_only).map_err(failed("attach a disk"))?;
+        let device = VirtioBlockDeviceConfiguration::new(&attachment).map_err(failed("make a disk device"))?;
+        device.set_block_device_identifier(&disk.identifier);
+        Ok(device)
+      })
+      .collect::<Result<Vec<_>>>()?;
     let mut storage: Vec<&dyn StorageDeviceConfiguration> = vec![&disk];
     storage.extend(
       seed
         .as_ref()
         .map(|seed| seed as &dyn StorageDeviceConfiguration),
+    );
+    storage.extend(
+      disks
+        .iter()
+        .map(|disk| disk as &dyn StorageDeviceConfiguration),
     );
     configuration.set_storage_devices(&storage);
 
@@ -316,6 +347,26 @@ impl Machine {
       machine.save_machine_state_to(&url, done)
     })?;
     Ok(started.elapsed().as_secs_f64())
+  }
+
+  /// The guest's device for the disk with `identifier`, such as
+  /// `/dev/vtbd1`. Looked up rather than named: the image turns off the
+  /// `/dev/diskid` labels that would name it.
+  pub fn disk_device(&self, identifier: &str) -> Result<String> {
+    let script = r#"for disk in $(sysctl -n kern.disks); do
+  [ "$(diskinfo -s "$disk" 2>/dev/null)" = "$1" ] && echo "/dev/$disk"
+done; true"#;
+    let ran = self
+      .agent
+      .check(&["sh", "-c", script, "sh", identifier], Duration::from_secs(60))?;
+
+    match ran.lines().as_slice() {
+      [device] => Ok(device.to_string()),
+      [] => Err(Error::Guest(format!("no disk has the identifier {identifier:?}"))),
+      devices => Err(Error::Guest(format!(
+        "disks {devices:?} all have the identifier {identifier:?}"
+      ))),
+    }
   }
 
   /// Mounts the share tagged `tag` at `path` in the guest.

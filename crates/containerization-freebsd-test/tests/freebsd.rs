@@ -1,9 +1,10 @@
 //! Boots FreeBSD's VM image: its first boot, which installs the guest
 //! bundle, a cold boot of the prepared disk, and a restore of its saved
-//! state. Run signed, through `bin/dev/test-integration`.
+//! state; and jails on ZFS clones, on a disk of their own. Run signed,
+//! through `bin/dev/test-integration`.
 
-use containerization_freebsd::{Exec, Exit, Output, Share, Upgrade, WindowSize};
-use containerization_freebsd_test::{base_disk, bundle};
+use containerization_freebsd::{Disk, Exec, Exit, Jail, Output, Share, Upgrade, WindowSize, Zfs, image};
+use containerization_freebsd_test::{base_disk, bundle, userland};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -145,6 +146,100 @@ fn prepares_boots_and_restores() {
   );
 
   restored
+    .shut_down(Duration::from_secs(120))
+    .expect("power off");
+}
+
+#[test]
+fn runs_a_jail_on_a_clone_of_the_userland() {
+  let work = work("runs_a_jail_on_a_clone_of_the_userland");
+  let mut layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
+    .expect("prepare the base");
+
+  let images = Disk {
+    path: work.join("images.raw"),
+    identifier: "images".into(),
+    read_only: false,
+  };
+  image::create_disk(&images.path, 8 << 30).expect("make the images disk");
+  layout.disks.push(images);
+  let userland = userland();
+  layout.shares.push(Share {
+    tag: "userland".into(),
+    path: userland.parent().expect("the cache").to_path_buf(),
+    read_only: true,
+  });
+
+  let machine = layout.machine("jails").expect("make the machine");
+  machine.start().expect("start");
+  machine
+    .wait_ready(Duration::from_secs(300))
+    .expect("the agent starts");
+  machine
+    .mount_share("userland", "/mnt/userland")
+    .expect("mount the userland's share");
+
+  let device = machine.disk_device("images").expect("find the images disk");
+  let zfs = Zfs::new(&machine.agent);
+  zfs
+    .create_pool("images", &device)
+    .expect("make a pool on the disk");
+  zfs
+    .create("images/userland")
+    .expect("make the userland's dataset");
+  zfs
+    .extract(&format!("/mnt/userland/{}", image::USERLAND), "images/userland")
+    .expect("extract the userland");
+  zfs
+    .snapshot("images/userland@base")
+    .expect("snapshot the userland");
+  zfs
+    .clone("images/userland@base", "images/jails/first")
+    .expect("clone the userland");
+  let root = zfs
+    .mountpoint("images/jails/first")
+    .expect("find the clone");
+
+  let jail = Jail::start(&machine.agent, "first", &root, &["mount.devfs"]).expect("start a jail");
+  let ran = jail
+    .check(&["freebsd-version", "-u"], SECONDS)
+    .expect("run a command in the jail");
+  assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
+  // Its root is the clone: the agent is the guest's, not the jail's.
+  jail
+    .check(
+      &["test", "!", "-e", "/usr/local/sbin/containerization-freebsd-agent"],
+      SECONDS,
+    )
+    .expect("a root of its own");
+
+  // What it writes stays in its clone.
+  let process = jail
+    .spawn(Exec {
+      argv: vec!["sh".into(), "-c".into(), "pwd; echo jailed > mark".into()],
+      cwd: Some("/root".into()),
+      ..Exec::default()
+    })
+    .expect("spawn in the jail");
+  process.close_input().expect("close its input");
+  assert_eq!(process.recv().expect("its output"), Output::Stdout(b"/root\n".to_vec()));
+  assert_eq!(process.recv().expect("its exit"), Output::Exited(Exit::Code(0)));
+  machine
+    .agent
+    .check(&["test", "-e", &format!("{root}/root/mark")], SECONDS)
+    .expect("the clone has the jail's file");
+  machine
+    .agent
+    .check(&["test", "!", "-e", "/images/userland/root/mark"], SECONDS)
+    .expect("the userland does not");
+
+  jail.stop().expect("stop the jail");
+  zfs
+    .destroy("images/jails/first")
+    .expect("destroy the clone");
+  assert!(!zfs.exists("images/jails/first").expect("list datasets"));
+
+  machine
     .shut_down(Duration::from_secs(120))
     .expect("power off");
 }

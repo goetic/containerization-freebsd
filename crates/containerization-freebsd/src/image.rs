@@ -15,6 +15,11 @@ pub const BASE_DISK: &str = "base.raw";
 pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r3.tar.xz";
 const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r3/freebsd-15.1-arm64-guest-r3.tar.xz";
 const BUNDLE_SHA256: &str = "4e1fc71b24896a0b1efdac5d3da900ccb89346a85e5defdc69d36971d48c3c28";
+/// `RELEASE`'s base system, the userland for jails, in the cache `userland`
+/// keeps.
+pub const USERLAND: &str = "FreeBSD-15.1-RELEASE-arm64-base.txz";
+const USERLAND_URL: &str = "https://download.freebsd.org/releases/arm64/aarch64/15.1-RELEASE/base.txz";
+const USERLAND_SHA256: &str = "5b7a46a0abfbe23a1d4454b5600e2efcfce16b705bc7e9c851c37470c035ef98";
 
 fn run(command: &mut Command) -> Result<String> {
   let description = format!("{command:?}");
@@ -116,14 +121,37 @@ fn base_disk_from(directory: &str, cache: &Path) -> Result<PathBuf> {
 
 /// The guest bundle in `cache`, downloaded and verified once.
 pub fn bundle(cache: &Path) -> Result<PathBuf> {
-  let path = cache.join(BUNDLE);
+  pinned(cache, BUNDLE, BUNDLE_URL, BUNDLE_SHA256)
+}
+
+/// `RELEASE`'s `base.txz` in `cache`, downloaded and verified once: the
+/// userland a jail's root starts from.
+pub fn userland(cache: &Path) -> Result<PathBuf> {
+  pinned(cache, USERLAND, USERLAND_URL, USERLAND_SHA256)
+}
+
+fn pinned(cache: &Path, name: &str, url: &str, sha256: &str) -> Result<PathBuf> {
+  let path = cache.join(name);
 
   if !path.exists() {
     std::fs::create_dir_all(cache).map_err(Error::io(format!("making {}", cache.display())))?;
-    fetch(BUNDLE_URL, &path)?;
-    verify(&path, BUNDLE_SHA256)?;
+    fetch(url, &path)?;
+    verify(&path, sha256)?;
   }
   Ok(path)
+}
+
+/// A new, empty raw disk of `size` bytes at `path`, taking no space until
+/// written. Never overwrites an existing file.
+pub fn create_disk(path: &Path, size: u64) -> Result<()> {
+  let creating = || format!("creating {}", path.display());
+
+  File::options()
+    .write(true)
+    .create_new(true)
+    .open(path)
+    .and_then(|file| file.set_len(size))
+    .map_err(Error::io(creating()))
 }
 
 /// The sha256 a `CHECKSUM.SHA256` lists for `name`: `SHA256 (name) = …`.

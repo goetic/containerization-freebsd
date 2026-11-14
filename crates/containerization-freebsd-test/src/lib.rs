@@ -3,8 +3,8 @@
 use containerization_freebsd::image;
 use std::path::PathBuf;
 
-/// FreeBSD's VM image and the guest bundle, downloaded once across runs:
-/// about 700 MB.
+/// FreeBSD's VM image, the guest bundle and the userland for jails,
+/// downloaded once across runs: about 900 MB.
 pub fn cache() -> PathBuf {
   PathBuf::from(std::env::var_os("HOME").expect("HOME is set")).join(".cache/containerization-freebsd-tests")
 }
@@ -24,6 +24,12 @@ pub fn bundle() -> PathBuf {
     return local;
   }
   cached(image::BUNDLE)
+}
+
+/// The cached userland for jails, `base.txz`, which `bin/dev/fetch-image`
+/// downloads too.
+pub fn userland() -> PathBuf {
+  cached(image::USERLAND)
 }
 
 fn cached(name: &str) -> PathBuf {
