@@ -32,6 +32,12 @@ the host will.
   refused. A user gets their home as `HOME`, unless the environment gives
   one.
 - **Terminals:** Eof is ignored; ^D, sent as Data, ends a terminal's input.
-- **Connect:** relays to 127.0.0.1, or failing that ::1.
+- **Sockets:** in a jail, a child process attached to it opens them, so
+  paths and loopback are the jail's. Connect relays to 127.0.0.1, or
+  failing that ::1, or to a Unix socket. Listen replaces a socket already
+  at its path, and opens an Accepted channel for each connection. The
+  host's Eof stops it, closing and removing the socket before the agent's
+  Eof; an Error, or the session's end, leaves the file for a later Listen
+  to replace.
 
 Unsafe code is confined to `src/sys.rs`.

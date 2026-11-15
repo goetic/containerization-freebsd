@@ -13,10 +13,12 @@
 
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{
-  CONTROL, Decoder, Frame, Message, Mux, Side, Skipped, VersionMismatch, WINDOW,
+  Address, CONTROL, Connect, Decoder, Frame, Listen, Message, Mux, Side, Skipped, VersionMismatch, WINDOW,
 };
 use std::collections::HashMap;
 use std::io::{PipeReader, PipeWriter, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -65,11 +67,18 @@ pub enum Output {
   Exited(Exit),
 }
 
-/// A connection to a TCP port on the guest's loopback. Dropping it closes
-/// the connection.
+/// A connection to a socket in the guest: a TCP port on its loopback or a
+/// jail's, or a Unix socket. Dropping it closes the connection.
 pub struct Relay {
   stream: Stream,
   ended: AtomicBool,
+}
+
+/// A Unix socket the agent listens on, relaying each connection to a socket
+/// on the host. Dropping it closes the socket in the guest, leaving its
+/// file.
+pub(crate) struct Listener {
+  stream: Stream,
 }
 
 /// An open channel: its number, and the messages the agent sends on it.
@@ -93,8 +102,23 @@ struct State {
   credit: Arc<Credit>,
   /// Where each open channel's messages go.
   channels: HashMap<u32, mpsc::Sender<Message>>,
+  /// The host socket each open Listen channel's connections relay to.
+  listeners: HashMap<u32, PathBuf>,
   mismatch: Option<VersionMismatch>,
   closed: bool,
+}
+
+/// What a frame from the agent leaves for `handle` to do.
+enum Heard {
+  Nothing,
+  /// The session started, or can't: wake those waiting for it.
+  Changed,
+  /// A connection to a Listen channel's socket, for `relay_accepted`.
+  Accepted {
+    channel: u32,
+    host: PathBuf,
+    messages: Receiver<Message>,
+  },
 }
 
 /// What the console reader hands the thread that handles it.
@@ -128,6 +152,7 @@ impl Agent {
         console: input,
         credit: credit.clone(),
         channels: HashMap::new(),
+        listeners: HashMap::new(),
         mismatch: None,
         closed: false,
       }),
@@ -139,6 +164,13 @@ impl Agent {
     std::thread::spawn(move || handle(&queue, &handler));
 
     Self { shared }
+  }
+
+  /// Another handle on the same agent, for threads of the crate's own.
+  pub(crate) fn share(&self) -> Self {
+    Self {
+      shared: self.shared.clone(),
+    }
   }
 
   /// Starts a session with an agent that is already running, as after a
@@ -182,16 +214,46 @@ impl Agent {
     let what = format!("{:?}", exec.argv);
 
     Ok(Process {
-      stream: self.open(Message::Exec(exec), what)?,
+      stream: self.open(Message::Exec(exec), what, None)?,
       exited: AtomicBool::new(false),
     })
   }
 
   /// Connects to `port` on the guest's loopback.
   pub fn connect(&self, port: u16) -> Result<Relay> {
+    self.relay(Connect {
+      to: Address::Port(port),
+      jail: None,
+    })
+  }
+
+  /// Connects to the Unix socket at `path` in the guest.
+  pub fn connect_unix(&self, path: &str) -> Result<Relay> {
+    self.relay(Connect {
+      to: Address::Unix(path.to_string()),
+      jail: None,
+    })
+  }
+
+  pub(crate) fn relay(&self, connect: Connect) -> Result<Relay> {
+    let what = match &connect.to {
+      Address::Port(port) => format!("port {port}"),
+      Address::Unix(path) => path.clone(),
+    };
+
     Ok(Relay {
-      stream: self.open(Message::Connect { port }, format!("port {port}"))?,
+      stream: self.open(Message::Connect(connect), what, None)?,
       ended: AtomicBool::new(false),
+    })
+  }
+
+  /// Has the agent listen on the Unix socket `listen` describes, relaying
+  /// each connection to the host's socket at `host`.
+  pub(crate) fn listen(&self, listen: Listen, host: PathBuf) -> Result<Listener> {
+    let what = listen.path.clone();
+
+    Ok(Listener {
+      stream: self.open(Message::Listen(listen), what, Some(host))?,
     })
   }
 
@@ -262,8 +324,8 @@ impl Agent {
   }
 
   /// Opens a channel with `message`, and waits for the agent to start what
-  /// it asks for.
-  fn open(&self, message: Message, what: String) -> Result<Stream> {
+  /// it asks for. A Listen channel's connections relay to `host`.
+  fn open(&self, message: Message, what: String, host: Option<PathBuf>) -> Result<Stream> {
     let (sender, receiver) = mpsc::channel();
     let channel = {
       let mut state = self.shared.lock();
@@ -272,6 +334,9 @@ impl Agent {
         .open(message)
         .map_err(|error| Error::Guest(format!("{what}: {error}")))?;
       state.channels.insert(channel, sender);
+      if let Some(host) = host {
+        state.listeners.insert(channel, host);
+      }
       state.write(&frame)?;
       channel
     };
@@ -390,6 +455,48 @@ impl Relay {
   }
 }
 
+impl Listener {
+  /// Stops it, and waits for the agent to close and remove its socket.
+  pub(crate) fn close(self) -> Result<()> {
+    if !self.stream.shared.lock().mux.is_open(self.stream.channel) {
+      return Ok(());
+    }
+    self.stream.send(Message::Eof)?;
+
+    loop {
+      match self.stream.recv(Some(OPENING))? {
+        Some(Message::Eof) => return Ok(()),
+        Some(_) => {}
+        None => {
+          return Err(Error::Timeout(format!(
+            "{}: the agent did not close it within {}s",
+            self.stream.what,
+            OPENING.as_secs()
+          )));
+        }
+      }
+    }
+  }
+}
+
+/// Relays a connection the agent accepted to the host's socket at `host`.
+fn relay_accepted(stream: Stream, host: &Path) {
+  match UnixStream::connect(host) {
+    Ok(local) => {
+      if stream.send(Message::Opened).is_ok() {
+        let relay = Relay {
+          stream,
+          ended: AtomicBool::new(false),
+        };
+        crate::socket::pump(relay, local);
+      }
+    }
+    Err(error) => {
+      let _ = stream.send(Message::Error(format!("connecting to {}: {error}", host.display())));
+    }
+  }
+}
+
 impl Stream {
   fn send(&self, message: Message) -> Result<()> {
     let mut state = self.shared.lock();
@@ -433,7 +540,7 @@ impl Drop for Stream {
     if state.channels.contains_key(&self.channel) && state.mux.is_open(self.channel) {
       state.close(self.channel, "closed by the host");
     }
-    state.channels.remove(&self.channel);
+    state.forget(self.channel);
   }
 }
 
@@ -463,6 +570,7 @@ impl State {
   /// Starts a session; ends any there was, and what it ran.
   fn hello(&mut self) -> Result<()> {
     self.channels.clear();
+    self.listeners.clear();
     let hello = self.mux.hello();
     self.write(&hello)
   }
@@ -473,39 +581,61 @@ impl State {
     }
   }
 
-  fn receive(&mut self, frame: Frame) -> bool {
+  fn forget(&mut self, channel: u32) {
+    self.channels.remove(&channel);
+    self.listeners.remove(&channel);
+  }
+
+  fn receive(&mut self, frame: Frame) -> Heard {
     let channel = frame.channel;
 
     match self.mux.receive(frame) {
       // The agent has no session: it started, or lost frames.
       Ok((_, Message::Hello { answer: false, .. })) => {
         let _ = self.hello();
-        false
+        Heard::Nothing
       }
-      Ok((_, Message::Hello { answer: true, .. })) => true,
+      Ok((_, Message::Hello { answer: true, .. })) => Heard::Changed,
       // The console reader counted it.
-      Ok((_, Message::Received(_))) => false,
+      Ok((_, Message::Received(_))) => Heard::Nothing,
       Ok((_, Message::Ping(number))) => {
         if let Ok(pong) = self.mux.send(channel, Message::Pong(number)) {
           let _ = self.write(&pong);
         }
-        false
+        Heard::Nothing
       }
+      Ok((_, Message::Accepted { listener })) => match self.listeners.get(&listener) {
+        Some(host) => {
+          let host = host.clone();
+          let (sender, messages) = mpsc::channel();
+          self.channels.insert(channel, sender);
+          Heard::Accepted {
+            channel,
+            host,
+            messages,
+          }
+        }
+        // It stopped as the agent accepted the connection.
+        None => {
+          self.close(channel, "nothing listens there any more");
+          Heard::Nothing
+        }
+      },
       Ok((_, message)) => {
         if let Some(sender) = self.channels.get(&channel) {
           let _ = sender.send(message);
         }
         if !self.mux.is_open(channel) {
-          self.channels.remove(&channel);
+          self.forget(channel);
         }
-        false
+        Heard::Nothing
       }
       Err(containerization_freebsd_protocol::Error::Version(mismatch)) => {
         self.mismatch = Some(mismatch);
-        true
+        Heard::Changed
       }
       // Such as a message that crossed its channel's closing.
-      Err(_) => false,
+      Err(_) => Heard::Nothing,
     }
   }
 }
@@ -591,36 +721,51 @@ fn read(mut output: PipeReader, credit: &Credit, events: &mpsc::Sender<Event>) {
 }
 
 /// Handles what the console brings, until it closes.
-fn handle(queue: &Receiver<Event>, shared: &Shared) {
+fn handle(queue: &Receiver<Event>, shared: &Arc<Shared>) {
   let mut line = Vec::new();
 
   for event in queue {
     let mut state = shared.lock();
-    let changed = match event {
+    let heard = match event {
       // Before a session, console text is the guest explaining why there is
       // none, such as first-boot.sh failing.
       Event::Read(bytes) => {
         if !state.mux.in_session() {
           echo(&mut line, &bytes);
         }
-        false
+        Heard::Nothing
       }
       Event::Frame(frame) => state.receive(frame),
       // Frames were lost mid-session: start over.
       Event::Skipped if state.mux.in_session() => {
         let _ = state.hello();
-        false
+        Heard::Nothing
       }
-      Event::Skipped => false,
+      Event::Skipped => Heard::Nothing,
     };
-    if changed {
-      shared.changed.notify_all();
+    match heard {
+      Heard::Nothing => {}
+      Heard::Changed => shared.changed.notify_all(),
+      Heard::Accepted {
+        channel,
+        host,
+        messages,
+      } => {
+        let stream = Stream {
+          channel,
+          shared: shared.clone(),
+          messages: Mutex::new(messages),
+          what: format!("a connection to {}", host.display()),
+        };
+        std::thread::spawn(move || relay_accepted(stream, &host));
+      }
     }
   }
 
   let mut state = shared.lock();
   state.closed = true;
   state.channels.clear();
+  state.listeners.clear();
   shared.changed.notify_all();
 }
 
@@ -639,7 +784,7 @@ fn echo(line: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
   use super::*;
   use containerization_freebsd_protocol::VERSION;
   use std::net::TcpListener;
@@ -658,7 +803,7 @@ mod tests {
     (output, input)
   }
 
-  fn started() -> Agent {
+  pub(crate) fn started() -> Agent {
     let (output, input) = serve();
     let agent = Agent::new(output, input);
     agent.wait_ready(PATIENCE).expect("a session");

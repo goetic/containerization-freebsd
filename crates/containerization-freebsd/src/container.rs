@@ -1,12 +1,16 @@
-//! Containers: each a jail on its own ZFS clone, with a main process and its
-//! own hostname, network, resolver and hosts. Where Containerization gives
+//! Containers: each a jail on its own ZFS clone, with a main process, its
+//! own hostname, network, resolver and hosts, and sockets relayed to and
+//! from the host. Where Containerization gives
 //! each Linux container a VM, these share one machine; for a VM each, make a
 //! machine each.
 
-use crate::agent::{Agent, Exec, Exit, Output, Process, Ran};
+use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
+use crate::socket::{SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
+use std::mem;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
@@ -29,6 +33,9 @@ pub struct Configuration {
   /// More jail(8) parameters, as `Jail::start` takes them. Containers mount
   /// devfs already.
   pub parameters: Vec<String>,
+  /// Unix sockets relayed between the host and it, with their guest paths
+  /// in the container: from when `start` starts it until it stops.
+  pub sockets: Vec<UnixSocket>,
 }
 
 /// A container's `/etc/resolv.conf`.
@@ -56,7 +63,9 @@ pub struct Container<'a> {
   jail: Jail<'a>,
   dataset: String,
   process: Exec,
+  sockets: Vec<UnixSocket>,
   main: Option<Process>,
+  relays: Mutex<Vec<SocketRelay>>,
 }
 
 impl<'a> Container<'a> {
@@ -75,7 +84,9 @@ impl<'a> Container<'a> {
         jail,
         dataset: dataset.to_string(),
         process: configuration.process,
+        sockets: configuration.sockets,
         main: None,
+        relays: Mutex::default(),
       }),
       Err(error) => {
         let _ = zfs.destroy(dataset);
@@ -92,11 +103,20 @@ impl<'a> Container<'a> {
     &self.dataset
   }
 
-  /// Starts its main process, at most once.
+  /// Relays its sockets, and starts its main process, at most once.
   pub fn start(&mut self) -> Result<()> {
     if self.main.is_some() {
       return Err(Error::Invalid(format!("container {} has started already", self.id())));
     }
+    let relays = self
+      .sockets
+      .iter()
+      .map(|socket| self.jail.relay_socket(socket))
+      .collect::<Result<_>>()?;
+    *self
+      .relays
+      .get_mut()
+      .unwrap_or_else(PoisonError::into_inner) = relays;
     self.main = Some(self.jail.spawn(self.process.clone())?);
     Ok(())
   }
@@ -121,16 +141,35 @@ impl<'a> Container<'a> {
     self.jail.check(argv, timeout)
   }
 
-  /// Stops its jail: jail(8) sends its processes SIGTERM, and kills those
-  /// left after 10 seconds. Its main process's last output and exit can
-  /// still be read. Stopping a stopped container does nothing.
+  /// As `Jail::connect`, in the container.
+  pub fn connect(&self, port: u16) -> Result<Relay> {
+    self.jail.connect(port)
+  }
+
+  /// As `Jail::connect_unix`, in the container.
+  pub fn connect_unix(&self, path: &str) -> Result<Relay> {
+    self.jail.connect_unix(path)
+  }
+
+  /// Closes its socket relays, and stops its jail: jail(8) sends its
+  /// processes SIGTERM, and kills those left after 10 seconds. Its main
+  /// process's last output and exit can still be read. Stopping a stopped
+  /// container does nothing.
   pub fn stop(&self) -> Result<()> {
+    self.close_relays()?;
     stop(self.agent, self.id())
   }
 
   /// Stops it, and destroys its clone.
   pub fn delete(self) -> Result<()> {
+    self.close_relays()?;
     delete(self.agent, self.id(), &self.dataset)
+  }
+
+  fn close_relays(&self) -> Result<()> {
+    let relays = mem::take(&mut *self.relays.lock().unwrap_or_else(PoisonError::into_inner));
+
+    relays.into_iter().try_for_each(SocketRelay::close)
   }
 }
 

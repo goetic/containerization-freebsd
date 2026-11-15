@@ -34,6 +34,14 @@
   and with a umask and resource limits. A container of an image runs as the
   image's user. The agent enters jails itself, so a working directory in a
   jail no longer needs its shell. Protocol version 3.
+- Relays Unix sockets between the host and the guest, a jail or a
+  container, as Containerization does: a host socket appears inside, or
+  one inside appears on the host, with the permissions given. A container
+  relays its sockets while it runs. Connects to the Unix sockets and
+  loopback ports of jails and containers too. Also protocol version 3.
+- Fixes a relay losing the host's last Data when the host's end finished
+  second, and stopping a jail returning before the jail is gone, while its
+  TCP connections still hold it.
 - Builds, containers and unpacked images can be stored under the pool of
   FreeBSD's VM image, whose root dataset isn't mounted.
 - Preparing a base can skip the first boot's online upgrade, taking seconds

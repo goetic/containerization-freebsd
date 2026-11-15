@@ -6,7 +6,7 @@
 //! well as the process: a process that leaves a child holding its output
 //! open runs on, as far as the host can tell, until that child exits too.
 
-use crate::session::{Handle, Input, Outbox, READ, Running};
+use crate::session::{Handle, Input, Outbox, READ};
 use crate::{sys, user};
 use containerization_freebsd_protocol::{Exec, Exit, Message, WindowSize};
 use std::ffi::CString;
@@ -165,10 +165,7 @@ fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
   ];
   watch(child, process.clone(), output, outbox);
 
-  Ok(Handle {
-    input,
-    running: Running::Process(process),
-  })
+  Ok(Handle::Process { input, process })
 }
 
 fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Result<Handle> {
@@ -191,10 +188,7 @@ fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Re
   let output = vec![pump(reader, outbox.clone(), Message::Data, true)];
   watch(child, process.clone(), output, outbox);
 
-  Ok(Handle {
-    input,
-    running: Running::Process(process),
-  })
+  Ok(Handle::Process { input, process })
 }
 
 /// Writes the host's Data to `sink`. Its Eof closes `sink`, or with

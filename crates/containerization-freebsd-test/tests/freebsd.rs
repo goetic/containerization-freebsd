@@ -6,12 +6,16 @@
 
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
-  Builder, Configuration, Containers, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Network, Output, Process,
-  Resource, Share, Step, Unpacker, Upgrade, User, WindowSize, Zfs, image,
+  Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Network, Output,
+  Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DISK_SIZE: u64 = 24 << 30;
 const SECONDS: Duration = Duration::from_secs(60);
@@ -42,6 +46,48 @@ fn finish(process: &Process) -> (String, Exit) {
       Output::Exited(exit) => return (String::from_utf8_lossy(&stdout).into_owned(), exit),
     }
   }
+}
+
+/// What `attempt` gives once it gives anything, trying for a minute: for a
+/// server just started.
+fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
+  let started = Instant::now();
+
+  loop {
+    if let Some(value) = attempt() {
+      return value;
+    }
+    assert!(started.elapsed() < SECONDS, "gave up after {}s", SECONDS.as_secs());
+    std::thread::sleep(Duration::from_millis(100));
+  }
+}
+
+/// Answers each connection to `listener`, once it ends, with what it sent
+/// in capitals.
+fn answer_in_capitals(listener: UnixListener) {
+  std::thread::spawn(move || {
+    for stream in listener.incoming() {
+      let mut stream = stream.expect("a connection");
+      let mut received = Vec::new();
+      stream
+        .read_to_end(&mut received)
+        .expect("read the question");
+      stream
+        .write_all(&received.to_ascii_uppercase())
+        .expect("answer");
+    }
+  });
+}
+
+/// What a connection to `path` answers `text` with: nothing, if it closes
+/// first.
+fn ask(path: &Path, text: &str) -> String {
+  let mut stream = UnixStream::connect(path).expect("connect");
+  let _ = stream.write_all(text.as_bytes());
+  let _ = stream.shutdown(Shutdown::Write);
+  let mut answer = String::new();
+  let _ = stream.read_to_string(&mut answer);
+  answer
 }
 
 fn host_sha256(path: &std::path::Path) -> String {
@@ -390,7 +436,12 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("only the steps that built have datasets");
 
   // Containers: a main process that stops cleanly on SIGTERM, in its own
-  // jail with its own hostname, resolver and hosts.
+  // jail with its own hostname, resolver, hosts and sockets. The work
+  // directory's paths are too long for a socket's.
+  let sockets = std::env::temp_dir().join(format!("cfbsd-{}", std::process::id()));
+  std::fs::create_dir_all(&sockets).expect("make a directory for sockets");
+  let (host_socket, web_socket) = (sockets.join("host.sock"), sockets.join("web.sock"));
+  answer_in_capitals(UnixListener::bind(&host_socket).expect("listen on the host"));
   let containers = Containers::new(&machine.agent, "images/containers");
   let mut web = containers
     .create(
@@ -416,6 +467,20 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
           address: "192.0.2.1".into(),
           names: vec!["db.test".into(), "db".into()],
         }],
+        sockets: vec![
+          UnixSocket {
+            host: host_socket.clone(),
+            guest: "/var/run/host.sock".into(),
+            direction: Direction::Into,
+            mode: Some(0o666),
+          },
+          UnixSocket {
+            host: web_socket.clone(),
+            guest: "/var/run/web.sock".into(),
+            direction: Direction::OutOf,
+            mode: Some(0o600),
+          },
+        ],
         ..Configuration::default()
       },
     )
@@ -486,8 +551,54 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   );
   assert_eq!((stdout.as_str(), exit), ("4242\n0\n/\n", Exit::Code(0)));
 
+  // The host's socket in it, open to its users; its own socket on the
+  // host; and a port on its own loopback.
+  let (stdout, exit) = finish(
+    &web
+      .exec(Exec {
+        argv: sh("stat -f %Lp /var/run/host.sock; echo hello | nc -N -U /var/run/host.sock")
+          .map(String::from)
+          .to_vec(),
+        user: Some(User {
+          name: "nobody".into(),
+          ..User::default()
+        }),
+        ..Exec::default()
+      })
+      .expect("use the host's socket"),
+  );
+  assert_eq!((stdout.as_str(), exit), ("666\nHELLO\n", Exit::Code(0)));
+  let mode = std::fs::metadata(&web_socket)
+    .expect("the container's socket on the host")
+    .permissions()
+    .mode();
+  assert_eq!(mode & 0o777, 0o600);
+  let serve = |script: &str| {
+    web
+      .exec(Exec {
+        argv: sh(script).map(String::from).to_vec(),
+        ..Exec::default()
+      })
+      .expect("serve in the container")
+  };
+  let server = serve("echo pong | nc -N -lU /var/run/web.sock");
+  let answer = eventually(|| Some(ask(&web_socket, "ping\n")).filter(|answer| !answer.is_empty()));
+  assert_eq!(answer, "pong\n");
+  assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
+  let server = serve("echo pong | nc -N -l 127.0.0.1 7000");
+  let relay = eventually(|| web.connect(7000).ok());
+  relay.write(b"ping\n").expect("write to its port");
+  relay.close_write().expect("finish writing");
+  let mut answer = Vec::new();
+  while let Some(bytes) = relay.read().expect("read from its port") {
+    answer.extend(bytes);
+  }
+  assert_eq!(answer, b"pong\n");
+  assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
+
   // Stderr is ignored: sh reports there its sleep dying of SIGTERM.
   web.stop().expect("stop the container");
+  assert!(!web_socket.exists(), "its socket on the host outlived it");
   let mut stdout = Vec::new();
   let exit = loop {
     match main.recv().expect("its last output") {
@@ -497,7 +608,9 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     }
   };
   assert_eq!((stdout.as_slice(), exit), (&b"stopping\n"[..], Exit::Code(3)));
+  // Only once the agent has closed the host's socket in it.
   web.delete().expect("delete the container");
+  std::fs::remove_dir_all(&sockets).expect("remove the sockets' directory");
 
   // One whose handle is gone, deleted by id.
   drop(

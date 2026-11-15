@@ -23,16 +23,23 @@ pub enum Message {
   Received(u32),
   /// Runs a process in the guest. Opens a channel, from the host.
   Exec(Exec),
-  /// Relays to a TCP port on the guest's loopback. Opens a channel, from the host.
-  Connect {
-    port: u16,
+  /// Relays to a socket in the guest. Opens a channel, from the host.
+  Connect(Connect),
+  /// Listens on a Unix socket in the guest. Opens a channel, from the host.
+  Listen(Listen),
+  /// A connection to the socket of the Listen channel `listener`, for the
+  /// host to relay. Opens a channel, from the guest.
+  Accepted {
+    listener: u32,
   },
-  /// The runner started the process, or connected the relay.
+  /// The runner started the process, connected the relay, or is listening.
   Opened,
   /// From the opener, stdin or relay bytes; from the runner, stdout or relay bytes.
   Data(Vec<u8>),
   Stderr(Vec<u8>),
-  /// The end of the sender's Data.
+  /// The end of the sender's Data. On a Listen channel, the host's stops
+  /// the listening, and the agent's follows once the socket is closed and
+  /// removed.
   Eof,
   Resize(WindowSize),
   Signal(i32),
@@ -109,6 +116,35 @@ impl Resource {
   pub const KQUEUES: Self = Self(13);
 }
 
+/// Where a relay connects, from inside its jail if it has one: so a path
+/// resolves, and loopback is, as there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Connect {
+  pub to: Address,
+  /// The jail, by name; or the guest.
+  pub jail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+  /// A TCP port on loopback: 127.0.0.1, or failing that ::1.
+  Port(u16),
+  /// A Unix socket, by its path.
+  Unix(String),
+}
+
+/// A Unix socket for the agent to listen on, made from inside its jail if
+/// it has one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Listen {
+  /// Its path. A socket already there is replaced.
+  pub path: String,
+  /// The jail, by name; or the guest.
+  pub jail: Option<String>,
+  /// Its permissions; or those the agent's umask leaves.
+  pub mode: Option<u16>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowSize {
   pub rows: u16,
@@ -138,6 +174,8 @@ mod kind {
   pub const RECEIVED: u8 = 0x04;
   pub const EXEC: u8 = 0x10;
   pub const CONNECT: u8 = 0x11;
+  pub const LISTEN: u8 = 0x12;
+  pub const ACCEPTED: u8 = 0x13;
   pub const OPENED: u8 = 0x20;
   pub const DATA: u8 = 0x21;
   pub const STDERR: u8 = 0x22;
@@ -156,7 +194,9 @@ impl Message {
       Self::Pong(_) => "pong",
       Self::Received(_) => "received",
       Self::Exec(_) => "exec",
-      Self::Connect { .. } => "connect",
+      Self::Connect(_) => "connect",
+      Self::Listen(_) => "listen",
+      Self::Accepted { .. } => "accepted",
       Self::Opened => "opened",
       Self::Data(_) => "data",
       Self::Stderr(_) => "stderr",
@@ -228,9 +268,32 @@ impl Message {
         }
         kind::EXEC
       }
-      Self::Connect { port } => {
-        payload.u16(*port);
+      Self::Connect(connect) => {
+        match &connect.to {
+          Address::Port(port) => payload.u8(0).u16(*port),
+          Address::Unix(path) => payload.u8(1).string(path),
+        };
+        match &connect.jail {
+          Some(jail) => payload.u8(1).string(jail),
+          None => payload.u8(0),
+        };
         kind::CONNECT
+      }
+      Self::Listen(listen) => {
+        payload.string(&listen.path);
+        match &listen.jail {
+          Some(jail) => payload.u8(1).string(jail),
+          None => payload.u8(0),
+        };
+        match listen.mode {
+          Some(mode) => payload.u8(1).u16(mode),
+          None => payload.u8(0),
+        };
+        kind::LISTEN
+      }
+      Self::Accepted { listener } => {
+        payload.u32(*listener);
+        kind::ACCEPTED
       }
       Self::Opened => kind::OPENED,
       Self::Data(bytes) => {
@@ -321,7 +384,22 @@ impl Message {
           })
           .collect::<Result<_, DecodeError>>()?,
       }),
-      kind::CONNECT => Self::Connect { port: reader.u16()? },
+      kind::CONNECT => Self::Connect(Connect {
+        to: match reader.u8()? {
+          0 => Address::Port(reader.u16()?),
+          1 => Address::Unix(reader.string()?),
+          tag => return Err(DecodeError::UnknownTag(tag)),
+        },
+        jail: reader.option(Reader::string)?,
+      }),
+      kind::LISTEN => Self::Listen(Listen {
+        path: reader.string()?,
+        jail: reader.option(Reader::string)?,
+        mode: reader.option(Reader::u16)?,
+      }),
+      kind::ACCEPTED => Self::Accepted {
+        listener: reader.u32()?,
+      },
       kind::OPENED => Self::Opened,
       kind::EOF => Self::Eof,
       kind::RESIZE => Self::Resize(reader.window()?),
@@ -522,7 +600,21 @@ mod tests {
         ..Exec::default()
       }),
       Message::Exec(Exec::default()),
-      Message::Connect { port: 8080 },
+      Message::Connect(Connect {
+        to: Address::Port(8080),
+        jail: None,
+      }),
+      Message::Connect(Connect {
+        to: Address::Unix("/var/run/app.sock".into()),
+        jail: Some("web".into()),
+      }),
+      Message::Listen(Listen {
+        path: "/var/run/host.sock".into(),
+        jail: Some("web".into()),
+        mode: Some(0o660),
+      }),
+      Message::Listen(Listen::default()),
+      Message::Accepted { listener: 4 },
       Message::Opened,
       Message::Data(b"stdin".to_vec()),
       Message::Stderr(vec![0xFF]),
@@ -546,7 +638,7 @@ mod tests {
       kind: 0x7F,
       payload: Vec::new(),
     };
-    let mut short = Message::Connect { port: 80 }.frame(2);
+    let mut short = Message::Accepted { listener: 2 }.frame(1);
     short.payload.pop();
     let mut long = Message::Eof.frame(2);
     long.payload.push(0);

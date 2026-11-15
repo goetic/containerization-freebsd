@@ -1,8 +1,8 @@
 //! A session's channels, from one side: who may send what, and when.
 //!
 //! Channel 0 is control. The host opens even channels; odd ones are the
-//! guest's, so it could open channels without asking, though nothing it sends
-//! opens one yet.
+//! guest's, so it opens channels for connections to its sockets without
+//! asking.
 
 use crate::frame::{Frame, MAX_PAYLOAD};
 use crate::message::{DecodeError, Message};
@@ -52,7 +52,8 @@ impl Side {
 
   fn opens(self, message: &Message) -> bool {
     match message {
-      Message::Exec(_) | Message::Connect { .. } => self == Self::Host,
+      Message::Exec(_) | Message::Connect(_) | Message::Listen(_) => self == Self::Host,
+      Message::Accepted { .. } => self == Self::Guest,
       _ => false,
     }
   }
@@ -86,6 +87,7 @@ pub enum Error {
 enum Kind {
   Exec { pty: bool },
   Relay,
+  Listener,
 }
 
 impl Kind {
@@ -94,7 +96,8 @@ impl Kind {
       Message::Exec(exec) => Some(Self::Exec {
         pty: exec.pty.is_some(),
       }),
-      Message::Connect { .. } => Some(Self::Relay),
+      Message::Connect(_) | Message::Accepted { .. } => Some(Self::Relay),
+      Message::Listen(_) => Some(Self::Listener),
       _ => None,
     }
   }
@@ -124,15 +127,16 @@ impl Channel {
   /// allows it now: whether the channel is closed after it.
   fn step(&mut self, from_opener: bool, message: &Message) -> Option<bool> {
     let runner = !from_opener;
-    let process = self.kind != Kind::Relay;
+    let process = matches!(self.kind, Kind::Exec { .. });
     let ended = if from_opener { self.opener_eof } else { self.runner_eof };
     // The opener may send stdin before the runner has started the process.
     let started = from_opener || self.opened;
 
     let allowed = match message {
       Message::Opened => runner && !self.opened,
-      Message::Data(_) | Message::Eof => started && !ended,
-      Message::Stderr(_) => runner && self.opened && process && self.kind != Kind::Exec { pty: true },
+      Message::Data(_) => started && !ended && self.kind != Kind::Listener,
+      Message::Eof => started && !ended,
+      Message::Stderr(_) => runner && self.opened && self.kind == Kind::Exec { pty: false },
       Message::Resize(_) => from_opener && self.kind == Kind::Exec { pty: true },
       Message::Signal(_) => from_opener && process,
       Message::Exited(_) => runner && self.opened && process,
@@ -214,7 +218,8 @@ impl Mux {
     .frame(CONTROL)
   }
 
-  /// Opens a channel with Exec or Connect, which only the host opens.
+  /// Opens a channel: with Exec, Connect or Listen from the host, or
+  /// Accepted from the guest.
   pub fn open(&mut self, message: Message) -> Result<(u32, Frame), Error> {
     self.require_session()?;
     let channel = self.free_channel();

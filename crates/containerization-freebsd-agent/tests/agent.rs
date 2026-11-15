@@ -2,11 +2,14 @@
 //! standing in for the console.
 
 use containerization_freebsd_protocol::{
-  CONTROL, Decoder, Exec, Exit, Frame, Limit, Message, Mux, Resource, Side, User, VERSION, WindowSize,
+  Address, CONTROL, Connect, Decoder, Exec, Exit, Frame, Limit, Listen, Message, Mux, Resource, Side, User, VERSION,
+  WindowSize,
 };
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::os::unix::net::UnixStream;
+use std::net::{Shutdown, TcpListener};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -147,6 +150,19 @@ impl Host {
     finished
   }
 
+  /// The channel's Data until its Eof.
+  fn read_to_eof(&mut self, channel: u32) -> String {
+    let mut output = String::new();
+
+    loop {
+      match self.next() {
+        (from, Message::Data(bytes)) if from == channel => output.push_str(&String::from_utf8_lossy(&bytes)),
+        (from, Message::Eof) if from == channel => return output,
+        other => panic!("unexpected {other:?} after {output:?}"),
+      }
+    }
+  }
+
   /// The channel's Data until it holds `text`.
   fn read_until(&mut self, channel: u32, text: &str) -> String {
     let mut output = String::new();
@@ -180,6 +196,24 @@ fn in_terminal(argv: &[&str]) -> Exec {
     pty: Some(TERMINAL),
     ..command(argv)
   }
+}
+
+fn connect(to: Address) -> Message {
+  Message::Connect(Connect { to, jail: None })
+}
+
+/// A path for the test's own socket.
+fn socket_path(name: &str) -> PathBuf {
+  let path = std::env::temp_dir().join(format!("cfbsd-agent-{}-{name}.sock", std::process::id()));
+  let _ = std::fs::remove_file(&path);
+  path
+}
+
+/// Answers what a connection sends, once it ends, in capitals.
+fn answer_in_capitals(mut stream: impl Read + Write) {
+  let mut received = Vec::new();
+  stream.read_to_end(&mut received).unwrap();
+  stream.write_all(&received.to_ascii_uppercase()).unwrap();
 }
 
 fn running(pid: &str) -> bool {
@@ -364,14 +398,9 @@ fn relays_to_a_local_port() {
   let mut host = Host::start();
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let port = listener.local_addr().unwrap().port();
-  let server = std::thread::spawn(move || {
-    let (mut stream, _) = listener.accept().unwrap();
-    let mut received = Vec::new();
-    stream.read_to_end(&mut received).unwrap();
-    stream.write_all(&received.to_ascii_uppercase()).unwrap();
-  });
+  let server = std::thread::spawn(move || answer_in_capitals(listener.accept().unwrap().0));
 
-  let channel = host.open(Message::Connect { port });
+  let channel = host.open(connect(Address::Port(port)));
   assert_eq!(host.next(), (channel, Message::Opened));
   host.send(channel, Message::Data(b"relayed".to_vec()));
   host.send(channel, Message::Eof);
@@ -391,9 +420,100 @@ fn refuses_a_port_nothing_listens_on() {
     .unwrap()
     .port();
 
-  let channel = host.open(Message::Connect { port });
+  let channel = host.open(connect(Address::Port(port)));
 
   assert!(matches!(host.next(), (from, Message::Error(_)) if from == channel));
+}
+
+#[test]
+fn writes_all_the_host_sent_before_its_eof_closes_a_relay() {
+  let mut host = Host::start();
+  let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let (eof_sent, wait_for_eof) = mpsc::channel();
+  // It finishes writing first, so the host's Eof closes the relay; and
+  // reads nothing until then, so what the host sent backs up in the agent.
+  let server = std::thread::spawn(move || {
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    wait_for_eof.recv().unwrap();
+    let mut received = Vec::new();
+    stream.read_to_end(&mut received).unwrap();
+    received.len()
+  });
+  let input = vec![b'x'; 16 << 20];
+
+  let channel = host.open(connect(Address::Port(port)));
+  assert_eq!(host.next(), (channel, Message::Opened));
+  assert_eq!(host.next(), (channel, Message::Eof));
+  for chunk in input.chunks(16 << 10) {
+    host.send(channel, Message::Data(chunk.to_vec()));
+  }
+  host.send(channel, Message::Eof);
+  // Time for the agent to act on it.
+  std::thread::sleep(Duration::from_millis(200));
+  eof_sent.send(()).unwrap();
+
+  assert_eq!(server.join().unwrap(), input.len());
+}
+
+#[test]
+fn relays_to_a_unix_socket() {
+  let mut host = Host::start();
+  let path = socket_path("connect");
+  let listener = UnixListener::bind(&path).unwrap();
+  let server = std::thread::spawn(move || answer_in_capitals(listener.accept().unwrap().0));
+
+  let channel = host.open(connect(Address::Unix(path.to_str().unwrap().into())));
+  assert_eq!(host.next(), (channel, Message::Opened));
+  host.send(channel, Message::Data(b"relayed".to_vec()));
+  host.send(channel, Message::Eof);
+  let finished = host.finish(channel);
+  server.join().unwrap();
+  std::fs::remove_file(&path).unwrap();
+
+  assert_eq!(finished.output, "RELAYED");
+}
+
+#[test]
+fn listens_on_a_unix_socket_and_relays_each_connection() {
+  let mut host = Host::start();
+  let path = socket_path("listen");
+  // A socket left behind, which listening replaces.
+  drop(UnixListener::bind(&path).unwrap());
+
+  let listener = host.open(Message::Listen(Listen {
+    path: path.to_str().unwrap().into(),
+    jail: None,
+    mode: Some(0o640),
+  }));
+  assert_eq!(host.next(), (listener, Message::Opened));
+  let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+  assert_eq!(mode & 0o777, 0o640);
+
+  let client = {
+    let path = path.clone();
+    std::thread::spawn(move || {
+      let mut stream = UnixStream::connect(path).unwrap();
+      stream.write_all(b"hello").unwrap();
+      stream.shutdown(Shutdown::Write).unwrap();
+      let mut answer = String::new();
+      stream.read_to_string(&mut answer).unwrap();
+      answer
+    })
+  };
+  let (channel, accepted) = host.next();
+  assert_eq!(accepted, Message::Accepted { listener });
+  host.send(channel, Message::Opened);
+  assert_eq!(host.read_to_eof(channel), "hello");
+  host.send(channel, Message::Data(b"HELLO".to_vec()));
+  host.send(channel, Message::Eof);
+  assert_eq!(client.join().unwrap(), "HELLO");
+
+  // The agent answers the host's Eof once its socket is gone.
+  host.send(listener, Message::Eof);
+  assert_eq!(host.next(), (listener, Message::Eof));
+  assert!(!path.exists());
 }
 
 #[test]

@@ -2,7 +2,8 @@
 //! as the console carries them.
 
 use containerization_freebsd_protocol::{
-  CONTROL, Decoder, Error, Exec, Exit, Frame, MAX_PAYLOAD, Message, Mux, Side, VERSION, VersionMismatch, WindowSize,
+  Address, CONTROL, Connect, Decoder, Error, Exec, Exit, Frame, Listen, MAX_PAYLOAD, Message, Mux, Side, VERSION,
+  VersionMismatch, WindowSize,
 };
 
 const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
@@ -43,6 +44,20 @@ fn exec(argv: &[&str], pty: Option<WindowSize>) -> Message {
     argv: argv.iter().map(|arg| arg.to_string()).collect(),
     pty,
     ..Exec::default()
+  })
+}
+
+fn connect(port: u16) -> Message {
+  Message::Connect(Connect {
+    to: Address::Port(port),
+    jail: None,
+  })
+}
+
+fn listen(path: &str) -> Message {
+  Message::Listen(Listen {
+    path: path.into(),
+    ..Listen::default()
   })
 }
 
@@ -116,7 +131,7 @@ fn keeps_interleaved_channels_apart() {
   let (mut host, mut guest) = session();
   let (plain, open_plain) = host.open(exec(&["make"], None)).unwrap();
   let (pty, open_pty) = host.open(exec(&["sh"], Some(TERMINAL))).unwrap();
-  let (relay, open_relay) = host.open(Message::Connect { port: 80 }).unwrap();
+  let (relay, open_relay) = host.open(connect(80)).unwrap();
   assert_eq!([plain, pty, relay], [2, 4, 6]);
   deliver(&mut guest, [open_plain, open_pty, open_relay]);
 
@@ -190,7 +205,7 @@ fn resizes_only_a_terminal_and_only_from_its_opener() {
 #[test]
 fn closes_a_relay_once_both_ends_have_finished() {
   let (mut host, mut guest) = session();
-  let (relay, open) = host.open(Message::Connect { port: 5432 }).unwrap();
+  let (relay, open) = host.open(connect(5432)).unwrap();
   deliver(&mut guest, [open]);
   deliver(&mut host, [guest.send(relay, Message::Opened).unwrap()]);
 
@@ -222,7 +237,7 @@ fn closes_a_relay_once_both_ends_have_finished() {
 #[test]
 fn closes_a_refused_relay() {
   let (mut host, mut guest) = session();
-  let (relay, open) = host.open(Message::Connect { port: 1 }).unwrap();
+  let (relay, open) = host.open(connect(1)).unwrap();
   deliver(&mut guest, [open]);
 
   let refused = guest
@@ -233,6 +248,75 @@ fn closes_a_refused_relay() {
     [(relay, Message::Error("connection refused".into()))]
   );
   assert!(!host.is_open(relay) && !guest.is_open(relay));
+}
+
+#[test]
+fn relays_each_connection_to_a_listener_on_a_channel_the_guest_opens() {
+  let (mut host, mut guest) = session();
+  let (listener, open) = host.open(listen("/var/run/host.sock")).unwrap();
+  deliver(&mut guest, [open]);
+  deliver(&mut host, [guest.send(listener, Message::Opened).unwrap()]);
+
+  let (first, accepted) = guest.open(Message::Accepted { listener }).unwrap();
+  let (second, also_accepted) = guest.open(Message::Accepted { listener }).unwrap();
+  assert_eq!([first, second], [1, 3]);
+  // The guest's end may send before the host has connected its own.
+  let early = guest.send(first, Message::Data(b"hello".to_vec())).unwrap();
+  assert_eq!(
+    deliver(&mut host, [accepted, also_accepted, early]),
+    [
+      (first, Message::Accepted { listener }),
+      (second, Message::Accepted { listener }),
+      (first, Message::Data(b"hello".to_vec())),
+    ]
+  );
+  assert_eq!(
+    host
+      .send(first, Message::Data(b"early".to_vec()))
+      .unwrap_err(),
+    not_allowed(first, "data")
+  );
+
+  deliver(
+    &mut guest,
+    [
+      host.send(first, Message::Opened).unwrap(),
+      host.send(first, Message::Data(b"HELLO".to_vec())).unwrap(),
+      host.send(first, Message::Eof).unwrap(),
+    ],
+  );
+  deliver(&mut host, [guest.send(first, Message::Eof).unwrap()]);
+  assert!(!host.is_open(first) && !guest.is_open(first));
+  // The host couldn't connect this one.
+  deliver(
+    &mut guest,
+    [host.send(second, Message::Error("refused".into())).unwrap()],
+  );
+  assert!(!host.is_open(second) && !guest.is_open(second));
+  assert!(host.is_open(listener) && guest.is_open(listener));
+}
+
+#[test]
+fn closes_a_listener_once_both_sides_have_sent_eof() {
+  let (mut host, mut guest) = session();
+  let (listener, open) = host.open(listen("/var/run/host.sock")).unwrap();
+  deliver(&mut guest, [open]);
+  deliver(&mut host, [guest.send(listener, Message::Opened).unwrap()]);
+  assert_eq!(
+    host
+      .send(listener, Message::Data(b"x".to_vec()))
+      .unwrap_err(),
+    not_allowed(listener, "data")
+  );
+
+  deliver(&mut guest, [host.send(listener, Message::Eof).unwrap()]);
+  // What it accepted before it stopped still opens.
+  let (_, accepted) = guest.open(Message::Accepted { listener }).unwrap();
+  deliver(&mut host, [accepted]);
+  assert!(host.is_open(listener) && guest.is_open(listener));
+
+  deliver(&mut host, [guest.send(listener, Message::Eof).unwrap()]);
+  assert!(!host.is_open(listener) && !guest.is_open(listener));
 }
 
 #[test]
@@ -262,14 +346,14 @@ fn closes_a_process_when_it_exits_not_when_its_output_ends() {
 }
 
 #[test]
-fn lets_only_the_host_open_channels() {
+fn lets_each_side_open_only_its_own_channels() {
   let (mut host, mut guest) = session();
+  let accepted = Message::Accepted { listener: 2 };
 
   assert_eq!(guest.open(exec(&["true"], None)).unwrap_err(), not_allowed(1, "exec"));
-  assert_eq!(
-    guest.open(Message::Connect { port: 22 }).unwrap_err(),
-    not_allowed(1, "connect")
-  );
+  assert_eq!(guest.open(connect(22)).unwrap_err(), not_allowed(1, "connect"));
+  assert_eq!(guest.open(listen("/s")).unwrap_err(), not_allowed(1, "listen"));
+  assert_eq!(host.open(accepted.clone()).unwrap_err(), not_allowed(2, "accepted"));
   // Nor can either pass off its own opening as the other's.
   assert_eq!(
     host.receive(exec(&["true"], None).frame(3)).unwrap_err(),
@@ -279,6 +363,11 @@ fn lets_only_the_host_open_channels() {
     guest.receive(exec(&["true"], None).frame(3)).unwrap_err(),
     Error::BadChannel(3)
   );
+  assert_eq!(
+    guest.receive(accepted.frame(1)).unwrap_err(),
+    not_allowed(1, "accepted")
+  );
+  assert_eq!(host.receive(accepted.frame(2)).unwrap_err(), Error::BadChannel(2));
 }
 
 #[test]

@@ -16,17 +16,19 @@
 //! Received: how much of the console it has read. The console drops bytes it
 //! can't hold, so the host keeps at most [`WINDOW`] bytes unreceived. The
 //! host opens channels with Exec, for a process on pipes or a pty, in the
-//! guest or a jail, as a user, with a umask and resource limits; and
-//! Connect, for a relay to a guest TCP port. The opener sends Data (stdin, or
-//! relay bytes), Resize and Signal.
-//! The runner answers Opened, then Data (stdout), Stderr and Exited. Eof ends
-//! the sender's Data, and a relay closes once both ends have sent it. Error
-//! closes any channel.
+//! guest or a jail, as a user, with a umask and resource limits; Connect,
+//! for a relay to a TCP port on loopback or a Unix socket, in the guest or
+//! a jail; and Listen, for a Unix socket the agent listens on, relaying
+//! each connection on a channel it opens with Accepted. The opener sends
+//! Data (stdin, or relay bytes), Resize and Signal. The runner answers
+//! Opened, then Data (stdout), Stderr and Exited. Eof ends the sender's
+//! Data, and a relay closes once both ends have sent it; so does a Listen
+//! channel, the host's Eof stopping it. Error closes any channel.
 
 pub mod frame;
 pub mod message;
 pub mod mux;
 
 pub use frame::{Decoder, Frame, MAGIC, MAX_PAYLOAD, Skipped};
-pub use message::{DecodeError, Exec, Exit, Limit, Message, Resource, User, WindowSize};
+pub use message::{Address, Connect, DecodeError, Exec, Exit, Limit, Listen, Message, Resource, User, WindowSize};
 pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch, WINDOW};

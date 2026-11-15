@@ -1,12 +1,16 @@
 //! The session loop. One thread owns the protocol's state and writes the
 //! console; the console's reader and every channel's threads send it events.
 
+use crate::listener;
 use crate::process::{self, Process};
-use crate::relay;
-use containerization_freebsd_protocol::{CONTROL, Decoder, Error, Exec, Frame, Message, Mux, Side, Skipped};
+use crate::relay::{self, Connection};
+use containerization_freebsd_protocol::{
+  Address, CONTROL, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
+};
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::io::{self, PipeWriter, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 
@@ -24,6 +28,12 @@ enum Event {
     id: u64,
     channel: u32,
     message: Message,
+  },
+  /// A connection to the socket of the Listen channel `listener`.
+  Accepted {
+    id: u64,
+    listener: u32,
+    stream: UnixStream,
   },
 }
 
@@ -49,6 +59,19 @@ impl Outbox {
       })
       .is_ok()
   }
+
+  /// Hands the session loop a connection to the socket of its Listen
+  /// channel. False once the session loop has stopped.
+  pub(crate) fn accepted(&self, stream: UnixStream) -> bool {
+    self
+      .events
+      .send(Event::Accepted {
+        id: self.id,
+        listener: self.channel,
+        stream,
+      })
+      .is_ok()
+  }
 }
 
 /// What a channel's threads take from the host.
@@ -58,25 +81,29 @@ pub(crate) enum Input {
 }
 
 /// The session loop's hold on what an open channel runs.
-pub(crate) struct Handle {
-  pub(crate) input: Sender<Input>,
-  pub(crate) running: Running,
-}
-
-pub(crate) enum Running {
-  Process(Arc<Process>),
-  Relay(TcpStream),
+pub(crate) enum Handle {
+  Process {
+    input: Sender<Input>,
+    process: Arc<Process>,
+  },
+  Relay {
+    input: Sender<Input>,
+    connection: Connection,
+  },
+  /// See `listener::listen`.
+  Listener { stop: PipeWriter },
 }
 
 impl Handle {
-  /// Ends it before it finishes: kills the process and its group, or closes
-  /// the relay.
+  /// Ends it before it finishes: kills the process and its group, closes
+  /// the relay, or stops the listener, closing its `stop`.
   fn stop(self) {
-    match self.running {
-      Running::Process(process) => process.kill(),
-      Running::Relay(stream) => {
-        let _ = stream.shutdown(Shutdown::Both);
+    match self {
+      Self::Process { process, .. } => process.kill(),
+      Self::Relay { connection, .. } => {
+        let _ = connection.shutdown(Shutdown::Both);
       }
+      Self::Listener { .. } => {}
     }
   }
 }
@@ -151,17 +178,26 @@ impl<W: Write> Agent<W> {
         Event::Console(bytes) => self.console(&bytes)?,
         Event::Closed(result) => return result,
         Event::Channel { id, channel, message } => {
-          if self
-            .channels
-            .get(&channel)
-            .is_some_and(|open| open.id == id)
-          {
+          if self.holds(channel, id) {
             self.send(channel, message)?;
+          }
+        }
+        Event::Accepted { id, listener, stream } => {
+          if self.holds(listener, id) {
+            self.accepted(listener, stream)?;
           }
         }
       }
     }
     Ok(())
+  }
+
+  /// Whether `channel` is open, as the channel `id` names.
+  fn holds(&self, channel: u32, id: u64) -> bool {
+    self
+      .channels
+      .get(&channel)
+      .is_some_and(|open| open.id == id)
   }
 
   fn console(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -197,8 +233,9 @@ impl<W: Write> Agent<W> {
         self.write(&answer)
       }
       Ok((_, Message::Ping(number))) => self.send(CONTROL, Message::Pong(number)),
-      Ok((_, Message::Exec(exec))) => self.exec(channel, exec),
-      Ok((_, Message::Connect { port })) => self.connect(channel, port),
+      Ok((_, Message::Exec(exec))) => self.exec(channel, &exec),
+      Ok((_, Message::Connect(connect))) => self.connect(channel, &connect),
+      Ok((_, Message::Listen(listen))) => self.listen(channel, &listen),
       Ok((_, message)) => {
         self.deliver(channel, message);
         Ok(())
@@ -217,26 +254,24 @@ impl<W: Write> Agent<W> {
 
   /// Hands an open channel the host's message.
   fn deliver(&mut self, channel: u32, message: Message) {
-    let Some(open) = self.channels.get(&channel) else {
+    let Some(open) = self.channels.get_mut(&channel) else {
       return;
     };
-    let process = match &open.handle.running {
-      Running::Process(process) => Some(process),
-      Running::Relay(_) => None,
-    };
+    let ends = matches!(message, Message::Error(_));
 
-    let result = match message {
-      Message::Data(bytes) => {
-        let _ = open.handle.input.send(Input::Data(bytes));
+    let result = match (message, &mut open.handle) {
+      (Message::Data(bytes), Handle::Process { input, .. } | Handle::Relay { input, .. }) => {
+        let _ = input.send(Input::Data(bytes));
         Ok(())
       }
-      Message::Eof => {
-        let _ = open.handle.input.send(Input::Eof);
+      (Message::Eof, Handle::Process { input, .. } | Handle::Relay { input, .. }) => {
+        let _ = input.send(Input::Eof);
         Ok(())
       }
-      Message::Resize(size) => process.map_or(Ok(()), |process| process.resize(size)),
-      Message::Signal(signal) => process.map_or(Ok(()), |process| process.signal(signal)),
-      Message::Error(reason) => {
+      (Message::Eof, Handle::Listener { stop }) => stop.write_all(&[1]),
+      (Message::Resize(size), Handle::Process { process, .. }) => process.resize(size),
+      (Message::Signal(signal), Handle::Process { process, .. }) => process.signal(signal),
+      (Message::Error(reason), _) => {
         eprintln!("agent: the host closed channel {channel}: {reason}");
         Ok(())
       }
@@ -246,40 +281,90 @@ impl<W: Write> Agent<W> {
       eprintln!("agent: channel {channel}: {error}");
     }
 
-    // Closed by the host: its Error, or a relay's last Eof.
+    // Closed by the host: its Error ends what the channel runs; after a
+    // relay's last Eof, the relay still writes the Data before it, then
+    // shuts its connection's write side.
     if !self.mux.is_open(channel)
       && let Some(open) = self.channels.remove(&channel)
+      && ends
     {
       open.handle.stop();
     }
   }
 
-  fn exec(&mut self, channel: u32, exec: Exec) -> io::Result<()> {
+  fn exec(&mut self, channel: u32, exec: &Exec) -> io::Result<()> {
     let outbox = self.outbox(channel);
     let id = outbox.id;
+    let started = process::spawn(exec, outbox);
 
-    match process::spawn(&exec, outbox) {
+    self.opened(channel, id, started, || {
+      let program = exec.argv.first().map_or("", String::as_str);
+      format!("running {program:?}")
+    })
+  }
+
+  fn connect(&mut self, channel: u32, connect: &Connect) -> io::Result<()> {
+    let outbox = self.outbox(channel);
+    let id = outbox.id;
+    let started = relay::connect(connect, outbox);
+
+    self.opened(channel, id, started, || {
+      let to = match &connect.to {
+        Address::Port(port) => format!("port {port}"),
+        Address::Unix(path) => format!("{path:?}"),
+      };
+      format!("connecting to {to}{}", in_jail(connect.jail.as_deref()))
+    })
+  }
+
+  fn listen(&mut self, channel: u32, listen: &Listen) -> io::Result<()> {
+    let outbox = self.outbox(channel);
+    let id = outbox.id;
+    let started = listener::listen(listen, outbox);
+
+    self.opened(channel, id, started, || {
+      format!("listening on {:?}{}", listen.path, in_jail(listen.jail.as_deref()))
+    })
+  }
+
+  /// Holds what the host's opening of `channel` started, and says it
+  /// opened; or says what failed, as `doing` describes it.
+  fn opened(
+    &mut self,
+    channel: u32,
+    id: u64,
+    started: io::Result<Handle>,
+    doing: impl FnOnce() -> String,
+  ) -> io::Result<()> {
+    match started {
       Ok(handle) => {
         self.channels.insert(channel, Open { id, handle });
         self.send(channel, Message::Opened)
       }
-      Err(error) => {
-        let program = exec.argv.first().map_or("", String::as_str);
-        self.send(channel, Message::Error(format!("running {program:?}: {error}")))
-      }
+      Err(error) => self.send(channel, Message::Error(format!("{}: {error}", doing()))),
     }
   }
 
-  fn connect(&mut self, channel: u32, port: u16) -> io::Result<()> {
+  /// Opens a channel for a connection to the socket of the Listen channel
+  /// `listener`, and relays it.
+  fn accepted(&mut self, listener: u32, stream: UnixStream) -> io::Result<()> {
+    let (channel, frame) = match self.mux.open(Message::Accepted { listener }) {
+      Ok(opened) => opened,
+      Err(error) => {
+        eprintln!("agent: could not relay a connection to listener {listener}: {error}");
+        return Ok(());
+      }
+    };
+    self.write(&frame)?;
     let outbox = self.outbox(channel);
     let id = outbox.id;
 
-    match relay::connect(port, outbox) {
+    match relay::start(Connection::Unix(stream), outbox) {
       Ok(handle) => {
         self.channels.insert(channel, Open { id, handle });
-        self.send(channel, Message::Opened)
+        Ok(())
       }
-      Err(error) => self.send(channel, Message::Error(format!("connecting to port {port}: {error}"))),
+      Err(error) => self.send(channel, Message::Error(format!("relaying a connection: {error}"))),
     }
   }
 
@@ -324,4 +409,10 @@ impl<W: Write> Agent<W> {
     self.output.write_all(&frame.to_bytes())?;
     self.output.flush()
   }
+}
+
+fn in_jail(jail: Option<&str>) -> String {
+  jail
+    .map(|jail| format!(" in jail {jail:?}"))
+    .unwrap_or_default()
 }

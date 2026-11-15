@@ -1,7 +1,9 @@
 //! FreeBSD jails in the guest, through its agent.
 
-use crate::agent::{Agent, Exec, Exit, Process, Ran};
+use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
 use crate::error::{Error, Result};
+use crate::socket::{SocketRelay, UnixSocket};
+use containerization_freebsd_protocol::{Address, Connect};
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
@@ -33,6 +35,13 @@ const NAT_JAIL: &str = r#"set -e
 jexec "$1" ifconfig lo0 inet 127.0.0.1/8 up
 jexec "$1" ifconfig "$2" inet "$3/16" up
 jexec "$1" route -q add default "$4""#;
+
+/// Waits for the jail named `$1` to be gone: once removed, it is dying
+/// until what it left closes, such as a TCP connection in TIME_WAIT, and
+/// until then holds its root and its network.
+const GONE: &str = r#"while jls -d -j "$1" >/dev/null 2>&1; do sleep 0.1; done"#;
+/// Past TIME_WAIT: twice FreeBSD's default MSL of 30 seconds.
+const DYING: Duration = Duration::from_secs(90);
 
 /// Copies the guest's resolver configuration into the jail rooted at `$1`,
 /// unless it has its own.
@@ -140,6 +149,28 @@ impl<'a> Jail<'a> {
     })
   }
 
+  /// Connects to `port` on the jail's loopback: the guest's, unless the
+  /// jail has its own network.
+  pub fn connect(&self, port: u16) -> Result<Relay> {
+    self.agent.relay(Connect {
+      to: Address::Port(port),
+      jail: Some(self.name.clone()),
+    })
+  }
+
+  /// Connects to the Unix socket at `path` in the jail.
+  pub fn connect_unix(&self, path: &str) -> Result<Relay> {
+    self.agent.relay(Connect {
+      to: Address::Unix(path.to_string()),
+      jail: Some(self.name.clone()),
+    })
+  }
+
+  /// As `Agent::relay_socket`, with the socket's guest path in the jail.
+  pub fn relay_socket(&self, socket: &UnixSocket) -> Result<SocketRelay> {
+    self.agent.relay_socket_in(socket, Some(&self.name))
+  }
+
   /// As `Agent::run`, in the jail.
   pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
     self.agent.run(&self.jexec(argv), timeout)
@@ -150,8 +181,9 @@ impl<'a> Jail<'a> {
     self.agent.check(&self.jexec(argv), timeout)
   }
 
-  /// Stops the jail, killing its processes, unmounts its devfs, and
-  /// destroys its epair.
+  /// Stops the jail, killing its processes, and waits for it to be gone,
+  /// which a TCP connection it made can hold up for a minute. Then unmounts
+  /// its devfs, and destroys its epair.
   pub fn stop(self) -> Result<()> {
     let ran = self
       .agent
@@ -174,6 +206,9 @@ impl<'a> Jail<'a> {
     };
 
     self.agent.check(&["jail", "-r", &self.name], QUICK)?;
+    self
+      .agent
+      .check(&["sh", "-c", GONE, "sh", &self.name], DYING)?;
 
     // jail(8) mounts devfs for `mount.devfs`, but can't unmount it on its
     // own: the parameter is jail(8)'s, not the kernel's, so a jail removed

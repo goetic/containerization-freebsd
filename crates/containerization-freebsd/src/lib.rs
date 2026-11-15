@@ -16,6 +16,7 @@ pub mod machine;
 mod memory;
 pub mod oci;
 pub mod prepare;
+pub mod socket;
 pub mod unpack;
 pub mod zfs;
 
@@ -27,5 +28,6 @@ pub use images::{Image, ImageStore};
 pub use jail::{Jail, Network};
 pub use machine::{Disk, Layout, Machine, Share};
 pub use prepare::{Upgrade, prepare};
+pub use socket::{Direction, SocketRelay, UnixSocket};
 pub use unpack::{Unpacked, Unpacker};
 pub use zfs::Zfs;
