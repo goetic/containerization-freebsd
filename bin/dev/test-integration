@@ -55,4 +55,4 @@ while IFS= read -r binary; do
   "$root/bin/dev/sign" "$binary"
 done <<<"$binaries"
 
-exec cargo nextest run -p "$package" "${targets[@]}" "$@"
+exec cargo nextest run --color always -p "$package" "${targets[@]}" "$@"

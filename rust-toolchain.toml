@@ -3,4 +3,6 @@
 # developed and tested against.
 [toolchain]
 channel = "1.99.1"
+# rust-src: guest/build-agent builds FreeBSD's std from it.
+components = ["rust-src"]
 targets = ["aarch64-apple-darwin"]

@@ -39,13 +39,20 @@ sha256() {
 }
 
 if [ ! -e "$sysroot/.complete" ]; then
-  curl -fsSL -o "$work/base.txz" "$base_url"
+  # Reuse one already in <work-dir>, such as the userland's, if it matches.
+  if [ ! -e "$work/base.txz" ] || [ "$(sha256 "$work/base.txz")" != "$base_sha256" ]; then
+    curl -fsSL -o "$work/base.txz" "$base_url"
+  fi
   actual="$(sha256 "$work/base.txz")"
   if [ "$actual" != "$base_sha256" ]; then
     echo "guest/build-agent: base.txz has sha256 $actual, not $base_sha256" >&2
     exit 1
   fi
 
+  # A sysroot left half made can hold read-only directories.
+  if [ -e "$sysroot" ]; then
+    chmod -R u+w "$sysroot"
+  fi
   rm -rf "$sysroot"
   mkdir -p "$sysroot"
   # Linking needs only the C runtime and the libraries std links.

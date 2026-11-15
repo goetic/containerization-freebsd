@@ -43,9 +43,12 @@ Pre-release.
 
 The integration suite boots VMs, so its binary must carry
 `com.apple.security.virtualization`. `bin/dev/test-integration` builds, signs
-and runs it, so is slow. Run `bin/dev/fetch-image` once prior to running
-integration tests, to download FreeBSD's VM image and the pinned guest bundle in
-`~/.cache/containerization-freebsd-tests`.
+and runs it, so is slow. Before it, nextest's setup scripts download FreeBSD's
+VM image and the userland into `~/.cache/containerization-freebsd-tests`
+(`bin/dev/fetch-image`), and build the guest bundle from the working tree
+(`bin/dev/build-guest-bundle`), which needs Homebrew's `llvm`, `lld`,
+`gnu-tar` and `xz`. The suite never boots a released bundle, so the agent can
+change without one: tag `guest-15.1-r<N>` once it is stable, and pin that.
 
 Set `DEVELOPMENT_TEAM` in `.local/envrc` to sign with that team's identity;
 unset, `bin/dev/sign` signs ad hoc.

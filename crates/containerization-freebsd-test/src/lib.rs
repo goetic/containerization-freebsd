@@ -14,16 +14,18 @@ pub fn base_disk() -> PathBuf {
   cached(image::BASE_DISK)
 }
 
-/// The cached guest bundle, which `bin/dev/fetch-image` downloads too, or an
-/// unreleased one from `guest/build-bundle` at `tmp/guest-bundle.tar.xz`.
+/// The guest bundle built from the working tree, which nextest has
+/// `bin/dev/build-guest-bundle` build before the suites. Never the pinned
+/// release: the suites test what the next release would ship.
 pub fn bundle() -> PathBuf {
   let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/guest-bundle.tar.xz");
 
-  if local.exists() {
-    eprintln!("using {}", local.display());
-    return local;
-  }
-  cached(image::BUNDLE)
+  assert!(
+    local.exists(),
+    "{} is missing: run bin/dev/build-guest-bundle",
+    local.display()
+  );
+  local
 }
 
 /// The cached userland for jails, `base.txz`, which `bin/dev/fetch-image`

@@ -1,0 +1,63 @@
+#!/usr/bin/env sh
+#
+# Builds the guest bundle the integration suites boot, from the working
+# tree, at tmp/guest-bundle.tar.xz: the agent, cross-built by
+# guest/build-agent, and the virtiofs modules, from tmp/modules if
+# guest/build-modules built them, else from the pinned release's bundle.
+# nextest runs it before the suites, after bin/dev/fetch-image, whose cache it
+# reads (.config/nextest.toml).
+#
+# Needs clang and ld.lld, GNU tar and xz: on macOS, Homebrew's llvm, lld,
+# gnu-tar and xz. CROSS_BINDIR names clang's directory, if not the usual one.
+
+set -eu
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$root"
+cache="$HOME/.cache/containerization-freebsd-tests"
+# Somewhere else, as on a mount whose read-only directories can't be removed.
+work="${AGENT_WORK:-tmp/agent-work}"
+
+pinned() {
+  sed -n "s/^pub const $1: &str = \"\(.*\)\";/\1/p" crates/containerization-freebsd/src/image.rs
+}
+
+if [ -z "${CROSS_BINDIR:-}" ]; then
+  brew="$(command -v brew || echo /opt/homebrew/bin/brew)"
+  if [ -x "$brew" ]; then
+    CROSS_BINDIR="$("$brew" --prefix llvm)/bin"
+    PATH="$("$brew" --prefix lld)/bin:$("$brew" --prefix gnu-tar)/libexec/gnubin:$("$brew" --prefix xz)/bin:$PATH"
+  else
+    CROSS_BINDIR=/usr/lib/llvm-19/bin
+  fi
+fi
+export CROSS_BINDIR PATH
+missing=
+[ -x "$CROSS_BINDIR/clang" ] || missing="$missing clang"
+[ -x "$CROSS_BINDIR/ld.lld" ] || command -v ld.lld >/dev/null || missing="$missing ld.lld"
+command -v xz >/dev/null || missing="$missing xz"
+tar --version 2>/dev/null | grep -q 'GNU tar' || missing="$missing GNU-tar"
+if [ -n "$missing" ]; then
+  echo "bin/dev/build-guest-bundle: missing$missing; on macOS, brew install llvm lld gnu-tar xz" >&2
+  exit 1
+fi
+
+# The sysroot's libraries come from the userland bin/dev/fetch-image cached:
+# the same base.txz guest/build-agent would download.
+if [ ! -e "$work/sysroot/.complete" ] && [ ! -e "$work/base.txz" ]; then
+  mkdir -p "$work"
+  cp "$cache/$(pinned USERLAND)" "$work/base.txz"
+fi
+guest/build-agent "$work" tmp/agent >/dev/null
+
+modules=tmp/modules
+if [ ! -e "$modules/virtiofs.ko" ]; then
+  modules=tmp/release-modules
+  mkdir -p "$modules"
+  tar -xJf "$cache/$(pinned BUNDLE)" -C "$modules" --strip-components=2 \
+    boot/modules/fusefs.ko boot/modules/vtfs.ko boot/modules/virtiofs.ko
+fi
+
+guest/build-bundle "$modules" tmp/agent/containerization-freebsd-agent dev tmp/bundle >/dev/null
+cp tmp/bundle/freebsd-15.1-arm64-guest-dev.tar.xz tmp/guest-bundle.tar.xz
+echo "built tmp/guest-bundle.tar.xz with the modules in $modules"
