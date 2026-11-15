@@ -25,7 +25,7 @@ pub use build::{Builder, Built, Step};
 pub use container::{Configuration, Container, Containers, Dns, Host};
 pub use error::{Error, Result};
 pub use images::{Image, ImageStore};
-pub use jail::{Jail, Network};
+pub use jail::{Jail, Mount, Network};
 pub use machine::{Disk, Layout, Machine, Share};
 pub use prepare::{Upgrade, prepare};
 pub use socket::{Direction, SocketRelay, UnixSocket};

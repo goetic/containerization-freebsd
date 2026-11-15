@@ -6,8 +6,8 @@
 
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
-  Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Network, Output,
-  Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
+  Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Mount, Network,
+  Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -436,8 +436,15 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("only the steps that built have datasets");
 
   // Containers: a main process that stops cleanly on SIGTERM, in its own
-  // jail with its own hostname, resolver, hosts and sockets. The work
-  // directory's paths are too long for a socket's.
+  // jail with its own hostname, resolver, hosts, mounts and sockets. The
+  // work directory's paths are too long for a socket's.
+  machine
+    .agent
+    .check(
+      &sh("mkdir -p /var/cfbsd-data && echo hello > /var/cfbsd-data/greeting"),
+      SECONDS,
+    )
+    .expect("make a guest directory to mount");
   let sockets = std::env::temp_dir().join(format!("cfbsd-{}", std::process::id()));
   std::fs::create_dir_all(&sockets).expect("make a directory for sockets");
   let (host_socket, web_socket) = (sockets.join("host.sock"), sockets.join("web.sock"));
@@ -467,6 +474,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
           address: "192.0.2.1".into(),
           names: vec!["db.test".into(), "db".into()],
         }],
+        mounts: vec![
+          Mount::directory("/mnt/userland", "/mnt/userland"),
+          Mount::directory("/var/cfbsd-data", "/var/data").read_only(),
+          Mount::tmpfs("/scratch"),
+        ],
         sockets: vec![
           UnixSocket {
             host: host_socket.clone(),
@@ -503,6 +515,15 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     lines[3].split_whitespace().collect::<Vec<_>>(),
     ["192.0.2.1", "db.test", "db"]
   );
+
+  // Its mounts: a host share, a guest directory read-only, and a tmpfs.
+  let script = format!(
+    "set -e; test -f /mnt/userland/{}; cat /var/data/greeting; \
+     touch /var/data/x 2>/dev/null || echo read-only; echo kept > /scratch/x; cat /scratch/x",
+    image::USERLAND
+  );
+  let ran = web.check(&sh(&script), SECONDS).expect("use its mounts");
+  assert_eq!(ran.lines(), ["hello", "read-only", "kept"]);
 
   // Its processes as its own users, with their groups and more, a umask and
   // limits, in a directory of its own; and as a uid it doesn't list.
@@ -599,6 +620,16 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   // Stderr is ignored: sh reports there its sleep dying of SIGTERM.
   web.stop().expect("stop the container");
   assert!(!web_socket.exists(), "its socket on the host outlived it");
+  machine
+    .agent
+    .check(
+      &sh(
+        "! mount -p | awk '{ print $2 }' | grep -q '^/images/containers/web/' && \
+         test ! -e /images/containers/web/scratch/x",
+      ),
+      SECONDS,
+    )
+    .expect("its mounts are gone, and the tmpfs's file with them");
   let mut stdout = Vec::new();
   let exit = loop {
     match main.recv().expect("its last output") {
@@ -612,10 +643,17 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   web.delete().expect("delete the container");
   std::fs::remove_dir_all(&sockets).expect("remove the sockets' directory");
 
-  // One whose handle is gone, deleted by id.
+  // One whose handle is gone, deleted by id, mounts and all.
   drop(
     containers
-      .create("left", "images/userland@base", Configuration::default())
+      .create(
+        "left",
+        "images/userland@base",
+        Configuration {
+          mounts: vec![Mount::tmpfs("/scratch")],
+          ..Configuration::default()
+        },
+      )
       .expect("create another container"),
   );
   containers

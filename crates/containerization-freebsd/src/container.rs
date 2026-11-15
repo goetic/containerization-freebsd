@@ -1,12 +1,11 @@
 //! Containers: each a jail on its own ZFS clone, with a main process, its
-//! own hostname, network, resolver and hosts, and sockets relayed to and
-//! from the host. Where Containerization gives
-//! each Linux container a VM, these share one machine; for a VM each, make a
-//! machine each.
+//! own hostname, network, resolver and hosts, mounts, and sockets relayed
+//! to and from the host. Where Containerization gives each Linux container
+//! a VM, these share one machine; for a VM each, make a machine each.
 
 use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
 use crate::error::{Error, Result};
-use crate::jail::{Jail, Network};
+use crate::jail::{Jail, Mount, Network};
 use crate::socket::{SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
 use std::mem;
@@ -33,6 +32,9 @@ pub struct Configuration {
   /// More jail(8) parameters, as `Jail::start` takes them. Containers mount
   /// devfs already.
   pub parameters: Vec<String>,
+  /// File systems mounted into it in this order, before its resolver and
+  /// hosts are written, until it stops.
+  pub mounts: Vec<Mount>,
   /// Unix sockets relayed between the host and it, with their guest paths
   /// in the container: from when `start` starts it until it stops.
   pub sockets: Vec<UnixSocket>,
@@ -280,8 +282,13 @@ fn set_up<'a>(agent: &'a Agent, id: &str, dataset: &str, configuration: &Configu
   let mut parameters = vec!["mount.devfs", hostname.as_str()];
   parameters.extend(configuration.parameters.iter().map(String::as_str));
   let jail = Jail::start(agent, id, &root, configuration.network, &parameters)?;
+  let furnished = configuration
+    .mounts
+    .iter()
+    .try_for_each(|mount| jail.mount(mount))
+    .and_then(|()| write_files(&jail, configuration));
 
-  match write_files(&jail, configuration) {
+  match furnished {
     Ok(()) => Ok(jail),
     Err(error) => {
       let _ = jail.stop();

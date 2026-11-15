@@ -39,6 +39,11 @@
   one inside appears on the host, with the permissions given. A container
   relays its sockets while it runs. Connects to the Unix sockets and
   loopback ports of jails and containers too. Also protocol version 3.
+- Mounts into containers and jails: guest directories, such as host
+  shares, through nullfs; tmpfs; or any file system mount(8) takes, and
+  read-only if asked. A mount point resolves as the jail sees it, so its
+  symbolic links can't lead out. Stopping a jail unmounts all mounted in
+  it.
 - Fixes a relay losing the host's last Data when the host's end finished
   second, and stopping a jail returning before the jail is gone, while its
   TCP connections still hold it.

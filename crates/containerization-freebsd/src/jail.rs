@@ -48,6 +48,47 @@ const DYING: Duration = Duration::from_secs(90);
 const RESOLVER: &str =
   r#"[ ! -e /etc/resolv.conf ] || [ -e "$1/etc/resolv.conf" ] || cp /etc/resolv.conf "$1/etc/resolv.conf""#;
 
+/// Prints `$2`, a path in the jail rooted at `$1`, as the guest's path to
+/// what the jail would find there, and makes the directories it lacks.
+/// Symbolic links resolve within the root, absolute ones from it, and `..`
+/// stops at it.
+const RESOLVE: &str = r#"set -e
+root=$1 rest=$2 resolved= links=0
+while [ -n "$rest" ]; do
+  part=${rest%%/*}
+  case $rest in */*) rest=${rest#*/} ;; *) rest= ;; esac
+  case $part in
+  '' | .) ;;
+  ..) resolved=${resolved%/*} ;;
+  *)
+    if [ -L "$root$resolved/$part" ]; then
+      links=$((links + 1))
+      if [ "$links" -gt 32 ]; then
+        echo "$2: too many symbolic links" >&2
+        exit 1
+      fi
+      target=$(readlink "$root$resolved/$part")
+      case $target in /*) resolved= ;; esac
+      rest=$target/$rest
+    else
+      resolved=$resolved/$part
+    fi
+    ;;
+  esac
+done
+if [ -z "$resolved" ]; then
+  echo "$2: that is the jail's root" >&2
+  exit 1
+fi
+mkdir -p "$root$resolved"
+printf '%s\n' "$root$resolved""#;
+
+/// Unmounts what is mounted under `$1` but datasets, the latest first.
+/// mount -p writes a space in a path as \040.
+const UNMOUNT: &str = r#"set -e
+mount -p | awk -v under="$1/" 'index($2, under) == 1 && $3 != "zfs" { print $2 }' | tail -r |
+  while read -r point; do umount "$(printf '%b' "$point")"; done"#;
+
 /// How a jail reaches the network.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Network {
@@ -60,6 +101,49 @@ pub enum Network {
   /// guest, and pf NATs it out through the guest's address. Needs the
   /// machine's NAT (`Layout::nat`).
   Nat,
+}
+
+/// A file system mounted into a jail, as Containerization's `Mount` is into
+/// a container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mount {
+  /// mount(8)'s type: `nullfs`, `tmpfs` or another.
+  pub kind: String,
+  /// For nullfs, a directory in the guest.
+  pub source: String,
+  /// A path in the jail. Symbolic links on the way resolve within the
+  /// jail, and the directories it lacks are made.
+  pub destination: String,
+  /// mount(8)'s `-o`, such as `ro`, or tmpfs's `size=64m`.
+  pub options: Vec<String>,
+}
+
+impl Mount {
+  /// The guest's directory `source` at `destination`, through nullfs: such
+  /// as a host share `Machine::mount_share` mounted, or one under it.
+  pub fn directory(source: &str, destination: &str) -> Self {
+    Self {
+      kind: "nullfs".into(),
+      source: source.into(),
+      destination: destination.into(),
+      options: Vec::new(),
+    }
+  }
+
+  /// A tmpfs at `destination`.
+  pub fn tmpfs(destination: &str) -> Self {
+    Self {
+      kind: "tmpfs".into(),
+      source: "tmpfs".into(),
+      destination: destination.into(),
+      options: Vec::new(),
+    }
+  }
+
+  pub fn read_only(mut self) -> Self {
+    self.options.push("ro".into());
+    self
+  }
 }
 
 pub struct Jail<'a> {
@@ -171,6 +255,35 @@ impl<'a> Jail<'a> {
     self.agent.relay_socket_in(socket, Some(&self.name))
   }
 
+  /// Mounts `mount` in the jail, until `stop`. Mount before anything runs
+  /// in it: a process there could otherwise swap a directory on the way
+  /// for a symbolic link as the mount is made.
+  pub fn mount(&self, mount: &Mount) -> Result<()> {
+    let root = self.root()?;
+    let resolved = self
+      .agent
+      .check(&["sh", "-c", RESOLVE, "sh", &root, &mount.destination], QUICK)?
+      .stdout;
+    let point = resolved.strip_suffix('\n').unwrap_or(&resolved);
+    let options = mount.options.join(",");
+    let mut argv = vec!["mount", "-t", mount.kind.as_str()];
+    if !options.is_empty() {
+      argv.extend(["-o", options.as_str()]);
+    }
+    argv.extend([mount.source.as_str(), point]);
+
+    self.agent.check(&argv, QUICK).map(|_| ())
+  }
+
+  /// Its root's path in the guest.
+  fn root(&self) -> Result<String> {
+    let ran = self
+      .agent
+      .check(&["jls", "-j", &self.name, "path"], QUICK)?;
+
+    Ok(ran.stdout.trim_end_matches('\n').to_string())
+  }
+
   /// As `Agent::run`, in the jail.
   pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
     self.agent.run(&self.jexec(argv), timeout)
@@ -183,7 +296,7 @@ impl<'a> Jail<'a> {
 
   /// Stops the jail, killing its processes, and waits for it to be gone,
   /// which a TCP connection it made can hold up for a minute. Then unmounts
-  /// its devfs, and destroys its epair.
+  /// what is mounted in it but datasets, and destroys its epair.
   pub fn stop(self) -> Result<()> {
     let ran = self
       .agent
@@ -210,18 +323,12 @@ impl<'a> Jail<'a> {
       .agent
       .check(&["sh", "-c", GONE, "sh", &self.name], DYING)?;
 
-    // jail(8) mounts devfs for `mount.devfs`, but can't unmount it on its
-    // own: the parameter is jail(8)'s, not the kernel's, so a jail removed
-    // by name has no record of it.
-    let devfs = format!("{path}/dev");
-    let mounted = self.agent.check(&["mount", "-t", "devfs"], QUICK)?;
-    if mounted
-      .lines()
-      .iter()
-      .any(|line| line.starts_with(&format!("devfs on {devfs} ")))
-    {
-      self.agent.check(&["umount", &devfs], QUICK)?;
-    }
+    // Including devfs, which jail(8) mounts for `mount.devfs` but can't
+    // unmount: the parameter is jail(8)'s, not the kernel's, so a jail
+    // removed by name has no record of it.
+    self
+      .agent
+      .check(&["sh", "-c", UNMOUNT, "sh", path], QUICK)?;
 
     // Back in the guest once the jail is gone; destroying one end
     // destroys both.
@@ -289,6 +396,62 @@ fn address(epair: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::os::unix::fs::symlink;
+  use std::path::Path;
+  use std::process::Command;
+
+  /// What RESOLVE makes of `path` in `root`, through the host's sh: the
+  /// guest path it prints, or its error.
+  fn resolve(root: &Path, path: &str) -> std::result::Result<String, String> {
+    let output = Command::new("sh")
+      .args(["-c", RESOLVE, "sh"])
+      .arg(root)
+      .arg(path)
+      .output()
+      .unwrap();
+
+    if output.status.success() {
+      Ok(String::from_utf8(output.stdout).unwrap())
+    } else {
+      Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+  }
+
+  #[test]
+  fn resolves_a_mount_point_as_the_jail_would() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir_all(root.join("srv/data")).unwrap();
+    symlink("/srv", root.join("absolute")).unwrap();
+    symlink("srv/data", root.join("relative")).unwrap();
+    symlink("../../../..", root.join("srv/up")).unwrap();
+    let inside = |path: &str| Ok(format!("{}{path}\n", root.display()));
+
+    assert_eq!(resolve(root, "/absolute/data"), inside("/srv/data"));
+    assert_eq!(resolve(root, "relative/new/./dir"), inside("/srv/data/new/dir"));
+    assert!(root.join("srv/data/new/dir").is_dir());
+    assert_eq!(resolve(root, "/srv/up/../srv/up/srv"), inside("/srv"));
+  }
+
+  #[test]
+  fn refuses_a_mount_point_it_cannot_resolve() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    symlink("loop", root.join("loop")).unwrap();
+    std::fs::write(root.join("file"), "").unwrap();
+
+    assert!(
+      resolve(root, "/loop")
+        .unwrap_err()
+        .contains("too many symbolic links")
+    );
+    assert!(
+      resolve(root, "/srv/..")
+        .unwrap_err()
+        .contains("the jail's root")
+    );
+    assert!(resolve(root, "/file/under").is_err());
+  }
 
   #[test]
   fn gives_each_epair_unit_its_own_address_after_the_gateway() {
