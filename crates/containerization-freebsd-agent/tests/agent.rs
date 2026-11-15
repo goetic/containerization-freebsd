@@ -1,7 +1,9 @@
 //! Drives the agent the way the host does: a host-side Mux, over a socket pair
 //! standing in for the console.
 
-use containerization_freebsd_protocol::{CONTROL, Decoder, Exec, Exit, Frame, Message, Mux, Side, VERSION, WindowSize};
+use containerization_freebsd_protocol::{
+  CONTROL, Decoder, Exec, Exit, Frame, Limit, Message, Mux, Resource, Side, User, VERSION, WindowSize,
+};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
@@ -221,6 +223,64 @@ fn passes_the_environment_and_working_directory() {
   });
 
   assert_eq!(host.finish(channel).output, "hello\n/\n");
+}
+
+#[test]
+fn sets_the_umask_and_resource_limits() {
+  let mut host = Host::start();
+
+  let channel = host.exec(Exec {
+    umask: Some(0o027),
+    limits: vec![
+      Limit {
+        resource: Resource::OPEN_FILES,
+        soft: 64,
+        hard: 128,
+      },
+      Limit {
+        resource: Resource::CORE,
+        soft: 0,
+        hard: u64::MAX,
+      },
+    ],
+    cwd: Some("/".into()),
+    ..command(&["sh", "-c", "umask; ulimit -Sn; ulimit -Hn; ulimit -Sc; ulimit -Hc; pwd"])
+  });
+  let finished = host.finish(channel);
+
+  assert_eq!(finished.output, "0027\n64\n128\n0\nunlimited\n/\n", "{finished:?}");
+  assert_eq!(finished.exit, Some(Exit::Code(0)));
+}
+
+#[test]
+fn refuses_a_user_its_root_does_not_list() {
+  let mut host = Host::start();
+
+  let channel = host.open(Message::Exec(Exec {
+    user: Some(User {
+      name: "cfbsd-nobody-at-all".into(),
+      ..User::default()
+    }),
+    ..command(&["true"])
+  }));
+
+  assert!(
+    matches!(host.next(), (from, Message::Error(reason)) if from == channel && reason.contains("cfbsd-nobody-at-all")),
+  );
+}
+
+#[test]
+fn refuses_a_jail_it_cannot_find() {
+  let mut host = Host::start();
+
+  let channel = host.open(Message::Exec(Exec {
+    jail: Some("cfbsd-no-such-jail".into()),
+    ..command(&["true"])
+  }));
+
+  assert!(
+    matches!(host.next(), (from, Message::Error(reason)) if from == channel && reason.contains("cfbsd-no-such-jail")),
+  );
 }
 
 #[test]

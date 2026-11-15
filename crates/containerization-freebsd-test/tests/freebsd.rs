@@ -6,8 +6,8 @@
 
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
-  Builder, Configuration, Containers, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Network, Output, Share, Step,
-  Unpacker, Upgrade, WindowSize, Zfs, image,
+  Builder, Configuration, Containers, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Network, Output, Process,
+  Resource, Share, Step, Unpacker, Upgrade, User, WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,20 @@ fn work(name: &str) -> PathBuf {
 
 fn sh(script: &str) -> [&str; 3] {
   ["sh", "-c", script]
+}
+
+/// A process's stdout once it exits, and how it exited. Its stderr fails
+/// the test.
+fn finish(process: &Process) -> (String, Exit) {
+  let mut stdout = Vec::new();
+
+  loop {
+    match process.recv().expect("its output") {
+      Output::Stdout(bytes) => stdout.extend(bytes),
+      Output::Stderr(bytes) => panic!("{}", String::from_utf8_lossy(&bytes)),
+      Output::Exited(exit) => return (String::from_utf8_lossy(&stdout).into_owned(), exit),
+    }
+  }
 }
 
 fn host_sha256(path: &std::path::Path) -> String {
@@ -424,6 +438,53 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     lines[3].split_whitespace().collect::<Vec<_>>(),
     ["192.0.2.1", "db.test", "db"]
   );
+
+  // Its processes as its own users, with their groups and more, a umask and
+  // limits, in a directory of its own; and as a uid it doesn't list.
+  let script = "id -u; id -g; id -G; umask; ulimit -n; echo \"$HOME\"; pwd";
+  let (stdout, exit) = finish(
+    &web
+      .exec(Exec {
+        argv: sh(script).map(String::from).to_vec(),
+        cwd: Some("/var/empty".into()),
+        user: Some(User {
+          name: "nobody".into(),
+          group: None,
+          groups: vec!["operator".into(), "4242".into()],
+        }),
+        umask: Some(0o077),
+        limits: vec![Limit {
+          resource: Resource::OPEN_FILES,
+          soft: 100,
+          hard: 100,
+        }],
+        ..Exec::default()
+      })
+      .expect("run a process as nobody"),
+  );
+  assert_eq!(exit, Exit::Code(0), "{stdout}");
+  let lines: Vec<&str> = stdout.lines().collect();
+  assert_eq!(lines[..2], ["65534", "65534"], "{stdout}");
+  // On FreeBSD 15, `id -G` lists only supplementary groups.
+  let mut groups: Vec<&str> = lines[2].split_whitespace().collect();
+  groups.sort_unstable();
+  assert_eq!(groups, ["4242", "5"], "{stdout}");
+  assert_eq!(lines[3..], ["0077", "100", "/nonexistent", "/var/empty"], "{stdout}");
+  let (stdout, exit) = finish(
+    &web
+      .exec(Exec {
+        argv: sh("id -u; id -g; echo \"$HOME\"")
+          .map(String::from)
+          .to_vec(),
+        user: Some(User {
+          name: "4242".into(),
+          ..User::default()
+        }),
+        ..Exec::default()
+      })
+      .expect("run a process as an unlisted uid"),
+  );
+  assert_eq!((stdout.as_str(), exit), ("4242\n0\n/\n", Exit::Code(0)));
 
   // Stderr is ignored: sh reports there its sleep dying of SIGTERM.
   web.stop().expect("stop the container");

@@ -15,7 +15,8 @@
 //! starts one. Channel 0 carries Hello, Ping and Pong, and the agent's
 //! Received: how much of the console it has read. The console drops bytes it
 //! can't hold, so the host keeps at most [`WINDOW`] bytes unreceived. The
-//! host opens channels with Exec, for a process on pipes or a pty, and
+//! host opens channels with Exec, for a process on pipes or a pty, in the
+//! guest or a jail, as a user, with a umask and resource limits; and
 //! Connect, for a relay to a guest TCP port. The opener sends Data (stdin, or
 //! relay bytes), Resize and Signal.
 //! The runner answers Opened, then Data (stdout), Stderr and Exited. Eof ends
@@ -27,5 +28,5 @@ pub mod message;
 pub mod mux;
 
 pub use frame::{Decoder, Frame, MAGIC, MAX_PAYLOAD, Skipped};
-pub use message::{DecodeError, Exec, Exit, Message, WindowSize};
+pub use message::{DecodeError, Exec, Exit, Limit, Message, Resource, User, WindowSize};
 pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch, WINDOW};

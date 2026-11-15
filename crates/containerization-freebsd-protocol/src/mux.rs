@@ -12,7 +12,7 @@ use std::{fmt, mem};
 pub const CONTROL: u32 = 0;
 
 /// The version this crate speaks, which the other side's must match.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// The most bytes the host may have written to the console that the agent
 /// hasn't yet said it Received. FreeBSD's virtio console drops what overflows

@@ -45,9 +45,68 @@ pub enum Message {
 pub struct Exec {
   pub argv: Vec<String>,
   pub env: Vec<(String, String)>,
+  /// A path in its jail, if it has one.
   pub cwd: Option<String>,
   /// A pseudo-terminal of this size, which merges stderr into Data; or pipes.
   pub pty: Option<WindowSize>,
+  /// The jail it runs in, by name; or the guest.
+  pub jail: Option<String>,
+  /// Whom it runs as; or root, as the agent does.
+  pub user: Option<User>,
+  /// Its file mode creation mask; or the agent's.
+  pub umask: Option<u16>,
+  pub limits: Vec<Limit>,
+}
+
+/// Whom a process runs as, looked up in its root's `/etc/passwd` and
+/// `/etc/group`: its jail's, or the guest's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct User {
+  /// A user's name, or a uid, which needn't be listed.
+  pub name: String,
+  /// A group's name, or a gid, in place of the user's own group and the
+  /// groups that list them.
+  pub group: Option<String>,
+  /// More groups, by name or gid.
+  pub groups: Vec<String>,
+}
+
+/// A resource limit, as setrlimit(2) sets it. A value past the guest's
+/// `RLIM_INFINITY`, such as `u64::MAX`, is unlimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limit {
+  pub resource: Resource,
+  pub soft: u64,
+  pub hard: u64,
+}
+
+/// A resource setrlimit(2) limits, numbered as in the guest, as signals are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Resource(pub i32);
+
+impl Resource {
+  /// CPU time, in seconds.
+  pub const CPU: Self = Self(0);
+  /// The size of a file it writes.
+  pub const FILE_SIZE: Self = Self(1);
+  pub const DATA: Self = Self(2);
+  pub const STACK: Self = Self(3);
+  /// The size of a core dump.
+  pub const CORE: Self = Self(4);
+  pub const RESIDENT: Self = Self(5);
+  pub const LOCKED_MEMORY: Self = Self(6);
+  /// Processes for its real user.
+  pub const PROCESSES: Self = Self(7);
+  pub const OPEN_FILES: Self = Self(8);
+  /// Socket buffers for its real user.
+  pub const SOCKET_BUFFERS: Self = Self(9);
+  pub const ADDRESS_SPACE: Self = Self(10);
+  /// Pseudo-terminals for its real user.
+  pub const PSEUDO_TERMINALS: Self = Self(11);
+  /// Swap reserved for its real user.
+  pub const SWAP: Self = Self(12);
+  /// Kqueues for its real user.
+  pub const KQUEUES: Self = Self(13);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +200,32 @@ impl Message {
           Some(size) => payload.u8(1).window(size),
           None => payload.u8(0),
         };
+        match &exec.jail {
+          Some(jail) => payload.u8(1).string(jail),
+          None => payload.u8(0),
+        };
+        match &exec.user {
+          Some(user) => {
+            payload.u8(1).string(&user.name);
+            match &user.group {
+              Some(group) => payload.u8(1).string(group),
+              None => payload.u8(0),
+            };
+            payload.strings(&user.groups)
+          }
+          None => payload.u8(0),
+        };
+        match exec.umask {
+          Some(umask) => payload.u8(1).u16(umask),
+          None => payload.u8(0),
+        };
+        payload.u32(length(exec.limits.len()));
+        for limit in &exec.limits {
+          payload
+            .i32(limit.resource.0)
+            .u64(limit.soft)
+            .u64(limit.hard);
+        }
         kind::EXEC
       }
       Self::Connect { port } => {
@@ -217,6 +302,24 @@ impl Message {
           .collect::<Result<_, DecodeError>>()?,
         cwd: reader.option(Reader::string)?,
         pty: reader.option(Reader::window)?,
+        jail: reader.option(Reader::string)?,
+        user: reader.option(|reader| {
+          Ok(User {
+            name: reader.string()?,
+            group: reader.option(Reader::string)?,
+            groups: reader.strings()?,
+          })
+        })?,
+        umask: reader.option(Reader::u16)?,
+        limits: (0..reader.u32()?)
+          .map(|_| {
+            Ok(Limit {
+              resource: Resource(reader.i32()?),
+              soft: reader.u64()?,
+              hard: reader.u64()?,
+            })
+          })
+          .collect::<Result<_, DecodeError>>()?,
       }),
       kind::CONNECT => Self::Connect { port: reader.u16()? },
       kind::OPENED => Self::Opened,
@@ -391,6 +494,32 @@ mod tests {
         env: vec![("TERM".into(), "xterm".into())],
         cwd: Some("/src".into()),
         pty: Some(WindowSize { rows: 24, columns: 80 }),
+        jail: Some("web".into()),
+        user: Some(User {
+          name: "www".into(),
+          group: Some("0".into()),
+          groups: vec!["wheel".into(), "5".into()],
+        }),
+        umask: Some(0o027),
+        limits: vec![
+          Limit {
+            resource: Resource::OPEN_FILES,
+            soft: 1024,
+            hard: u64::MAX,
+          },
+          Limit {
+            resource: Resource(-1),
+            soft: 0,
+            hard: 0,
+          },
+        ],
+      }),
+      Message::Exec(Exec {
+        user: Some(User {
+          name: "1000".into(),
+          ..User::default()
+        }),
+        ..Exec::default()
       }),
       Message::Exec(Exec::default()),
       Message::Connect { port: 8080 },

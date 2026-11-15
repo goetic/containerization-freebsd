@@ -29,6 +29,11 @@
   host, which lists, tags and deletes them. Checks each layer against the
   image's config and unpacks it into a ZFS snapshot named by its chain id, so
   images share layers. A container can run an image's default process.
+- Processes run as a user, by name or uid, with their own groups or a group
+  given, and more, looked up in their jail's `/etc/passwd` and `/etc/group`;
+  and with a umask and resource limits. A container of an image runs as the
+  image's user. The agent enters jails itself, so a working directory in a
+  jail no longer needs its shell. Protocol version 3.
 - Builds, containers and unpacked images can be stored under the pool of
   FreeBSD's VM image, whose root dataset isn't mounted.
 - Preparing a base can skip the first boot's online upgrade, taking seconds

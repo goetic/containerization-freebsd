@@ -21,8 +21,16 @@ the host will.
   A new session kills the process groups of the old session's
   channels.
 - **Exec:** the environment adds to the agent's own. Signal numbers are the
-  guest's. Exited follows the end of output, so a process whose child
-  holds its output open stays open until that child exits.
+  guest's, as are resource numbers. Exited follows the end of output, so a
+  process whose child holds its output open stays open until that child
+  exits.
+- **Jails and users:** before it starts, a process attaches to its jail,
+  sets its limits and umask, takes on its user, then changes directory as
+  that user. Users and groups are looked up as runc does, in the jail's
+  `/etc/passwd` and `/etc/group`, or the guest's: a name must be listed,
+  but a uid needn't be. A file that leads out of the jail's root is
+  refused. A user gets their home as `HOME`, unless the environment gives
+  one.
 - **Terminals:** Eof is ignored; ^D, sent as Data, ends a terminal's input.
 - **Connect:** relays to 127.0.0.1, or failing that ::1.
 

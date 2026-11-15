@@ -9,7 +9,7 @@ pub use content::ContentStore;
 pub use reference::Reference;
 pub use registry::{Credentials, RegistryClient};
 
-use crate::agent::Exec;
+use crate::agent::{Exec, User};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -179,10 +179,24 @@ pub struct RootFs {
 
 impl ImageConfig {
   /// The process a container of the image runs unless told otherwise: its
-  /// entrypoint then command, its environment and its working directory.
-  /// Its user isn't applied yet.
+  /// entrypoint then command, its environment, its working directory, and
+  /// its user, `user` or `user:group`, each a name or a number.
   pub fn process(&self) -> Exec {
     let run = self.config.clone().unwrap_or_default();
+    let user = run
+      .user
+      .filter(|user| !user.is_empty())
+      .map(|user| match user.split_once(':') {
+        Some((name, group)) => User {
+          name: name.to_string(),
+          group: Some(group.to_string()),
+          groups: Vec::new(),
+        },
+        None => User {
+          name: user,
+          ..User::default()
+        },
+      });
 
     Exec {
       argv: run
@@ -198,7 +212,8 @@ impl ImageConfig {
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect(),
       cwd: run.working_dir.filter(|directory| !directory.is_empty()),
-      pty: None,
+      user,
+      ..Exec::default()
     }
   }
 
@@ -318,6 +333,38 @@ mod tests {
     );
     assert_eq!(process.cwd.as_deref(), Some("/srv"));
     assert_eq!(ImageConfig::default().process(), Exec::default());
+  }
+
+  #[test]
+  fn runs_as_the_images_user_and_group() {
+    let user = |user: &str| {
+      ImageConfig {
+        config: Some(RunConfig {
+          user: Some(user.into()),
+          ..RunConfig::default()
+        }),
+        ..ImageConfig::default()
+      }
+      .process()
+      .user
+    };
+
+    assert_eq!(
+      user("www"),
+      Some(User {
+        name: "www".into(),
+        ..User::default()
+      })
+    );
+    assert_eq!(
+      user("1000:wheel"),
+      Some(User {
+        name: "1000".into(),
+        group: Some("wheel".into()),
+        groups: Vec::new(),
+      })
+    );
+    assert_eq!(user(""), None);
   }
 
   #[test]

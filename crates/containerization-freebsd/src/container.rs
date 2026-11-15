@@ -15,7 +15,8 @@ const QUICK: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Default)]
 pub struct Configuration {
   /// Its main process, which `Container::start` starts. Its working
-  /// directory is a path in the container.
+  /// directory is a path in the container, and its user one the
+  /// container's `/etc/passwd` lists, or a uid.
   pub process: Exec,
   /// Defaults to its id.
   pub hostname: Option<String>,

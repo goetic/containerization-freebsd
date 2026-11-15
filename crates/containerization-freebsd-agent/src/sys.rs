@@ -1,14 +1,18 @@
 //! The calls std has no safe API for: pseudo-terminals, raw mode, signals,
-//! and waiting for an exit without reaping it. The crate's only unsafe code.
+//! waiting for an exit without reaping it, jails, and what a process takes
+//! on before it starts. The crate's only unsafe code.
 
 #![allow(unsafe_code)]
 
-use containerization_freebsd_protocol::WindowSize;
+use crate::user::Ids;
+use containerization_freebsd_protocol::{Limit, WindowSize};
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn check(result: libc::c_int) -> io::Result<libc::c_int> {
@@ -103,6 +107,129 @@ fn window(size: WindowSize) -> libc::winsize {
     ws_col: size.columns,
     ws_xpixel: 0,
     ws_ypixel: 0,
+  }
+}
+
+/// The running jail named `name`: its id, and its root's path in the guest.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
+  use std::ffi::{CStr, OsString};
+  use std::os::unix::ffi::OsStringExt;
+
+  fn parameter(bytes: &[u8]) -> libc::iovec {
+    libc::iovec {
+      iov_base: bytes.as_ptr().cast_mut().cast(),
+      iov_len: bytes.len(),
+    }
+  }
+
+  let wanted =
+    CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a jail's name has a NUL"))?;
+  let mut path = vec![0u8; libc::PATH_MAX as usize];
+  let mut parameters = [
+    parameter(c"name".to_bytes_with_nul()),
+    parameter(wanted.to_bytes_with_nul()),
+    parameter(c"path".to_bytes_with_nul()),
+    libc::iovec {
+      iov_base: path.as_mut_ptr().cast(),
+      iov_len: path.len(),
+    },
+  ];
+
+  // SAFETY: jail_get reads the names and the jail's name, which outlive the
+  // call, and writes no more than the path's buffer holds.
+  let jid = unsafe { libc::jail_get(parameters.as_mut_ptr(), parameters.len() as libc::c_uint, 0) };
+  if jid == -1 {
+    let error = io::Error::last_os_error();
+    return Err(match error.raw_os_error() {
+      Some(libc::ENOENT) => io::Error::new(io::ErrorKind::NotFound, format!("no jail is named {name:?}")),
+      _ => error,
+    });
+  }
+  let path = CStr::from_bytes_until_nul(&path)
+    .map_err(|_| io::Error::other(format!("jail {name:?}'s path has no end")))?
+    .to_bytes()
+    .to_vec();
+  Ok((jid, PathBuf::from(OsString::from_vec(path))))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
+  Err(io::Error::new(
+    io::ErrorKind::Unsupported,
+    format!("jail {name:?}: jails are FreeBSD's"),
+  ))
+}
+
+#[cfg(target_os = "freebsd")]
+fn attach(jid: libc::c_int) -> io::Result<()> {
+  // SAFETY: jail_attach touches no memory.
+  check(unsafe { libc::jail_attach(jid) })?;
+  Ok(())
+}
+
+/// Never called: `find_jail` finds none.
+#[cfg(not(target_os = "freebsd"))]
+fn attach(_: libc::c_int) -> io::Result<()> {
+  Err(io::ErrorKind::Unsupported.into())
+}
+
+/// What a process takes on before it starts.
+pub(crate) struct Entry {
+  pub(crate) jail: Option<libc::c_int>,
+  pub(crate) limits: Vec<Limit>,
+  pub(crate) umask: Option<u16>,
+  pub(crate) ids: Option<Ids>,
+  pub(crate) cwd: Option<CString>,
+}
+
+/// Has the command's process take on `entry` between fork and exec, in
+/// this order: its jail, its limits and umask, its user, and its working
+/// directory, which it reaches as that user, as std would.
+// rlim_t is signed on FreeBSD, and mode_t is u16 on FreeBSD and macOS but
+// u32 on Linux.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn enter_on_exec(command: &mut Command, entry: Entry) {
+  let rlim = |value: u64| value.min(libc::RLIM_INFINITY as u64) as libc::rlim_t;
+  let limits: Vec<(libc::c_int, libc::rlimit)> = entry
+    .limits
+    .iter()
+    .map(|limit| {
+      let rlimit = libc::rlimit {
+        rlim_cur: rlim(limit.soft),
+        rlim_max: rlim(limit.hard),
+      };
+      (limit.resource.0, rlimit)
+    })
+    .collect();
+  let umask = entry.umask.map(|umask| umask as libc::mode_t);
+  let Entry { jail, ids, cwd, .. } = entry;
+
+  // SAFETY: between fork and exec, the closure makes only system calls,
+  // which are async-signal-safe, reading what it owns, and allocates
+  // nothing.
+  unsafe {
+    command.pre_exec(move || {
+      if let Some(jid) = jail {
+        attach(jid)?;
+      }
+      for (resource, limit) in &limits {
+        check(libc::setrlimit(*resource as _, limit))?;
+      }
+      if let Some(umask) = umask {
+        libc::umask(umask);
+      }
+      if let Some(ids) = &ids {
+        // Supplementary groups only, on FreeBSD 15 as elsewhere.
+        check(libc::setgroups(ids.groups.len() as _, ids.groups.as_ptr()))?;
+        check(libc::setgid(ids.gid))?;
+        check(libc::setuid(ids.uid))?;
+      }
+      if let Some(cwd) = &cwd {
+        check(libc::chdir(cwd.as_ptr()))?;
+      }
+      Ok(())
+    });
   }
 }
 

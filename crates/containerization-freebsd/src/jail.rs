@@ -5,8 +5,6 @@ use crate::error::{Error, Result};
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
-/// Runs the rest of its arguments in the directory it gets first.
-const IN_DIRECTORY: &str = r#"cd "$0" && exec "$@""#;
 /// The bridge NAT jails sit on, and its address: the jails' gateway.
 const BRIDGE: &str = "cfbsd0";
 const GATEWAY: &str = "10.66.0.1";
@@ -133,15 +131,13 @@ impl<'a> Jail<'a> {
   }
 
   /// Starts `exec`'s process in the jail, as `Agent::spawn` does in the
-  /// guest. Its working directory is a path in the jail.
-  pub fn spawn(&self, mut exec: Exec) -> Result<Process> {
-    let mut argv = vec!["jexec".to_string(), self.name.clone()];
-    if let Some(cwd) = exec.cwd.take() {
-      argv.extend(["/bin/sh".into(), "-c".into(), IN_DIRECTORY.into(), cwd]);
-    }
-    argv.append(&mut exec.argv);
-
-    self.agent.spawn(Exec { argv, ..exec })
+  /// guest. Its working directory is a path in the jail, and its user is
+  /// looked up in the jail's `/etc/passwd` and `/etc/group`.
+  pub fn spawn(&self, exec: Exec) -> Result<Process> {
+    self.agent.spawn(Exec {
+      jail: Some(self.name.clone()),
+      ..exec
+    })
   }
 
   /// As `Agent::run`, in the jail.

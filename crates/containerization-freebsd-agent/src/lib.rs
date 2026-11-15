@@ -9,6 +9,7 @@ mod process;
 mod relay;
 mod session;
 mod sys;
+mod user;
 
 pub use session::serve;
 pub use sys::make_raw;

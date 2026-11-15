@@ -1,4 +1,5 @@
-//! Processes the host runs with Exec: on pipes, or in a pseudo-terminal.
+//! Processes the host runs with Exec: on pipes, or in a pseudo-terminal; in
+//! the guest, or a jail.
 //!
 //! Each has a thread per output, one feeding its input, and one that waits
 //! for it. Exited closes the channel, so it waits for the output to end as
@@ -6,11 +7,13 @@
 //! open runs on, as far as the host can tell, until that child exits too.
 
 use crate::session::{Handle, Input, Outbox, READ, Running};
-use crate::sys;
+use crate::{sys, user};
 use containerization_freebsd_protocol::{Exec, Exit, Message, WindowSize};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -78,14 +81,66 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
   command
     .args(args)
     .envs(exec.env.iter().map(|(name, value)| (name, value)));
-  if let Some(cwd) = &exec.cwd {
-    command.current_dir(cwd);
+  if exec.pty.is_some() {
+    // Its own session, with the terminal as its controlling terminal, as a
+    // login shell has; taken while it is still root.
+    sys::take_terminal_on_exec(&mut command);
   }
+  enter(&mut command, exec)?;
 
   match exec.pty {
     Some(size) => in_terminal(command, size, outbox),
     None => on_pipes(command, outbox),
   }
+}
+
+/// Has the process enter its jail and take on its user, limits and umask,
+/// then change directory: in its jail, to `/` if to nowhere else. With none
+/// of those, std changes its directory.
+fn enter(command: &mut Command, exec: &Exec) -> io::Result<()> {
+  if exec.jail.is_none() && exec.user.is_none() && exec.umask.is_none() && exec.limits.is_empty() {
+    if let Some(cwd) = &exec.cwd {
+      command.current_dir(cwd);
+    }
+    return Ok(());
+  }
+
+  let (jail, root) = match &exec.jail {
+    Some(name) => {
+      let (jid, root) = sys::find_jail(name)?;
+      (Some(jid), root)
+    }
+    None => (None, PathBuf::from("/")),
+  };
+  let ids = exec
+    .user
+    .as_ref()
+    .map(|user| user::look_up(user, &root))
+    .transpose()?;
+  if let Some(ids) = &ids
+    && !exec.env.iter().any(|(name, _)| name == "HOME")
+  {
+    command.env("HOME", &ids.home);
+  }
+  let cwd = exec
+    .cwd
+    .as_deref()
+    .or(jail.map(|_| "/"))
+    .map(CString::new)
+    .transpose()
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the working directory has a NUL"))?;
+
+  sys::enter_on_exec(
+    command,
+    sys::Entry {
+      jail,
+      limits: exec.limits.clone(),
+      umask: exec.umask,
+      ids,
+      cwd,
+    },
+  );
+  Ok(())
 }
 
 fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
@@ -123,9 +178,6 @@ fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Re
     .stdin(child_end.try_clone()?)
     .stdout(child_end.try_clone()?)
     .stderr(child_end);
-  // Its own session, with the terminal as its controlling terminal, as a
-  // login shell has.
-  sys::take_terminal_on_exec(&mut command);
   let child = command.spawn();
   // The parent's copies of the terminal's child end: until they close,
   // reading the terminal never ends.

@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-pub use containerization_freebsd_protocol::{Exec, Exit, WindowSize};
+pub use containerization_freebsd_protocol::{Exec, Exit, Limit, Resource, User, WindowSize};
 
 /// How long the agent has to start a process or connect a relay, and to read
 /// the console when the host has a window's worth unreceived.
@@ -175,8 +175,9 @@ impl Agent {
     }
   }
 
-  /// Starts `exec`'s process in the guest. The environment adds to the
-  /// agent's; with `pty`, it runs in a terminal of that size.
+  /// Starts `exec`'s process in the guest, or its jail. The environment
+  /// adds to the agent's; with `pty`, it runs in a terminal of that size.
+  /// A user gets their home as `HOME`, unless the environment gives one.
   pub fn spawn(&self, exec: Exec) -> Result<Process> {
     let what = format!("{:?}", exec.argv);
 
