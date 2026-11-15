@@ -47,6 +47,10 @@
 - Publishes ports on the loopback of the guest, a jail or a container on
   the host, relaying each connection. A container publishes its ports
   while it runs.
+- Quotas on what a jail's or container's processes use together, through
+  rctl: CPU, memory, processes, and file system reads and writes; and
+  statistics of what they use. Preparing a base now sets
+  `kern.racct.enable`, which they need: prepare older bases again.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited

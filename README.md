@@ -23,6 +23,8 @@ Pre-release.
 - `hw.vtnet.csum_disable=1` and `hw.vtnet.mq_disable=1`, written to
   `/efi/freebsd/loader.env` on the disk's EFI partition: Apple's virtio-net
   rejects the offloads vtnet(4) otherwise asks for.
+- `kern.racct.enable=1` there too, so the kernel accounts for what processes
+  use, as jails' quotas and statistics need.
 - NAT networking only when asked for.
 - Host directories over virtio-fs, which FreeBSD 15.1 mounts only with the
   patched modules in `guest/`.

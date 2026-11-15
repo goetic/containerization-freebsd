@@ -2,6 +2,7 @@
 
 use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
 use crate::error::{Error, Result};
+use crate::quota::{self, Quotas, Statistics};
 use crate::socket::{PublishedPort, SocketRelay, UnixSocket};
 use containerization_freebsd_protocol::{Address, Connect};
 use std::time::Duration;
@@ -281,6 +282,25 @@ impl<'a> Jail<'a> {
     self.agent.check(&argv, QUICK).map(|_| ())
   }
 
+  /// Replaces the jail's quotas with `quotas`, through rctl(8). `stop`
+  /// lifts them.
+  pub fn limit(&self, quotas: &Quotas) -> Result<()> {
+    let rules = quota::rules(&self.name, quotas);
+    let mut argv = vec!["sh", "-c", quota::LIMIT, "sh", self.name.as_str()];
+    argv.extend(rules.iter().map(String::as_str));
+
+    self.agent.check(&argv, QUICK).map(|_| ())
+  }
+
+  /// What the jail's processes use together, as rctl(8) accounts for it.
+  pub fn statistics(&self) -> Result<Statistics> {
+    let ran = self
+      .agent
+      .check(&["rctl", "-u", &format!("jail:{}", self.name)], QUICK)?;
+
+    quota::statistics(&ran.stdout)
+  }
+
   /// Its root's path in the guest.
   fn root(&self) -> Result<String> {
     let ran = self
@@ -301,8 +321,9 @@ impl<'a> Jail<'a> {
   }
 
   /// Stops the jail, killing its processes, and waits for it to be gone,
-  /// which a TCP connection it made can hold up for a minute. Then unmounts
-  /// what is mounted in it but datasets, and destroys its epair.
+  /// which a TCP connection it made can hold up for a minute. Then lifts
+  /// its quotas, unmounts what is mounted in it but datasets, and destroys
+  /// its epair.
   pub fn stop(self) -> Result<()> {
     let ran = self
       .agent
@@ -328,6 +349,10 @@ impl<'a> Jail<'a> {
     self
       .agent
       .check(&["sh", "-c", GONE, "sh", &self.name], DYING)?;
+    // rctl keeps a jail's rules by name, for the next jail of that name.
+    self
+      .agent
+      .check(&["sh", "-c", quota::LIMIT, "sh", &self.name], QUICK)?;
 
     // Including devfs, which jail(8) mounts for `mount.devfs` but can't
     // unmount: the parameter is jail(8)'s, not the kernel's, so a jail

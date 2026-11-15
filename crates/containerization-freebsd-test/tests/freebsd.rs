@@ -7,7 +7,8 @@
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
   Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Mount, Network,
-  Output, Process, PublishedPort, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
+  Output, Process, PublishedPort, Quotas, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs,
+  image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -665,6 +666,58 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   // Only once the agent has closed the host's socket in it.
   web.delete().expect("delete the container");
   std::fs::remove_dir_all(&sockets).expect("remove the sockets' directory");
+
+  // A container's quotas and statistics: memory is sampled once a second.
+  let limited = containers
+    .create(
+      "limited",
+      "images/userland@base",
+      Configuration {
+        quotas: Quotas {
+          cpu_percent: Some(50),
+          memory: Some(64 << 20),
+          processes: Some(4),
+          ..Quotas::default()
+        },
+        ..Configuration::default()
+      },
+    )
+    .expect("create a container with quotas");
+  let ran = machine
+    .agent
+    .check(&["rctl", "jail:limited:"], SECONDS)
+    .expect("list its rules");
+  let mut rules = ran.lines();
+  rules.sort_unstable();
+  assert_eq!(
+    rules,
+    [
+      "jail:limited:maxproc:deny=4",
+      "jail:limited:memoryuse:deny=67108864",
+      "jail:limited:pcpu:deny=50",
+    ]
+  );
+  let sleeper = limited
+    .exec(Exec {
+      argv: vec!["sleep".into(), "30".into()],
+      ..Exec::default()
+    })
+    .expect("start a process in it");
+  let statistics =
+    eventually(|| Some(limited.statistics().expect("its statistics")).filter(|statistics| statistics.memory > 0));
+  assert_eq!(statistics.processes, 1, "{statistics:?}");
+  drop(sleeper);
+  let ran = limited
+    .run(&sh("sleep 1 & sleep 1 & sleep 1 & sleep 1 & wait"), SECONDS)
+    .expect("fork past its quota");
+  assert_ne!(ran.exit, Exit::Code(0), "{ran:?}");
+  assert!(ran.stderr.to_lowercase().contains("fork"), "{ran:?}");
+  limited.delete().expect("delete the container with quotas");
+  let ran = machine
+    .agent
+    .check(&["rctl", "jail:limited:"], SECONDS)
+    .expect("list its rules again");
+  assert_eq!(ran.stdout, "", "its rules outlived it");
 
   // One whose handle is gone, deleted by id, mounts and all.
   drop(
