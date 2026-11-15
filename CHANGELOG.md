@@ -44,6 +44,9 @@
   read-only if asked. A mount point resolves as the jail sees it, so its
   symbolic links can't lead out. Stopping a jail unmounts all mounted in
   it.
+- Loads and saves OCI archives: tars of an OCI image layout, plain or
+  compressed with xz, such as FreeBSD's container images on
+  download.freebsd.org. Loaded images are named as the archive names them.
 - Publishes ports on the loopback of the guest, a jail or a container on
   the host, relaying each connection. A container publishes its ports
   while it runs.

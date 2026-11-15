@@ -1,5 +1,7 @@
 use super::{Descriptor, sha256_digest, sha256_file, sha256_hex};
 use crate::error::{Error, Result};
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -62,6 +64,32 @@ impl ContentStore {
       });
     }
     self.commit(partial, &digest)
+  }
+
+  /// Puts what `reader` reads in the store as the blob `digest`, if that is
+  /// its digest.
+  pub(crate) fn ingest_from(&self, reader: &mut impl Read, digest: &str) -> Result<()> {
+    let partial = self.partial();
+    let written = File::create(&partial).and_then(|mut file| io::copy(reader, &mut file));
+    let checked = written
+      .map_err(Error::io(format!("writing {}", partial.display())))
+      .and_then(|_| sha256_file(&partial));
+
+    match checked {
+      Ok((actual, _)) if actual == digest => self.commit(&partial, digest),
+      Ok((actual, _)) => {
+        let _ = std::fs::remove_file(&partial);
+        Err(Error::Checksum {
+          path: partial,
+          actual,
+          expected: digest.to_string(),
+        })
+      }
+      Err(error) => {
+        let _ = std::fs::remove_file(&partial);
+        Err(error)
+      }
+    }
   }
 
   /// A fresh path to write a blob at before ingesting it.
