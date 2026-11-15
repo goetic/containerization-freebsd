@@ -44,9 +44,13 @@
   read-only if asked. A mount point resolves as the jail sees it, so its
   symbolic links can't lead out. Stopping a jail unmounts all mounted in
   it.
+- Publishes ports on the loopback of the guest, a jail or a container on
+  the host, relaying each connection. A container publishes its ports
+  while it runs.
 - Fixes a relay losing the host's last Data when the host's end finished
-  second, and stopping a jail returning before the jail is gone, while its
-  TCP connections still hold it.
+  second; stopping a jail returning before the jail is gone, while its TCP
+  connections still hold it; and running a command failing when it exited
+  before the host closed its input.
 - Builds, containers and unpacked images can be stored under the pool of
   FreeBSD's VM image, whose root dataset isn't mounted.
 - Preparing a base can skip the first boot's online upgrade, taking seconds

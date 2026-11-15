@@ -2,7 +2,7 @@
 
 use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
 use crate::error::{Error, Result};
-use crate::socket::{SocketRelay, UnixSocket};
+use crate::socket::{PublishedPort, SocketRelay, UnixSocket};
 use containerization_freebsd_protocol::{Address, Connect};
 use std::time::Duration;
 
@@ -253,6 +253,12 @@ impl<'a> Jail<'a> {
   /// As `Agent::relay_socket`, with the socket's guest path in the jail.
   pub fn relay_socket(&self, socket: &UnixSocket) -> Result<SocketRelay> {
     self.agent.relay_socket_in(socket, Some(&self.name))
+  }
+
+  /// Publishes `port` of the jail's loopback on the host, as
+  /// `Agent::publish` does the guest's.
+  pub fn publish(&self, port: &PublishedPort) -> Result<SocketRelay> {
+    self.agent.publish_in(port, Some(&self.name))
   }
 
   /// Mounts `mount` in the jail, until `stop`. Mount before anything runs

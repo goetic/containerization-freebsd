@@ -6,7 +6,7 @@
 use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Mount, Network};
-use crate::socket::{SocketRelay, UnixSocket};
+use crate::socket::{PublishedPort, SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
 use std::mem;
 use std::sync::{Mutex, PoisonError};
@@ -38,6 +38,9 @@ pub struct Configuration {
   /// Unix sockets relayed between the host and it, with their guest paths
   /// in the container: from when `start` starts it until it stops.
   pub sockets: Vec<UnixSocket>,
+  /// Ports on its loopback published on the host, for as long as its
+  /// sockets are relayed.
+  pub ports: Vec<PublishedPort>,
 }
 
 /// A container's `/etc/resolv.conf`.
@@ -66,6 +69,7 @@ pub struct Container<'a> {
   dataset: String,
   process: Exec,
   sockets: Vec<UnixSocket>,
+  ports: Vec<PublishedPort>,
   main: Option<Process>,
   relays: Mutex<Vec<SocketRelay>>,
 }
@@ -87,6 +91,7 @@ impl<'a> Container<'a> {
         dataset: dataset.to_string(),
         process: configuration.process,
         sockets: configuration.sockets,
+        ports: configuration.ports,
         main: None,
         relays: Mutex::default(),
       }),
@@ -105,16 +110,18 @@ impl<'a> Container<'a> {
     &self.dataset
   }
 
-  /// Relays its sockets, and starts its main process, at most once.
+  /// Relays its sockets, publishes its ports, and starts its main process,
+  /// at most once.
   pub fn start(&mut self) -> Result<()> {
     if self.main.is_some() {
       return Err(Error::Invalid(format!("container {} has started already", self.id())));
     }
-    let relays = self
+    let sockets = self
       .sockets
       .iter()
-      .map(|socket| self.jail.relay_socket(socket))
-      .collect::<Result<_>>()?;
+      .map(|socket| self.jail.relay_socket(socket));
+    let ports = self.ports.iter().map(|port| self.jail.publish(port));
+    let relays = sockets.chain(ports).collect::<Result<_>>()?;
     *self
       .relays
       .get_mut()
@@ -153,10 +160,10 @@ impl<'a> Container<'a> {
     self.jail.connect_unix(path)
   }
 
-  /// Closes its socket relays, and stops its jail: jail(8) sends its
-  /// processes SIGTERM, and kills those left after 10 seconds. Its main
-  /// process's last output and exit can still be read. Stopping a stopped
-  /// container does nothing.
+  /// Closes its socket relays and published ports, and stops its jail:
+  /// jail(8) sends its processes SIGTERM, and kills those left after 10
+  /// seconds. Its main process's last output and exit can still be read.
+  /// Stopping a stopped container does nothing.
   pub fn stop(&self) -> Result<()> {
     self.close_relays()?;
     stop(self.agent, self.id())

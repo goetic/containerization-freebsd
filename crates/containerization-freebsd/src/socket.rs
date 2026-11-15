@@ -1,12 +1,13 @@
-//! Unix sockets relayed between the host and the guest, or a jail, as
-//! Containerization's `UnixSocketConfiguration`s are.
+//! Sockets relayed between the host and the guest, or a jail: Unix sockets
+//! either way, as Containerization's `UnixSocketConfiguration`s are, and
+//! TCP ports published on the host.
 
 use crate::agent::{Agent, Listener, Relay};
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{Address, Connect, Listen};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -41,9 +42,20 @@ pub enum Direction {
   OutOf,
 }
 
-/// A socket relayed, as `Agent::relay_socket` started it. Connections it
-/// relayed carry on after it stops. Dropping it stops it; going into the
-/// guest, that leaves the socket's file there, which `close` removes.
+/// A TCP port on the guest's loopback, or a jail's, published on the host:
+/// connections to `host` relay to `port` there. A service listening on
+/// every address is listening on loopback too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PublishedPort {
+  /// Where the host listens, such as 127.0.0.1:8080.
+  pub host: SocketAddr,
+  pub port: u16,
+}
+
+/// A socket relayed, as `Agent::relay_socket` or `Agent::publish` started
+/// it. Connections it relayed carry on after it stops. Dropping it stops
+/// it; going into the guest, that leaves the socket's file there, which
+/// `close` removes.
 pub struct SocketRelay {
   relaying: Relaying,
 }
@@ -53,11 +65,29 @@ enum Relaying {
   OutOf(HostListener),
 }
 
-/// The host's end of a relay out of the guest: its socket, and the thread
-/// accepting connections to it.
+/// The host's end of a relay out of the guest: where it listens, and
+/// whether its accepting thread should stop.
 struct HostListener {
-  path: PathBuf,
+  place: Place,
   stopped: Arc<AtomicBool>,
+}
+
+enum Place {
+  Unix(PathBuf),
+  /// Where a connection reaches it.
+  Tcp(SocketAddr),
+}
+
+/// A connection on the host, for `pump`.
+pub(crate) trait Connection: Read + Write + Send + Sized + 'static {
+  fn try_clone(&self) -> io::Result<Self>;
+  fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+
+/// A listener on the host.
+trait Accept: Send + 'static {
+  type Connection: Connection;
+  fn next_connection(&self) -> io::Result<Self::Connection>;
 }
 
 impl Agent {
@@ -86,7 +116,7 @@ impl Agent {
           jail,
         };
         Relaying::OutOf(
-          HostListener::start(self.share(), socket, connect)
+          HostListener::unix(self.share(), socket, connect)
             .map_err(Error::io(format!("listening on {}", socket.host.display())))?,
         )
       }
@@ -94,11 +124,31 @@ impl Agent {
 
     Ok(SocketRelay { relaying })
   }
+
+  /// Publishes `port` of the guest's loopback on the host.
+  pub fn publish(&self, port: &PublishedPort) -> Result<SocketRelay> {
+    self.publish_in(port, None)
+  }
+
+  /// As `publish`, from `jail`'s loopback, if given.
+  pub(crate) fn publish_in(&self, port: &PublishedPort, jail: Option<&str>) -> Result<SocketRelay> {
+    let connect = Connect {
+      to: Address::Port(port.port),
+      jail: jail.map(str::to_string),
+    };
+    let listener =
+      HostListener::tcp(self.share(), port.host, connect).map_err(Error::io(format!("listening on {}", port.host)))?;
+
+    Ok(SocketRelay {
+      relaying: Relaying::OutOf(listener),
+    })
+  }
 }
 
 impl SocketRelay {
-  /// Stops it, and removes its socket: going into the guest, once the
-  /// agent has closed it, so it no longer holds the file system it is on.
+  /// Stops it, and removes its socket's file, if it has one: going into the
+  /// guest, once the agent has closed it, so it no longer holds the file
+  /// system it is on.
   pub fn close(self) -> Result<()> {
     match self.relaying {
       Relaying::Into(listener) => listener.close(),
@@ -113,42 +163,113 @@ impl SocketRelay {
 impl HostListener {
   /// Listens at `socket.host`, and relays each connection as `connect`
   /// says.
-  fn start(agent: Agent, socket: &UnixSocket, connect: Connect) -> io::Result<Self> {
+  fn unix(agent: Agent, socket: &UnixSocket, connect: Connect) -> io::Result<Self> {
     let path = socket.host.clone();
     remove_socket(&path)?;
     let listener = UnixListener::bind(&path)?;
     if let Some(mode) = socket.mode {
       fs::set_permissions(&path, fs::Permissions::from_mode(mode.into()))?;
     }
-    let stopped = Arc::new(AtomicBool::new(false));
-    let stopping = stopped.clone();
 
-    thread::spawn(move || {
-      for local in listener.incoming() {
-        if stopping.load(Ordering::Relaxed) {
-          return;
-        }
-        let Ok(local) = local else { continue };
-        let (agent, connect) = (agent.share(), connect.clone());
-        // One the guest refuses is closed.
-        thread::spawn(move || {
-          if let Ok(relay) = agent.relay(connect) {
-            pump(relay, local);
-          }
-        });
-      }
-    });
-    Ok(Self { path, stopped })
+    Ok(Self {
+      place: Place::Unix(path),
+      stopped: relay_each(listener, agent, connect),
+    })
   }
+
+  /// Listens at `address`, and relays each connection as `connect` says.
+  fn tcp(agent: Agent, address: SocketAddr, connect: Connect) -> io::Result<Self> {
+    let listener = TcpListener::bind(address)?;
+    let mut reached = listener.local_addr()?;
+    if reached.ip().is_unspecified() {
+      reached.set_ip(match reached {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+      });
+    }
+
+    Ok(Self {
+      place: Place::Tcp(reached),
+      stopped: relay_each(listener, agent, connect),
+    })
+  }
+}
+
+/// Relays each connection to `listener` as `connect` says, from a thread
+/// of its own, until told to stop.
+fn relay_each(listener: impl Accept, agent: Agent, connect: Connect) -> Arc<AtomicBool> {
+  let stopped = Arc::new(AtomicBool::new(false));
+  let stopping = stopped.clone();
+
+  thread::spawn(move || {
+    loop {
+      let local = listener.next_connection();
+      if stopping.load(Ordering::Relaxed) {
+        return;
+      }
+      let Ok(local) = local else { continue };
+      let (agent, connect) = (agent.share(), connect.clone());
+      // One the guest refuses is closed.
+      thread::spawn(move || {
+        if let Ok(relay) = agent.relay(connect) {
+          pump(relay, local);
+        }
+      });
+    }
+  });
+  stopped
 }
 
 impl Drop for HostListener {
   /// Stops accepting, waking the thread with a connection of its own, and
-  /// removes the socket.
+  /// removes a Unix socket.
   fn drop(&mut self) {
     self.stopped.store(true, Ordering::Relaxed);
-    let _ = UnixStream::connect(&self.path);
-    let _ = fs::remove_file(&self.path);
+    match &self.place {
+      Place::Unix(path) => {
+        let _ = UnixStream::connect(path);
+        let _ = fs::remove_file(path);
+      }
+      Place::Tcp(address) => {
+        let _ = TcpStream::connect(address);
+      }
+    }
+  }
+}
+
+impl Connection for UnixStream {
+  fn try_clone(&self) -> io::Result<Self> {
+    UnixStream::try_clone(self)
+  }
+
+  fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+    UnixStream::shutdown(self, how)
+  }
+}
+
+impl Connection for TcpStream {
+  fn try_clone(&self) -> io::Result<Self> {
+    TcpStream::try_clone(self)
+  }
+
+  fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+    TcpStream::shutdown(self, how)
+  }
+}
+
+impl Accept for UnixListener {
+  type Connection = UnixStream;
+
+  fn next_connection(&self) -> io::Result<UnixStream> {
+    self.accept().map(|(stream, _)| stream)
+  }
+}
+
+impl Accept for TcpListener {
+  type Connection = TcpStream;
+
+  fn next_connection(&self) -> io::Result<TcpStream> {
+    self.accept().map(|(stream, _)| stream)
   }
 }
 
@@ -164,7 +285,7 @@ fn remove_socket(path: &Path) -> io::Result<()> {
 
 /// Relays between `relay` and `local`, a connection on the host, until
 /// both have finished.
-pub(crate) fn pump(relay: Relay, local: UnixStream) {
+pub(crate) fn pump(relay: Relay, local: impl Connection) {
   let Ok(mut to_local) = local.try_clone() else {
     return;
   };
@@ -223,10 +344,10 @@ mod tests {
 
   /// Answers each connection to `listener`, once it ends, with what it
   /// sent in capitals.
-  fn answer_in_capitals(listener: UnixListener) {
+  fn answer_in_capitals(listener: impl Accept) {
     thread::spawn(move || {
-      for stream in listener.incoming() {
-        let mut stream = stream.unwrap();
+      loop {
+        let mut stream = listener.next_connection().unwrap();
         let mut received = Vec::new();
         stream.read_to_end(&mut received).unwrap();
         stream.write_all(&received.to_ascii_uppercase()).unwrap();
@@ -237,7 +358,11 @@ mod tests {
   /// What a connection to `path` answers `text` with: nothing, if it closes
   /// first.
   fn ask(path: &Path, text: &str) -> String {
-    let mut stream = UnixStream::connect(path).unwrap();
+    exchange(UnixStream::connect(path).unwrap(), text)
+  }
+
+  /// What `stream` answers `text` with.
+  fn exchange(mut stream: impl Connection, text: &str) -> String {
     let _ = stream.write_all(text.as_bytes());
     let _ = stream.shutdown(Shutdown::Write);
     let mut answer = String::new();
@@ -303,5 +428,29 @@ mod tests {
 
     assert_eq!(ask(&path("into.sock"), "anyone?"), "");
     assert_eq!(ask(&path("out.sock"), "anyone?"), "");
+  }
+
+  #[test]
+  fn publishes_a_guest_port_on_the_host() {
+    let agent = started();
+    let guest = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = guest.local_addr().unwrap().port();
+    answer_in_capitals(guest);
+    let host = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap();
+
+    let relay = agent.publish(&PublishedPort { host, port }).unwrap();
+    assert_eq!(exchange(TcpStream::connect(host).unwrap(), "published"), "PUBLISHED");
+    assert_eq!(exchange(TcpStream::connect(host).unwrap(), "again"), "AGAIN");
+
+    relay.close().unwrap();
+    // Its thread closes the listener once it notices.
+    let closed = std::time::Instant::now();
+    while TcpStream::connect(host).is_ok() {
+      assert!(closed.elapsed().as_secs() < 10, "it still listens");
+      thread::sleep(std::time::Duration::from_millis(10));
+    }
   }
 }

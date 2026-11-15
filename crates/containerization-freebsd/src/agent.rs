@@ -376,9 +376,10 @@ impl Process {
     self.stream.write(bytes)
   }
 
-  /// Ends its stdin. In a terminal, write ^D instead.
+  /// Ends its stdin. In a terminal, write ^D instead. Once it has exited,
+  /// does nothing.
   pub fn close_input(&self) -> Result<()> {
-    self.stream.send(Message::Eof)
+    self.stream.send_while_open(Message::Eof).map(|_| ())
   }
 
   /// Resizes its terminal.
@@ -458,10 +459,9 @@ impl Relay {
 impl Listener {
   /// Stops it, and waits for the agent to close and remove its socket.
   pub(crate) fn close(self) -> Result<()> {
-    if !self.stream.shared.lock().mux.is_open(self.stream.channel) {
+    if !self.stream.send_while_open(Message::Eof)? {
       return Ok(());
     }
-    self.stream.send(Message::Eof)?;
 
     loop {
       match self.stream.recv(Some(OPENING))? {
@@ -505,6 +505,21 @@ impl Stream {
       .send(self.channel, message)
       .map_err(|error| Error::Guest(format!("{}: {error}", self.what)))?;
     state.write(&frame)
+  }
+
+  /// As `send`, while the channel is open: whether it was. A process's
+  /// closes once it exits, which can be before the host acts on Opened.
+  fn send_while_open(&self, message: Message) -> Result<bool> {
+    let mut state = self.shared.lock();
+    if !state.mux.is_open(self.channel) {
+      return Ok(false);
+    }
+    let frame = state
+      .mux
+      .send(self.channel, message)
+      .map_err(|error| Error::Guest(format!("{}: {error}", self.what)))?;
+    state.write(&frame)?;
+    Ok(true)
   }
 
   fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -926,6 +941,16 @@ pub(crate) mod tests {
     process.close_input().unwrap();
 
     assert_eq!(finish(&process), ("fed\n".to_string(), Exit::Code(0)));
+  }
+
+  #[test]
+  fn closing_the_input_of_a_process_that_exited_does_nothing() {
+    let agent = started();
+
+    let process = agent.spawn(command(&["true"])).unwrap();
+    assert_eq!(finish(&process), (String::new(), Exit::Code(0)));
+
+    process.close_input().unwrap();
   }
 
   #[test]
