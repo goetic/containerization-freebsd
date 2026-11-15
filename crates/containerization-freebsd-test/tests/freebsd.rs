@@ -235,23 +235,21 @@ fn prepares_boots_and_restores() {
     .expect("use the share after restoring");
   assert_eq!(ran.lines(), ["restored", "written on the host", "written in the guest"]);
 
+  // Read the output before the command exits: FreeBSD frees a terminal's
+  // unread output a second after its last close.
   let terminal = restored
     .agent
     .spawn(Exec {
-      argv: vec!["tty".into()],
+      argv: sh("tty; read line").map(String::from).to_vec(),
       pty: Some(WindowSize { rows: 24, columns: 80 }),
       ..Exec::default()
     })
     .expect("run a command in a terminal");
   let mut output = Vec::new();
-  loop {
+  while !output.contains(&b'\n') {
     match terminal.recv().expect("its output") {
       Output::Stdout(bytes) => output.extend(bytes),
-      Output::Exited(exit) => {
-        assert_eq!(exit, Exit::Code(0));
-        break;
-      }
-      Output::Stderr(_) => unreachable!("a terminal merges stderr into stdout"),
+      other => panic!("{other:?} after {:?}", String::from_utf8_lossy(&output)),
     }
   }
   assert!(
@@ -259,6 +257,15 @@ fn prepares_boots_and_restores() {
     "{:?}",
     String::from_utf8_lossy(&output)
   );
+  terminal.write(b"\n").expect("answer it");
+  let exit = loop {
+    match terminal.recv().expect("its last output") {
+      Output::Stdout(_) => {}
+      Output::Exited(exit) => break exit,
+      Output::Stderr(_) => unreachable!("a terminal merges stderr into stdout"),
+    }
+  };
+  assert_eq!(exit, Exit::Code(0));
 
   restored
     .shut_down(Duration::from_secs(120))

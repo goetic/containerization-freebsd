@@ -32,6 +32,9 @@ the host will.
   refused. A user gets their home as `HOME`, unless the environment gives
   one.
 - **Terminals:** Eof is ignored; ^D, sent as Data, ends a terminal's input.
+  At a terminal's last close, FreeBSD gives the agent a second to read
+  what is left, then frees it: a process that writes as it exits can lose
+  that output if the agent doesn't run in time, as on a busy host.
 - **Sockets:** in a jail, a child process attached to it opens them, so
   paths and loopback are the jail's. Connect relays to 127.0.0.1, or
   failing that ::1, or to a Unix socket. Listen replaces a socket already
