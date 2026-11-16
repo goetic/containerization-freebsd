@@ -1065,6 +1065,54 @@ fn pulls_unpacks_and_runs_oci_images() {
       "hidden"
     ]
   );
+
+  // Copies in and out, by the guest's `/rescue` tools, not the image's.
+  let copies = work.join("copies");
+  let tree = copies.join("tree");
+  std::fs::create_dir_all(tree.join("sub")).expect("make a tree to copy");
+  std::fs::write(tree.join("one"), "one\n").expect("write a file of the tree");
+  std::fs::write(tree.join("sub/two"), "two\n").expect("write a file of the tree");
+  let big: Vec<u8> = (0..1u32 << 20).map(|i| (i % 251) as u8).collect();
+  std::fs::write(copies.join("big"), &big).expect("write a file to copy");
+  hidden
+    .copy_in(&copies.join("big"), "/cfbsd/new/", 0o644, true)
+    .expect_err("copy a file into a missing directory");
+  hidden
+    .copy_in(&copies.join("big"), "/cfbsd/new/big", 0o600, true)
+    .expect("copy a file in");
+  hidden
+    .copy_in(&tree, "/cfbsd", 0o644, true)
+    .expect("copy a directory into a directory");
+  hidden
+    .copy_in(&tree, "/cfbsd/kept", 0o644, true)
+    .expect_err("copy a directory over a file");
+  let ran = hidden
+    .check(
+      &sh("ls -ln /cfbsd/new/big /cfbsd/tree/sub/two | while read mode links uid rest; do echo $mode $uid; done; cat /cfbsd/tree/one"),
+      SECONDS,
+    )
+    .expect("look at the files copied in");
+  assert_eq!(ran.lines(), ["-rw------- 0", "-rw-r--r-- 0", "one"]);
+  let out = copies.join("out");
+  hidden
+    .copy_out("/cfbsd/new/big", &out.join("big"), true)
+    .expect("copy a file out");
+  assert_eq!(std::fs::read(out.join("big")).expect("read the file copied out"), big);
+  let mode = std::fs::metadata(out.join("big"))
+    .expect("the file copied out")
+    .permissions()
+    .mode();
+  assert_eq!(mode & 0o777, 0o644);
+  hidden
+    .copy_out("/cfbsd/tree", &out.join("tree"), true)
+    .expect("copy a directory out");
+  for (path, text) in [("one", "one\n"), ("sub/two", "two\n")] {
+    let copied = std::fs::read_to_string(out.join("tree").join(path)).expect("read a file copied out");
+    assert_eq!(copied, text);
+  }
+  hidden
+    .copy_out("/cfbsd/missing", &out.join("missing"), true)
+    .expect_err("copy out what is missing");
   hidden.delete().expect("delete the container");
 
   machine

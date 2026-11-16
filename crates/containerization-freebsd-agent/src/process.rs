@@ -87,6 +87,9 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
     sys::take_terminal_on_exec(&mut command);
   }
   enter(&mut command, exec)?;
+  if exec.rescue {
+    sys::rescue_on_exec(&mut command, &exec.argv)?;
+  }
 
   match exec.pty {
     Some(size) => in_terminal(command, size, outbox),

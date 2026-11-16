@@ -1,10 +1,12 @@
 //! FreeBSD jails in the guest, through its agent.
 
 use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
+use crate::copy;
 use crate::error::{Error, Result};
 use crate::quota::{self, Statistics};
 use crate::socket::{SocketRelay, UnixSocket};
 use containerization_freebsd_protocol::{Address, Connect};
+use std::path::Path;
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
@@ -285,6 +287,22 @@ impl<'a> Jail<'a> {
     argv.extend(rules.iter().map(String::as_str));
 
     self.agent.check(&argv, QUICK).map(|_| ())
+  }
+
+  /// Copies `source`, a file or directory on the host, into the jail, as
+  /// Containerization's `copyIn` does: to `destination`, or into it if it
+  /// is a directory. A file gets `mode`. With `create_parents`, missing
+  /// directories on the way are made. Paths resolve as the jail sees them.
+  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, create_parents: bool) -> Result<()> {
+    copy::copy_in(self, source, destination, mode, create_parents)
+  }
+
+  /// Copies `source`, a file or directory in the jail, to `destination` on
+  /// the host, as Containerization's `copyOut` does: a file with mode
+  /// 0644, or a directory's contents into `destination`. With
+  /// `create_parents`, the destination's missing parents are made.
+  pub fn copy_out(&self, source: &str, destination: &Path, create_parents: bool) -> Result<()> {
+    copy::copy_out(self, source, destination, create_parents)
   }
 
   /// What the jail's processes use together, as rctl(8) accounts for it.

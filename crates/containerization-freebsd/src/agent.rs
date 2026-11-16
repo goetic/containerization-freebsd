@@ -260,8 +260,14 @@ impl Agent {
   /// Runs `argv` in the guest, with no input, and collects what it prints.
   /// One still running after `timeout` is killed.
   pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
+    self.run_exec(command(argv), timeout)
+  }
+
+  /// As `run`, for `exec`'s process.
+  pub(crate) fn run_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
     let started = Instant::now();
-    let process = self.spawn(command(argv))?;
+    let argv = exec.argv.clone();
+    let process = self.spawn(exec)?;
     process.close_input()?;
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
 
@@ -292,7 +298,13 @@ impl Agent {
 
   /// As `run`, failing unless the command exits 0.
   pub fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    let ran = self.run(argv, timeout)?;
+    self.check_exec(command(argv), timeout)
+  }
+
+  /// As `check`, for `exec`'s process.
+  pub(crate) fn check_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
+    let argv = exec.argv.clone();
+    let ran = self.run_exec(exec, timeout)?;
 
     match ran.exit {
       Exit::Code(0) => Ok(ran),

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-  /// A host tool (`curl`, `hdiutil`, `diskutil`, `cp`) failed.
+  /// A host tool (`curl`, `hdiutil`, `diskutil`, `cp`, `tar`) failed.
   Command {
     command: String,
     failure: String,

@@ -57,6 +57,11 @@
   and `memoryInBytes`, through rctl, and reports what they use. Preparing
   a base now sets `kern.racct.enable`, which this needs: prepare older
   bases again.
+- Copies files and directories into and out of containers and jails, as
+  Containerization's `copyIn` and `copyOut` do. Copying runs the guest's
+  `/rescue` tools in the jail, so it needs nothing from the image, and
+  paths resolve as the jail sees them. Exec's new `rescue` runs one of
+  those tools. Also protocol version 3.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited

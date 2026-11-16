@@ -244,6 +244,89 @@ pub(crate) fn enter_on_exec(command: &mut Command, entry: Entry) {
   }
 }
 
+/// The guest's `/rescue` tool a process runs in place of its program, with
+/// its arguments and environment ready for fexecve(2), which takes them
+/// after fork, when nothing can be allocated.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+struct Rescue {
+  tool: File,
+  _strings: Vec<CString>,
+  argv: Vec<*const libc::c_char>,
+  envp: Vec<*const libc::c_char>,
+}
+
+// SAFETY: the pointers point into `_strings`, which the struct owns and
+// never changes, so they stay valid wherever it goes.
+unsafe impl Send for Rescue {}
+// SAFETY: as for Send; nothing is written through the pointers.
+unsafe impl Sync for Rescue {}
+
+/// Has the command's process run the guest's `/rescue` tool named
+/// `argv[0]`, with `argv`, once it has taken on all else: in its jail too,
+/// whose root needn't hold the tool. The environment is the agent's, with
+/// the command's on top.
+pub(crate) fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> {
+  use std::collections::BTreeMap;
+  use std::os::unix::ffi::OsStrExt;
+
+  let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, what.to_string());
+  let name = argv
+    .first()
+    .filter(|name| !name.is_empty() && !name.contains('/') && *name != "." && *name != "..")
+    .ok_or_else(|| invalid("no rescue tool is named"))?;
+  let tool = File::open(format!("/rescue/{name}"))
+    .map_err(|error| io::Error::new(error.kind(), format!("/rescue/{name}: {error}")))?;
+
+  let mut environment: BTreeMap<_, _> = std::env::vars_os().collect();
+  for (name, value) in command.get_envs() {
+    match value {
+      Some(value) => environment.insert(name.to_owned(), value.to_owned()),
+      None => environment.remove(name),
+    };
+  }
+  let cstring = |bytes: Vec<u8>| CString::new(bytes).map_err(|_| invalid("an argument or variable has a NUL"));
+  let args = argv
+    .iter()
+    .map(|arg| cstring(arg.clone().into_bytes()))
+    .collect::<io::Result<Vec<_>>>()?;
+  let variables = environment
+    .iter()
+    .map(|(name, value)| cstring([name.as_bytes(), b"=", value.as_bytes()].concat()))
+    .collect::<io::Result<Vec<_>>>()?;
+  let pointers = |strings: &[CString]| {
+    let mut pointers: Vec<_> = strings.iter().map(|string| string.as_ptr()).collect();
+    pointers.push(ptr::null());
+    pointers
+  };
+  let rescue = Rescue {
+    tool,
+    argv: pointers(&args),
+    envp: pointers(&variables),
+    _strings: args.into_iter().chain(variables).collect(),
+  };
+
+  // SAFETY: between fork and exec, the closure calls only fexecve, which is
+  // async-signal-safe, with what `rescue` owns, and allocates nothing.
+  unsafe {
+    command.pre_exec(move || Err(fexecve(&rescue)));
+  }
+  Ok(())
+}
+
+/// Returns only when it fails.
+#[cfg(target_os = "freebsd")]
+fn fexecve(rescue: &Rescue) -> io::Error {
+  // SAFETY: the arrays end in nulls, and point at strings `rescue` owns.
+  unsafe { libc::fexecve(rescue.tool.as_raw_fd(), rescue.argv.as_ptr(), rescue.envp.as_ptr()) };
+  io::Error::last_os_error()
+}
+
+/// Never called: no other system has `/rescue`.
+#[cfg(not(target_os = "freebsd"))]
+fn fexecve(_: &Rescue) -> io::Error {
+  io::ErrorKind::Unsupported.into()
+}
+
 /// Sends `signal` to `target`: a pid, or a process group's id negated.
 pub(crate) fn signal(target: libc::pid_t, signal: i32) -> io::Result<()> {
   // SAFETY: kill touches no memory.

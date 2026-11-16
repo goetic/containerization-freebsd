@@ -10,6 +10,7 @@ use crate::quota::Statistics;
 use crate::socket::{SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
 use std::mem;
+use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -158,6 +159,16 @@ impl<'a> Container<'a> {
   /// As `Jail::connect_unix`, in the container.
   pub fn connect_unix(&self, path: &str) -> Result<Relay> {
     self.jail.connect_unix(path)
+  }
+
+  /// As `Jail::copy_in`, into the container.
+  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, create_parents: bool) -> Result<()> {
+    self.jail.copy_in(source, destination, mode, create_parents)
+  }
+
+  /// As `Jail::copy_out`, out of the container.
+  pub fn copy_out(&self, source: &str, destination: &Path, create_parents: bool) -> Result<()> {
+    self.jail.copy_out(source, destination, create_parents)
   }
 
   /// What its processes use together, as `Jail::statistics`.

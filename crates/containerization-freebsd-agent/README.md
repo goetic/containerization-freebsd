@@ -26,7 +26,9 @@ the host will.
   exits.
 - **Jails and users:** before it starts, a process attaches to its jail,
   sets its limits and umask, takes on its user, then changes directory as
-  that user. Users and groups are looked up as runc does, in the jail's
+  that user. One may run a tool of the guest's `/rescue`, opened before
+  it enters its jail, so the jail needn't hold it. Users and groups are
+  looked up as runc does, in the jail's
   `/etc/passwd` and `/etc/group`, or the guest's: a name must be listed,
   but a uid needn't be. A file that leads out of the jail's root is
   refused. A user gets their home as `HOME`, unless the environment gives

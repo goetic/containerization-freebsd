@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod build;
 pub mod container;
+mod copy;
 mod error;
 pub mod image;
 pub mod images;

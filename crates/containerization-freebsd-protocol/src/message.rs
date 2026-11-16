@@ -63,6 +63,9 @@ pub struct Exec {
   /// Its file mode creation mask; or the agent's.
   pub umask: Option<u16>,
   pub limits: Vec<Limit>,
+  /// Runs the guest's `/rescue` tool that `argv[0]` names, a static
+  /// binary, which needn't be in its jail.
+  pub rescue: bool,
 }
 
 /// Whom a process runs as, looked up in its root's `/etc/passwd` and
@@ -266,6 +269,7 @@ impl Message {
             .u64(limit.soft)
             .u64(limit.hard);
         }
+        payload.u8(u8::from(exec.rescue));
         kind::EXEC
       }
       Self::Connect(connect) => {
@@ -383,6 +387,7 @@ impl Message {
             })
           })
           .collect::<Result<_, DecodeError>>()?,
+        rescue: reader.flag()?,
       }),
       kind::CONNECT => Self::Connect(Connect {
         to: match reader.u8()? {
@@ -591,6 +596,7 @@ mod tests {
             hard: 0,
           },
         ],
+        rescue: true,
       }),
       Message::Exec(Exec {
         user: Some(User {
