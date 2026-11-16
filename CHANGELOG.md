@@ -49,7 +49,10 @@
   container images on download.freebsd.org, to load it. Loaded images are
   named as the layout names them.
 - Pushes images to registries: the blobs a registry lacks, then the
-  manifests, an index's before the index.
+  manifests, an index's before the index. Pushing or saving an image for
+  one platform makes a new index of that platform's manifests, as
+  Containerization does. Lists an image's platforms, the store's or a
+  registry's, without pulling its layers.
 - Limits a container's processes together to Containerization's `cpus`
   and `memoryInBytes`, through rctl, and reports what they use. Preparing
   a base now sets `kern.racct.enable`, which this needs: prepare older
