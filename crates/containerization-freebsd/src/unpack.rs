@@ -8,7 +8,6 @@ use crate::error::{Error, Result};
 use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type, sha256_hex};
 use crate::zfs::Zfs;
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::time::Duration;
 
@@ -149,52 +148,6 @@ impl<'a> Unpacker<'a> {
     Ok(unpacked)
   }
 
-  /// Destroys the unpacked layers `images` don't need for `platform`,
-  /// unless something is cloned from them: a container, a build, or a layer
-  /// above. How many it destroyed. Like unpacks, prunes must not run at
-  /// once with anything else on the store.
-  pub fn prune(&self, images: &[Image], platform: &Platform) -> Result<usize> {
-    let mut needed = BTreeSet::new();
-    for image in images {
-      for chain_id in image.config(platform)?.chain_ids() {
-        needed.extend(sha256_hex(&chain_id).map(str::to_string));
-      }
-    }
-    if !self.zfs.exists(&self.store)? {
-      return Ok(0);
-    }
-
-    let mut pruned = 0;
-    loop {
-      let listing = self.agent.check(
-        &[
-          "zfs",
-          "list",
-          "-H",
-          "-o",
-          "name,clones",
-          "-t",
-          "filesystem,snapshot",
-          "-r",
-          &self.store,
-        ],
-        QUICK,
-      )?;
-      let doomed: Vec<String> = layers(&listing.stdout, &self.store)
-        .into_iter()
-        .filter(|(hex, cloned)| !cloned && !needed.contains(hex))
-        .map(|(hex, _)| hex)
-        .collect();
-      if doomed.is_empty() {
-        return Ok(pruned);
-      }
-      for hex in doomed {
-        self.zfs.destroy(&format!("{}/{hex}", self.store))?;
-        pruned += 1;
-      }
-    }
-  }
-
   /// Unpacks `layer` into a fresh `dataset` on `below`, by way of the
   /// decompressed tarball at `staging`; leaves neither behind if it fails.
   fn layer(
@@ -271,32 +224,6 @@ impl<'a> Unpacker<'a> {
   }
 }
 
-/// The layers in `listing`, what `zfs list -H -o name,clones` printed of
-/// `store`'s datasets and snapshots: each by its chain id's hex, and whether
-/// anything is cloned from its snapshot. Datasets not named by a chain id
-/// aren't layers.
-fn layers(listing: &str, store: &str) -> Vec<(String, bool)> {
-  let prefix = format!("{store}/");
-  let mut layers = BTreeMap::new();
-
-  for line in listing.lines() {
-    let (name, clones) = line.split_once('\t').unwrap_or((line, ""));
-    let Some(rest) = name.strip_prefix(&prefix) else {
-      continue;
-    };
-    let (hex, snapshot) = match rest.split_once('@') {
-      Some((hex, _)) => (hex, true),
-      None => (rest, false),
-    };
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-      continue;
-    }
-    let cloned = layers.entry(hex.to_string()).or_insert(false);
-    *cloned |= snapshot && !matches!(clones, "" | "-");
-  }
-  layers.into_iter().collect()
-}
-
 /// How a layer of `media_type` is compressed.
 fn compression(media_type: &str) -> Result<&'static str> {
   match media_type {
@@ -343,25 +270,5 @@ mod tests {
     assert_eq!(compression(media_type::LAYER_ZSTD).unwrap(), "zstd");
     assert_eq!(compression(media_type::LAYER).unwrap(), "none");
     assert!(compression("application/vnd.oci.image.layer.nondistributable.v1.tar+gzip").is_err());
-  }
-
-  #[test]
-  fn finds_the_layers_and_whether_anything_is_cloned_from_them() {
-    let (base, top, half) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
-    let listing = format!(
-      "images/layers\t-\n\
-       images/layers/{base}\t-\n\
-       images/layers/{base}@unpacked\timages/layers/{top}\n\
-       images/layers/{top}\t-\n\
-       images/layers/{top}@unpacked\timages/containers/web,images/builds/1\n\
-       images/layers/{half}\t-\n\
-       images/layers/{half}@unpacked\t\n\
-       images/layers/scratch\t-\n"
-    );
-
-    assert_eq!(
-      layers(&listing, "images/layers"),
-      [(base, true), (top, true), (half, false)]
-    );
   }
 }

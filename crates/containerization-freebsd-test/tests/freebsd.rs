@@ -1078,17 +1078,7 @@ fn pulls_unpacks_and_runs_oci_images() {
       "hidden"
     ]
   );
-
-  // Pruning keeps the layers an image needs, and those a container, or a
-  // layer above, is cloned from.
-  let kept = std::slice::from_ref(&runtime);
-  assert_eq!(unpacker.prune(kept, &platform).expect("prune"), 0);
   hidden.delete().expect("delete the container");
-  assert_eq!(unpacker.prune(kept, &platform).expect("prune again"), 2);
-  let again = unpacker
-    .unpack(&whiteouts, &platform)
-    .expect("unpack the layered image again");
-  assert_eq!((again.unpacked, again.cached), (2, 1));
 
   machine
     .shut_down(Duration::from_secs(120))

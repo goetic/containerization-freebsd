@@ -47,8 +47,6 @@
 - Loads and saves OCI archives: tars of an OCI image layout, plain or
   compressed with xz, such as FreeBSD's container images on
   download.freebsd.org. Loaded images are named as the archive names them.
-- Prunes unpacked layers no image needs, but those a container, a build or
-  another layer is cloned from.
 - Pushes images to registries: the blobs a registry lacks, then the
   manifests, an index's before the index.
 - Quotas on what a jail's or container's processes use together, through
