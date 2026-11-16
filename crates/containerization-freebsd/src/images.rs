@@ -99,6 +99,48 @@ impl ImageStore {
     self.create(&reference.to_string(), top)
   }
 
+  /// Pushes the image named `reference` to the registry the name gives:
+  /// the blobs the registry lacks, then the manifests, an index's before
+  /// the index. To push it as another name, tag it first. An index needs
+  /// all its manifests, which a pull doesn't fetch; to push one platform's,
+  /// name its manifest with `create` and push that.
+  pub fn push(&self, reference: &str, credentials: Option<Credentials>) -> Result<()> {
+    let image = self.get(reference)?;
+    let reference = Reference::parse(reference)?;
+    let client = RegistryClient::new(credentials);
+
+    self.push_children(&client, &reference, &image.descriptor)?;
+    client.push_manifest(&reference, reference.target(), &image.descriptor, &self.content)
+  }
+
+  /// Pushes what `descriptor` lists: a manifest's config and layers, or an
+  /// index's manifests, by digest.
+  fn push_children(&self, client: &RegistryClient, reference: &Reference, descriptor: &Descriptor) -> Result<()> {
+    let bytes = self.content.read(&descriptor.digest)?;
+    if !descriptor.is_index() {
+      let manifest: Manifest = parse(&bytes, &format!("{reference}'s manifest"))?;
+      return std::iter::once(&manifest.config)
+        .chain(&manifest.layers)
+        .try_for_each(|blob| client.push_blob(reference, blob, &self.content));
+    }
+
+    let index: Index = parse(&bytes, &format!("{reference}'s index"))?;
+    for child in &index.manifests {
+      if !self.content.has(&child.digest) {
+        let platform = child
+          .platform
+          .as_ref()
+          .map_or_else(|| child.digest.clone(), Platform::to_string);
+        return Err(Error::Invalid(format!(
+          "the store lacks {reference}'s manifest for {platform}: push one platform's by naming its manifest"
+        )));
+      }
+      self.push_children(client, reference, child)?;
+      client.push_manifest(reference, &child.digest, child, &self.content)?;
+    }
+    Ok(())
+  }
+
   /// Names `descriptor`, an index or manifest in the store, `reference`,
   /// replacing any image of that name.
   pub fn create(&self, reference: &str, descriptor: Descriptor) -> Result<Image> {
@@ -601,6 +643,174 @@ mod tests {
       }
     });
     address
+  }
+
+  /// A registry on loopback that takes pushes and serves pulls of any
+  /// repository behind a bearer token: POST and PUT need a push token, GET
+  /// and HEAD either. Uploads go to a location of their own.
+  fn writable_registry() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let realm = format!("http://{address}/token");
+    let host = address.clone();
+
+    std::thread::spawn(move || {
+      let mut manifests: HashMap<String, (String, Vec<u8>)> = HashMap::new();
+      let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
+      let mut uploads = 0;
+
+      for stream in listener.incoming() {
+        let mut stream = stream.unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut parts = line.split_whitespace();
+        let (method, path) = (
+          parts.next().unwrap_or_default().to_string(),
+          parts.next().unwrap_or_default().to_string(),
+        );
+        let mut headers = HashMap::new();
+        loop {
+          let mut line = String::new();
+          reader.read_line(&mut line).unwrap();
+          match line.trim_end().split_once(':') {
+            Some((name, value)) => headers.insert(name.to_ascii_lowercase(), value.trim().to_string()),
+            None => break,
+          };
+        }
+        let length = headers
+          .get("content-length")
+          .and_then(|length| length.parse().ok())
+          .unwrap_or(0);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+
+        let token = headers
+          .get("authorization")
+          .and_then(|value| value.strip_prefix("Bearer "));
+        let allowed = match method.as_str() {
+          "POST" | "PUT" => token == Some("push"),
+          _ => matches!(token, Some("push" | "pull")),
+        };
+        let url = url::Url::parse(&format!("http://{host}{path}")).unwrap();
+        let query = |name: &str| {
+          url
+            .query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+        };
+        let found = |found: Option<(String, Vec<u8>)>| match found {
+          Some((kind, bytes)) => ("200 OK", format!("Content-Type: {kind}\r\n"), bytes),
+          None => ("404 Not Found", String::new(), Vec::new()),
+        };
+
+        let (status, extra, response) = if url.path() == "/token" {
+          let granted = if query("scope").is_some_and(|scope| scope.contains("push")) {
+            "push"
+          } else {
+            "pull"
+          };
+          (
+            "200 OK",
+            String::new(),
+            format!(r#"{{"token":"{granted}"}}"#).into_bytes(),
+          )
+        } else if !allowed {
+          (
+            "401 Unauthorized",
+            format!("WWW-Authenticate: Bearer realm=\"{realm}\",service=\"test\"\r\n"),
+            Vec::new(),
+          )
+        } else if url.path().starts_with("/upload/") {
+          let digest = query("digest").unwrap_or_default();
+          if sha256_digest(&body) == digest {
+            blobs.insert(digest, body);
+            ("201 Created", String::new(), Vec::new())
+          } else {
+            ("400 Bad Request", String::new(), Vec::new())
+          }
+        } else if let Some((repository, target)) = url.path().rsplit_once("/manifests/") {
+          if method == "PUT" {
+            let kind = headers.get("content-type").cloned().unwrap_or_default();
+            manifests.insert(format!("{repository}/{target}"), (kind.clone(), body.clone()));
+            manifests.insert(format!("{repository}/{}", sha256_digest(&body)), (kind, body));
+            ("201 Created", String::new(), Vec::new())
+          } else {
+            found(manifests.get(&format!("{repository}/{target}")).cloned())
+          }
+        } else if url.path().ends_with("/blobs/uploads/") {
+          uploads += 1;
+          ("202 Accepted", format!("Location: /upload/{uploads}\r\n"), Vec::new())
+        } else if let Some((_, digest)) = url.path().rsplit_once("/blobs/") {
+          found(
+            blobs
+              .get(digest)
+              .map(|blob| ("application/octet-stream".to_string(), blob.clone())),
+          )
+        } else {
+          ("404 Not Found", String::new(), Vec::new())
+        };
+
+        let _ = write!(
+          stream,
+          "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+          response.len()
+        );
+        if method != "HEAD" {
+          let _ = stream.write_all(&response);
+        }
+      }
+    });
+    address
+  }
+
+  #[test]
+  fn pushes_images_that_pull_back() {
+    let (pushed, pulled) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store = ImageStore::new(pushed.path()).unwrap();
+    let image = store
+      .pull(&format!("{}/test/image:1", registry()), &Platform::default(), None)
+      .unwrap();
+    let writable = writable_registry();
+
+    // The pull fetched only arm64's manifest of the index.
+    let whole = format!("{writable}/test/index:1");
+    store.tag(&image.reference, &whole).unwrap();
+    let error = store.push(&whole, None).unwrap_err();
+    assert!(error.to_string().contains("freebsd/amd64"), "{error}");
+
+    // One platform's manifest, and an index of only that.
+    let (manifest, _) = image.manifest(&Platform::default()).unwrap();
+    let single = format!("{writable}/test/single:1");
+    store.create(&single, manifest.clone()).unwrap();
+    let mut entry = manifest;
+    entry.platform = Some(Platform::default());
+    let index = json(&Index {
+      manifests: vec![entry],
+      ..Index::default()
+    });
+    let indexed = format!("{writable}/test/indexed:1");
+    store
+      .create(&indexed, blob_of(&store, media_type::INDEX, &index))
+      .unwrap();
+    for name in [&single, &indexed, &single] {
+      store.push(name, None).unwrap();
+    }
+
+    let other = ImageStore::new(pulled.path()).unwrap();
+    for name in [&single, &indexed] {
+      let back = other.pull(name, &Platform::default(), None).unwrap();
+      assert_eq!(back.descriptor.digest, store.get(name).unwrap().descriptor.digest);
+      let config = back.config(&Platform::default()).unwrap();
+      assert_eq!(config.config.unwrap().cmd, Some(vec!["/bin/sh".to_string()]));
+    }
+    assert!(other.get(&indexed).unwrap().descriptor.is_index());
+  }
+
+  /// `bytes` in `store`, as a blob of `media_type`.
+  fn blob_of(store: &ImageStore, media_type: &str, bytes: &[u8]) -> Descriptor {
+    store.content().ingest(bytes).unwrap();
+    descriptor(media_type, bytes, None)
   }
 
   #[test]

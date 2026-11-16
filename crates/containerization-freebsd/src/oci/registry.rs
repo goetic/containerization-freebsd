@@ -20,13 +20,15 @@ pub struct Credentials {
   pub password: String,
 }
 
-/// Pulls from registries over the OCI distribution API, through curl(1).
-/// Tokens and passwords reach curl on its stdin, never its arguments.
+/// Pulls from and pushes to registries over the OCI distribution API,
+/// through curl(1). Tokens and passwords reach curl on its stdin, never its
+/// arguments.
 #[derive(Debug, Default)]
 pub struct RegistryClient {
   credentials: Option<Credentials>,
-  /// The bearer token for each registry and repository.
-  tokens: Mutex<HashMap<String, String>>,
+  /// The bearer token for each registry and repository, to pull or to
+  /// push.
+  tokens: Mutex<HashMap<(String, bool), String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +36,31 @@ enum Auth {
   None,
   Bearer(String),
   Basic(Credentials),
+}
+
+/// What curl is to send.
+struct Request<'a> {
+  method: &'a str,
+  url: String,
+  accept: Option<&'a str>,
+  content_type: Option<&'a str>,
+  /// A file to send as the body.
+  upload: Option<&'a Path>,
+  /// Where the response's body goes.
+  output: Option<&'a Path>,
+}
+
+impl<'a> Request<'a> {
+  fn new(method: &'a str, url: String) -> Self {
+    Self {
+      method,
+      url,
+      accept: None,
+      content_type: None,
+      upload: None,
+      output: None,
+    }
+  }
 }
 
 struct Response {
@@ -112,40 +139,118 @@ impl RegistryClient {
     result
   }
 
-  /// GETs `path` under the repository into `body`, authenticating as the
-  /// registry asks; fails unless it answers 200.
+  /// Uploads `descriptor`'s blob from `store` to `reference`'s repository,
+  /// unless the repository has it: in one PUT, after a POST starts the
+  /// upload.
+  pub fn push_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
+    let path = format!("blobs/{}", descriptor.digest);
+    let head = Request::new("HEAD", url(reference, &path));
+    match self.send(reference, &head, true)?.status {
+      200 => return Ok(()),
+      404 => {}
+      status => return Err(unexpected(&head, status, None)),
+    }
+
+    let post = Request::new("POST", url(reference, "blobs/uploads/"));
+    let started = self.send(reference, &post, true)?;
+    let location = started
+      .header("location")
+      .filter(|_| started.status == 202)
+      .ok_or_else(|| unexpected(&post, started.status, None))?;
+    let mut upload = url::Url::parse(&post.url)
+      .and_then(|base| base.join(location))
+      .map_err(|error| {
+        Error::Guest(format!(
+          "{} gave the upload location {location:?}: {error}",
+          reference.domain
+        ))
+      })?;
+    upload
+      .query_pairs_mut()
+      .append_pair("digest", &descriptor.digest);
+
+    let blob = store.path(&descriptor.digest)?;
+    let mut put = Request::new("PUT", upload.to_string());
+    put.content_type = Some("application/octet-stream");
+    put.upload = Some(&blob);
+    // A location elsewhere, such as storage, gets no credentials.
+    let response = if same_origin(&post.url, &put.url) {
+      self.send(reference, &put, true)?
+    } else {
+      curl(&put, &Auth::None)?
+    };
+    match response.status {
+      201 => Ok(()),
+      status => Err(unexpected(&put, status, None)),
+    }
+  }
+
+  /// Uploads the manifest or index `descriptor` from `store` to
+  /// `reference`'s repository as `target`, a tag or its digest.
+  pub fn push_manifest(
+    &self,
+    reference: &Reference,
+    target: &str,
+    descriptor: &Descriptor,
+    store: &ContentStore,
+  ) -> Result<()> {
+    let document = store.path(&descriptor.digest)?;
+    let response_body = store.partial();
+    let mut put = Request::new("PUT", url(reference, &format!("manifests/{target}")));
+    put.content_type = Some(&descriptor.media_type);
+    put.upload = Some(&document);
+    put.output = Some(&response_body);
+
+    let result = self
+      .send(reference, &put, true)
+      .and_then(|response| match response.status {
+        201 => Ok(()),
+        status => Err(unexpected(&put, status, Some(&response_body))),
+      });
+    let _ = std::fs::remove_file(&response_body);
+    result
+  }
+
+  /// GETs `path` under the repository into `body`; fails unless it answers
+  /// 200.
   fn get(&self, reference: &Reference, path: &str, accept: Option<&str>, body: &Path) -> Result<Response> {
-    let scheme = if reference.local() { "http" } else { "https" };
-    let url = format!("{scheme}://{}/v2/{}/{path}", reference.registry(), reference.repository);
-    let key = format!("{}/{}", reference.registry(), reference.repository);
+    let mut get = Request::new("GET", url(reference, path));
+    get.accept = accept;
+    get.output = Some(body);
+    let response = self.send(reference, &get, false)?;
+
+    match response.status {
+      200 => Ok(response),
+      status => Err(unexpected(&get, status, Some(body))),
+    }
+  }
+
+  /// Sends `request` to `reference`'s registry, authenticating as it asks,
+  /// to pull from its repository or, with `push`, to push to it too.
+  fn send(&self, reference: &Reference, request: &Request, push: bool) -> Result<Response> {
+    let key = (format!("{}/{}", reference.registry(), reference.repository), push);
     let cached = self
       .tokens
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
       .get(&key)
       .cloned();
-    let mut auth = cached.map_or(Auth::None, Auth::Bearer);
+    let auth = cached.map_or(Auth::None, Auth::Bearer);
 
-    for attempt in 0..2 {
-      let response = curl(&url, accept, &auth, Some(body))?;
-
-      match response.status {
-        200 => return Ok(response),
-        401 if attempt == 0 => {
-          let challenge = response
-            .header("www-authenticate")
-            .ok_or_else(|| failed(&url, &response, body))?;
-          auth = self.authorize(reference, &key, challenge)?;
-        }
-        _ => return Err(failed(&url, &response, body)),
-      }
+    let response = curl(request, &auth)?;
+    if response.status != 401 {
+      return Ok(response);
     }
-    unreachable!("the second attempt returns")
+    let challenge = response
+      .header("www-authenticate")
+      .ok_or_else(|| unexpected(request, 401, request.output))?;
+    let auth = self.authorize(reference, &key, challenge)?;
+    curl(request, &auth)
   }
 
   /// What the registry's challenge asks for: a bearer token from its realm,
   /// or the account itself.
-  fn authorize(&self, reference: &Reference, key: &str, challenge: &str) -> Result<Auth> {
+  fn authorize(&self, reference: &Reference, key: &(String, bool), challenge: &str) -> Result<Auth> {
     let (scheme, parameters) = parse_challenge(challenge);
 
     match scheme.to_ascii_lowercase().as_str() {
@@ -158,7 +263,8 @@ impl RegistryClient {
         let realm = parameters
           .get("realm")
           .ok_or_else(|| Error::Guest(format!("{} named no token realm: {challenge}", reference.domain)))?;
-        let scope = format!("repository:{}:pull", reference.repository);
+        let actions = if key.1 { "pull,push" } else { "pull" };
+        let scope = format!("repository:{}:{actions}", reference.repository);
         let mut url = url::Url::parse(realm)
           .map_err(|error| Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain)))?;
         {
@@ -171,7 +277,9 @@ impl RegistryClient {
 
         let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
         let body = tempfile_path();
-        let response = curl(url.as_str(), None, &auth, Some(&body));
+        let mut get = Request::new("GET", url.to_string());
+        get.output = Some(&body);
+        let response = curl(&get, &auth);
         let bytes = std::fs::read(&body).unwrap_or_default();
         let _ = std::fs::remove_file(&body);
         let response = response?;
@@ -191,7 +299,7 @@ impl RegistryClient {
           .tokens
           .lock()
           .unwrap_or_else(PoisonError::into_inner)
-          .insert(key.to_string(), token.clone());
+          .insert(key.clone(), token.clone());
         Ok(Auth::Bearer(token))
       }
       _ => Err(Error::Invalid(format!(
@@ -208,19 +316,51 @@ struct TokenResponse {
   access_token: Option<String>,
 }
 
-/// Runs curl on `url`, following redirects, writing the body to `body`.
-fn curl(url: &str, accept: Option<&str>, auth: &Auth, body: Option<&Path>) -> Result<Response> {
+/// The URL of `path` under `reference`'s repository.
+fn url(reference: &Reference, path: &str) -> String {
+  let scheme = if reference.local() { "http" } else { "https" };
+
+  format!("{scheme}://{}/v2/{}/{path}", reference.registry(), reference.repository)
+}
+
+fn same_origin(one: &str, other: &str) -> bool {
+  match (url::Url::parse(one), url::Url::parse(other)) {
+    (Ok(one), Ok(other)) => one.origin() == other.origin(),
+    _ => false,
+  }
+}
+
+/// Runs curl, following redirects.
+fn curl(request: &Request, auth: &Auth) -> Result<Response> {
+  let url = &request.url;
   let headers = tempfile_path();
   let mut config = format!(
     "url = {}\ndump-header = {}\nlocation\nsilent\nshow-error\nretry = 3\nwrite-out = \"%{{http_code}}\"\n",
     quote(url),
     quote(&headers.to_string_lossy())
   );
-  if let Some(body) = body {
-    config.push_str(&format!("output = {}\n", quote(&body.to_string_lossy())));
+  match (request.method, request.upload) {
+    ("HEAD", _) => config.push_str("head\n"),
+    // Without waiting for a 100 Continue.
+    (_, Some(upload)) => config.push_str(&format!(
+      "upload-file = {}\nrequest = {}\nheader = \"Expect:\"\n",
+      quote(&upload.to_string_lossy()),
+      quote(request.method)
+    )),
+    ("GET", None) => {}
+    (method, None) => config.push_str(&format!("request = {}\ndata-binary = \"\"\n", quote(method))),
   }
-  if let Some(accept) = accept {
+  // Stdout carries only the status.
+  let output = request.output.unwrap_or(Path::new("/dev/null"));
+  config.push_str(&format!("output = {}\n", quote(&output.to_string_lossy())));
+  if let Some(accept) = request.accept {
     config.push_str(&format!("header = {}\n", quote(&format!("Accept: {accept}"))));
+  }
+  if let Some(content_type) = request.content_type {
+    config.push_str(&format!(
+      "header = {}\n",
+      quote(&format!("Content-Type: {content_type}"))
+    ));
   }
   match auth {
     Auth::None => {}
@@ -234,7 +374,7 @@ fn curl(url: &str, accept: Option<&str>, auth: &Auth, body: Option<&Path>) -> Re
     )),
   }
 
-  let command = || format!("curl {url}");
+  let command = || format!("curl {} {url}", request.method);
   let failed = |failure: String| Error::Command {
     command: command(),
     failure,
@@ -278,12 +418,15 @@ fn curl(url: &str, accept: Option<&str>, auth: &Auth, body: Option<&Path>) -> Re
   result
 }
 
-fn failed(url: &str, response: &Response, body: &Path) -> Error {
-  let bytes = std::fs::read(body).unwrap_or_default();
+/// The error for `request` answering `status`, with a snippet of `body`.
+fn unexpected(request: &Request, status: u16, body: Option<&Path>) -> Error {
+  let bytes = body
+    .and_then(|body| std::fs::read(body).ok())
+    .unwrap_or_default();
 
   Error::Command {
-    command: format!("GET {url}"),
-    failure: format!("HTTP {}: {}", response.status, snippet(&bytes)),
+    command: format!("{} {}", request.method, request.url),
+    failure: format!("HTTP {status}: {}", snippet(&bytes)),
   }
 }
 

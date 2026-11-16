@@ -49,6 +49,8 @@
   download.freebsd.org. Loaded images are named as the archive names them.
 - Prunes unpacked layers no image needs, but those a container, a build or
   another layer is cloned from.
+- Pushes images to registries: the blobs a registry lacks, then the
+  manifests, an index's before the index.
 - Publishes ports on the loopback of the guest, a jail or a container on
   the host, relaying each connection. A container publishes its ports
   while it runs.
