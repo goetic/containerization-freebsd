@@ -7,12 +7,11 @@
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
   Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Mount, Network,
-  Output, Process, PublishedPort, Quotas, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs,
-  image,
+  Output, Process, Quotas, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -84,16 +83,6 @@ fn answer_in_capitals(listener: UnixListener) {
 /// first.
 fn ask(path: &Path, text: &str) -> String {
   let mut stream = UnixStream::connect(path).expect("connect");
-  let _ = stream.write_all(text.as_bytes());
-  let _ = stream.shutdown(Shutdown::Write);
-  let mut answer = String::new();
-  let _ = stream.read_to_string(&mut answer);
-  answer
-}
-
-/// As `ask`, of the port at `address`.
-fn ask_port(address: SocketAddr, text: &str) -> String {
-  let mut stream = TcpStream::connect(address).expect("connect");
   let _ = stream.write_all(text.as_bytes());
   let _ = stream.shutdown(Shutdown::Write);
   let mut answer = String::new();
@@ -467,9 +456,6 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   std::fs::create_dir_all(&sockets).expect("make a directory for sockets");
   let (host_socket, web_socket) = (sockets.join("host.sock"), sockets.join("web.sock"));
   answer_in_capitals(UnixListener::bind(&host_socket).expect("listen on the host"));
-  let published = TcpListener::bind("127.0.0.1:0")
-    .and_then(|listener| listener.local_addr())
-    .expect("find a free port on the host");
   let containers = Containers::new(&machine.agent, "images/containers");
   let mut web = containers
     .create(
@@ -514,10 +500,6 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
             mode: Some(0o600),
           },
         ],
-        ports: vec![PublishedPort {
-          host: published,
-          port: 7000,
-        }],
         ..Configuration::default()
       },
     )
@@ -641,16 +623,10 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   }
   assert_eq!(answer, b"pong\n");
   assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
-  // That port, published on the host.
-  let server = serve("echo pong | nc -N -l 127.0.0.1 7000");
-  let answer = eventually(|| Some(ask_port(published, "ping\n")).filter(|answer| !answer.is_empty()));
-  assert_eq!(answer, "pong\n");
-  assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
 
   // Stderr is ignored: sh reports there its sleep dying of SIGTERM.
   web.stop().expect("stop the container");
   assert!(!web_socket.exists(), "its socket on the host outlived it");
-  eventually(|| TcpStream::connect(published).is_err().then_some(()));
   machine
     .agent
     .check(

@@ -51,9 +51,6 @@
   another layer is cloned from.
 - Pushes images to registries: the blobs a registry lacks, then the
   manifests, an index's before the index.
-- Publishes ports on the loopback of the guest, a jail or a container on
-  the host, relaying each connection. A container publishes its ports
-  while it runs.
 - Quotas on what a jail's or container's processes use together, through
   rctl: CPU, memory, processes, and file system reads and writes; and
   statistics of what they use. Preparing a base now sets
