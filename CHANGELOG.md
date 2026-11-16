@@ -56,7 +56,9 @@
 - Limits a container's processes together to Containerization's `cpus`
   and `memoryInBytes`, through rctl, and reports what they use. Preparing
   a base now sets `kern.racct.enable`, which this needs: prepare older
-  bases again.
+  bases again. Statistics include network counters for each interface of
+  a jail with its own network, and a container's block IO, counted as its
+  ZFS dataset's reads and writes.
 - Copies files and directories into and out of containers and jails, as
   Containerization's `copyIn` and `copyOut` do. Copying runs the guest's
   `/rescue` tools in the jail, so it needs nothing from the image, and

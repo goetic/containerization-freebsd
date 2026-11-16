@@ -6,7 +6,7 @@
 use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Mount, Network};
-use crate::quota::Statistics;
+use crate::quota::{self, Statistics};
 use crate::socket::{SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
 use std::mem;
@@ -171,9 +171,16 @@ impl<'a> Container<'a> {
     self.jail.copy_out(source, destination, create_parents)
   }
 
-  /// What its processes use together, as `Jail::statistics`.
+  /// What its processes use together, as `Jail::statistics`, and its
+  /// dataset's reads and writes.
   pub fn statistics(&self) -> Result<Statistics> {
-    self.jail.statistics()
+    let mut statistics = self.jail.statistics()?;
+    let ran = self
+      .agent
+      .check(&["sh", "-c", quota::DATASET_IO, "sh", &self.dataset], QUICK)?;
+    statistics.block_io = vec![quota::dataset_io(&self.dataset, &ran.stdout)?];
+
+    Ok(statistics)
   }
 
   /// Closes its socket relays, and stops its jail:

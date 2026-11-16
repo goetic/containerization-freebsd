@@ -305,13 +305,19 @@ impl<'a> Jail<'a> {
     copy::copy_out(self, source, destination, create_parents)
   }
 
-  /// What the jail's processes use together, as rctl(8) accounts for it.
+  /// What the jail's processes use together, as rctl(8) accounts for it,
+  /// and its network's counters.
   pub fn statistics(&self) -> Result<Statistics> {
     let ran = self
       .agent
       .check(&["rctl", "-u", &format!("jail:{}", self.name)], QUICK)?;
+    let mut statistics = quota::statistics(&ran.stdout)?;
+    let ran = self
+      .agent
+      .check(&["sh", "-c", quota::INTERFACES, "sh", &self.name], QUICK)?;
+    statistics.networks = quota::networks(&ran.stdout)?;
 
-    quota::statistics(&ran.stdout)
+    Ok(statistics)
   }
 
   /// Its root's path in the guest.

@@ -1,13 +1,15 @@
 //! Limits on a jail's processes together, and what they use, through
 //! rctl(8): the counterpart of Containerization's per-container cpus and
 //! memory, which size its VMs, and of its statistics. They need
-//! `kern.racct.enable` set at boot, which preparing a base does.
+//! `kern.racct.enable` set at boot, which preparing a base does. Network
+//! counters come from netstat(1), and a container's block IO from ZFS.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 
-/// What a jail's processes use together.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What a jail's processes use together, as Containerization's
+/// `ContainerStatistics`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Statistics {
   /// CPU time, in whole seconds.
   pub cpu_seconds: u64,
@@ -23,7 +25,48 @@ pub struct Statistics {
   pub write_bytes_per_second: u64,
   pub read_operations_per_second: u64,
   pub write_operations_per_second: u64,
+  /// The interfaces of a jail with a network of its own, loopback too. A
+  /// jail sharing the guest's has none: those counters are the guest's.
+  pub networks: Vec<NetworkStatistics>,
+  /// A container's dataset, the counterpart of Containerization's block
+  /// devices: FreeBSD counts no jail's block IO. A jail has none.
+  pub block_io: Vec<DatasetIo>,
 }
+
+/// An interface's counters since it was made.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkStatistics {
+  pub interface: String,
+  pub received_packets: u64,
+  pub transmitted_packets: u64,
+  pub received_bytes: u64,
+  pub transmitted_bytes: u64,
+  pub received_errors: u64,
+  pub transmitted_errors: u64,
+  pub received_dropped: u64,
+  pub transmitted_dropped: u64,
+}
+
+/// A dataset's file reads and writes since it was mounted, as ZFS counts
+/// them: cached reads too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DatasetIo {
+  pub dataset: String,
+  pub read_bytes: u64,
+  pub write_bytes: u64,
+  pub read_operations: u64,
+  pub write_operations: u64,
+}
+
+/// Prints the interfaces of the jail named `$1`, with their counters, if
+/// it has a network of its own.
+pub(crate) const INTERFACES: &str = r#"[ "$(jls -j "$1" vnet)" != new ] || exec netstat -j "$1" -i -b -d -n -W"#;
+
+/// Prints the reads, bytes read, writes and bytes written of the dataset
+/// `$1`, from its ZFS kstats.
+pub(crate) const DATASET_IO: &str = r#"set -e
+objset=kstat.zfs.${1%%/*}.dataset.objset-$(printf 0x%x "$(zfs get -Hp -o value objsetid "$1")")
+sysctl -n "$objset.reads" "$objset.nread" "$objset.writes" "$objset.nwritten""#;
 
 /// Replaces the rules of the jail named `$1` with the rules after it, if
 /// the kernel accounts.
@@ -76,6 +119,72 @@ pub(crate) fn statistics(usage: &str) -> Result<Statistics> {
     write_bytes_per_second: value("writebps")?,
     read_operations_per_second: value("readiops")?,
     write_operations_per_second: value("writeiops")?,
+    networks: Vec::new(),
+    block_io: Vec::new(),
+  })
+}
+
+/// The interfaces in what `INTERFACES` printed: netstat's link rows, read
+/// by its header's names.
+pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
+  let unreadable = || Error::Guest(format!("netstat printed {table:?}"));
+  let mut lines = table.lines();
+  let Some(header) = lines.next() else {
+    return Ok(Vec::new());
+  };
+  let columns: Vec<&str> = header.split_whitespace().collect();
+  let column = |name: &str| {
+    columns
+      .iter()
+      .position(|column| *column == name)
+      .ok_or_else(unreadable)
+  };
+  let network = column("Network")?;
+
+  lines
+    .map(|line| line.split_whitespace().collect::<Vec<_>>())
+    .filter(|fields| {
+      fields
+        .get(network)
+        .is_some_and(|field| field.starts_with("<Link#"))
+    })
+    .map(|fields| {
+      if fields.len() != columns.len() {
+        return Err(unreadable());
+      }
+      let value = |name: &str| -> Result<u64> { fields[column(name)?].parse().map_err(|_| unreadable()) };
+
+      Ok(NetworkStatistics {
+        interface: fields[column("Name")?].to_string(),
+        received_packets: value("Ipkts")?,
+        transmitted_packets: value("Opkts")?,
+        received_bytes: value("Ibytes")?,
+        transmitted_bytes: value("Obytes")?,
+        received_errors: value("Ierrs")?,
+        transmitted_errors: value("Oerrs")?,
+        received_dropped: value("Idrop")?,
+        transmitted_dropped: value("Drop")?,
+      })
+    })
+    .collect()
+}
+
+/// The dataset's counters in what `DATASET_IO` printed.
+pub(crate) fn dataset_io(dataset: &str, counters: &str) -> Result<DatasetIo> {
+  let values = counters
+    .lines()
+    .map(|line| line.trim().parse().ok())
+    .collect::<Option<Vec<u64>>>();
+  let Some([reads, read, writes, written]) = values.as_deref() else {
+    return Err(Error::Guest(format!("ZFS counted {counters:?} for {dataset}")));
+  };
+
+  Ok(DatasetIo {
+    dataset: dataset.to_string(),
+    read_bytes: *read,
+    write_bytes: *written,
+    read_operations: *reads,
+    write_operations: *writes,
   })
 }
 
@@ -116,8 +225,62 @@ mod tests {
         write_bytes_per_second: 512,
         read_operations_per_second: 2,
         write_operations_per_second: 1,
+        ..Statistics::default()
       }
     );
     assert!(statistics("cputime=12\n").is_err());
+  }
+
+  #[test]
+  fn reads_netstats_link_rows() {
+    let table = "\
+Name      Mtu Network       Address              Ipkts Ierrs Idrop     Ibytes    Opkts Oerrs     Obytes  Coll  Drop
+lo0     16384 <Link#1>      lo0                     12     0     0        840       12     0        840     0     0
+lo0         - 127.0.0.0/8   127.0.0.1               12     -     -        840       12     -        840     -     -
+epair0b  1500 <Link#2>      02:6d:2e:1f:a4:0b      104     1     2      14210       98     3      10324     0     4
+epair0b     - 10.66.0.0/16  10.66.0.2               40     -     -       3200       38     -       2900     -     -
+";
+
+    assert_eq!(
+      networks(table).unwrap(),
+      [
+        NetworkStatistics {
+          interface: "lo0".into(),
+          received_packets: 12,
+          transmitted_packets: 12,
+          received_bytes: 840,
+          transmitted_bytes: 840,
+          ..NetworkStatistics::default()
+        },
+        NetworkStatistics {
+          interface: "epair0b".into(),
+          received_packets: 104,
+          transmitted_packets: 98,
+          received_bytes: 14210,
+          transmitted_bytes: 10324,
+          received_errors: 1,
+          transmitted_errors: 3,
+          received_dropped: 2,
+          transmitted_dropped: 4,
+        },
+      ]
+    );
+    assert_eq!(networks("").unwrap(), []);
+    assert!(networks("Name Network Ipkts\nlo0 <Link#1>\n").is_err());
+  }
+
+  #[test]
+  fn reads_a_datasets_counters() {
+    assert_eq!(
+      dataset_io("zroot/c/web", "7\n4096\n3\n512\n").unwrap(),
+      DatasetIo {
+        dataset: "zroot/c/web".into(),
+        read_bytes: 4096,
+        write_bytes: 512,
+        read_operations: 7,
+        write_operations: 3,
+      }
+    );
+    assert!(dataset_io("zroot/c/web", "7\n4096\n").is_err());
   }
 }

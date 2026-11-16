@@ -624,6 +624,31 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   assert_eq!(answer, b"pong\n");
   assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
 
+  // Its own network's counters, its loopback carrying what was relayed;
+  // and its dataset's, which its files were written to.
+  let statistics = web.statistics().expect("its statistics");
+  let loopback = statistics
+    .networks
+    .iter()
+    .find(|network| network.interface == "lo0")
+    .unwrap_or_else(|| panic!("its loopback in {statistics:?}"));
+  assert!(loopback.received_bytes > 0, "{statistics:?}");
+  assert!(
+    statistics
+      .networks
+      .iter()
+      .any(|network| network.interface.starts_with("epair")),
+    "{statistics:?}"
+  );
+  let [dataset] = statistics.block_io.as_slice() else {
+    panic!("one dataset in {statistics:?}");
+  };
+  assert_eq!(dataset.dataset, web.dataset());
+  assert!(
+    dataset.write_bytes > 0 && dataset.write_operations > 0,
+    "{statistics:?}"
+  );
+
   // Stderr is ignored: sh reports there its sleep dying of SIGTERM.
   web.stop().expect("stop the container");
   assert!(!web_socket.exists(), "its socket on the host outlived it");
@@ -681,6 +706,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   let statistics =
     eventually(|| Some(limited.statistics().expect("its statistics")).filter(|statistics| statistics.memory > 0));
   assert_eq!(statistics.processes, 1, "{statistics:?}");
+  assert!(statistics.networks.is_empty(), "the guest's network in {statistics:?}");
   drop(sleeper);
   limited.delete().expect("delete the container with limits");
   let ran = machine
