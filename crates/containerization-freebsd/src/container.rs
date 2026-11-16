@@ -6,7 +6,7 @@
 use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Mount, Network};
-use crate::quota::{Quotas, Statistics};
+use crate::quota::Statistics;
 use crate::socket::{SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
 use std::mem;
@@ -36,8 +36,12 @@ pub struct Configuration {
   /// File systems mounted into it in this order, before its resolver and
   /// hosts are written, until it stops.
   pub mounts: Vec<Mount>,
-  /// Quotas on what its processes use together.
-  pub quotas: Quotas,
+  /// The CPUs its processes may use together, as Containerization's
+  /// `cpus` sizes a container's VM; or all the machine's.
+  pub cpus: Option<u32>,
+  /// The resident memory its processes may use together, as
+  /// `memoryInBytes`; or all the machine's.
+  pub memory_in_bytes: Option<u64>,
   /// Unix sockets relayed between the host and it, with their guest paths
   /// in the container: from when `start` starts it until it stops.
   pub sockets: Vec<UnixSocket>,
@@ -154,11 +158,6 @@ impl<'a> Container<'a> {
   /// As `Jail::connect_unix`, in the container.
   pub fn connect_unix(&self, path: &str) -> Result<Relay> {
     self.jail.connect_unix(path)
-  }
-
-  /// As `Jail::limit`: replaces its quotas.
-  pub fn limit(&self, quotas: &Quotas) -> Result<()> {
-    self.jail.limit(quotas)
   }
 
   /// What its processes use together, as `Jail::statistics`.
@@ -295,9 +294,9 @@ fn set_up<'a>(agent: &'a Agent, id: &str, dataset: &str, configuration: &Configu
   let mut parameters = vec!["mount.devfs", hostname.as_str()];
   parameters.extend(configuration.parameters.iter().map(String::as_str));
   let jail = Jail::start(agent, id, &root, configuration.network, &parameters)?;
-  // Even without quotas, to lift rules a jail of the same name left.
+  // Even without limits, to lift rules a jail of the same name left.
   let furnished = jail
-    .limit(&configuration.quotas)
+    .limit(configuration.cpus, configuration.memory_in_bytes)
     .and_then(|()| {
       configuration
         .mounts

@@ -1,28 +1,10 @@
-//! Quotas and statistics for what a jail's processes use together, through
-//! rctl(8): Containerization's per-container limits and statistics. They
-//! need `kern.racct.enable` set at boot, which preparing a base does.
+//! Limits on a jail's processes together, and what they use, through
+//! rctl(8): the counterpart of Containerization's per-container cpus and
+//! memory, which size its VMs, and of its statistics. They need
+//! `kern.racct.enable` set at boot, which preparing a base does.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
-
-/// Quotas on what a jail's processes use together.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Quotas {
-  /// CPU, in percent of one core: 250 is two and a half. Its processes are
-  /// slowed to keep within it.
-  pub cpu_percent: Option<u64>,
-  /// Resident memory, in bytes. The kernel pages out what is past it,
-  /// which can thrash the machine.
-  pub memory: Option<u64>,
-  /// Processes: forking past it fails.
-  pub processes: Option<u64>,
-  /// File system reads and writes a second: its processes are slowed to
-  /// keep within them. Writes include those to the cache.
-  pub read_bytes_per_second: Option<u64>,
-  pub write_bytes_per_second: Option<u64>,
-  pub read_operations_per_second: Option<u64>,
-  pub write_operations_per_second: Option<u64>,
-}
 
 /// What a jail's processes use together.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,25 +33,19 @@ shift
 if [ "$(sysctl -n kern.racct.enable 2>/dev/null)" = 1 ]; then
   [ -z "$(rctl "jail:$jail:")" ] || rctl -r "jail:$jail:"
 elif [ $# -gt 0 ]; then
-  echo "quotas need kern.racct.enable=1 at boot: prepare the base again" >&2
+  echo "limits need kern.racct.enable=1 at boot: prepare the base again" >&2
   exit 1
 fi
 [ $# -eq 0 ] || rctl -a "$@""#;
 
-/// rctl(8)'s rules for `quotas` on the jail named `jail`.
-pub(crate) fn rules(jail: &str, quotas: &Quotas) -> Vec<String> {
-  let rule = |resource: &str, action: &str, amount: Option<u64>| {
-    amount.map(|amount| format!("jail:{jail}:{resource}:{action}={amount}"))
-  };
+/// rctl(8)'s rules limiting the jail named `jail` to `cpus` and
+/// `memory_in_bytes` of resident memory.
+pub(crate) fn rules(jail: &str, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
+  let rule = |resource: &str, amount: Option<u64>| amount.map(|amount| format!("jail:{jail}:{resource}:deny={amount}"));
 
   [
-    rule("pcpu", "deny", quotas.cpu_percent),
-    rule("memoryuse", "deny", quotas.memory),
-    rule("maxproc", "deny", quotas.processes),
-    rule("readbps", "throttle", quotas.read_bytes_per_second),
-    rule("writebps", "throttle", quotas.write_bytes_per_second),
-    rule("readiops", "throttle", quotas.read_operations_per_second),
-    rule("writeiops", "throttle", quotas.write_operations_per_second),
+    rule("pcpu", cpus.map(|cpus| u64::from(cpus) * 100)),
+    rule("memoryuse", memory_in_bytes),
   ]
   .into_iter()
   .flatten()
@@ -108,23 +84,16 @@ mod tests {
   use super::*;
 
   #[test]
-  fn makes_a_rule_for_each_quota_given() {
-    let quotas = Quotas {
-      cpu_percent: Some(150),
-      memory: Some(256 << 20),
-      write_bytes_per_second: Some(1 << 20),
-      ..Quotas::default()
-    };
-
+  fn makes_a_rule_for_each_limit_given() {
     assert_eq!(
-      rules("web", &quotas),
-      [
-        "jail:web:pcpu:deny=150",
-        "jail:web:memoryuse:deny=268435456",
-        "jail:web:writebps:throttle=1048576",
-      ]
+      rules("web", Some(2), Some(256 << 20)),
+      ["jail:web:pcpu:deny=200", "jail:web:memoryuse:deny=268435456"]
     );
-    assert!(rules("web", &Quotas::default()).is_empty());
+    assert_eq!(
+      rules("web", None, Some(1 << 30)),
+      ["jail:web:memoryuse:deny=1073741824"]
+    );
+    assert!(rules("web", None, None).is_empty());
   }
 
   #[test]

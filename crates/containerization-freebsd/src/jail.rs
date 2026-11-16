@@ -2,7 +2,7 @@
 
 use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
 use crate::error::{Error, Result};
-use crate::quota::{self, Quotas, Statistics};
+use crate::quota::{self, Statistics};
 use crate::socket::{SocketRelay, UnixSocket};
 use containerization_freebsd_protocol::{Address, Connect};
 use std::time::Duration;
@@ -276,10 +276,11 @@ impl<'a> Jail<'a> {
     self.agent.check(&argv, QUICK).map(|_| ())
   }
 
-  /// Replaces the jail's quotas with `quotas`, through rctl(8). `stop`
-  /// lifts them.
-  pub fn limit(&self, quotas: &Quotas) -> Result<()> {
-    let rules = quota::rules(&self.name, quotas);
+  /// Replaces the jail's limits, through rctl(8): its processes together
+  /// get `cpus` and `memory_in_bytes` of resident memory. Past its CPUs
+  /// they are slowed; past its memory, paged out. `stop` lifts the limits.
+  pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Result<()> {
+    let rules = quota::rules(&self.name, cpus, memory_in_bytes);
     let mut argv = vec!["sh", "-c", quota::LIMIT, "sh", self.name.as_str()];
     argv.extend(rules.iter().map(String::as_str));
 
@@ -316,7 +317,7 @@ impl<'a> Jail<'a> {
 
   /// Stops the jail, killing its processes, and waits for it to be gone,
   /// which a TCP connection it made can hold up for a minute. Then lifts
-  /// its quotas, unmounts what is mounted in it but datasets, and destroys
+  /// its limits, unmounts what is mounted in it but datasets, and destroys
   /// its epair.
   pub fn stop(self) -> Result<()> {
     let ran = self

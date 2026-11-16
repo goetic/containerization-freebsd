@@ -24,7 +24,7 @@ use virtualization::{
 /// offloads and multiqueue vtnet(4) asks for, and vtnet fails to attach
 /// ("desired features were not accepted"); the first two drop them from the
 /// request. The last has the kernel account for what processes use, for
-/// jails' quotas and statistics.
+/// jails' limits and statistics.
 pub const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\nkern.racct.enable=1\n";
 
 /// A host directory the guest mounts with `Machine::mount_share`.

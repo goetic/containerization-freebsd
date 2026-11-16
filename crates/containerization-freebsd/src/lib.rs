@@ -29,7 +29,7 @@ pub use images::{Image, ImageStore};
 pub use jail::{Jail, Mount, Network};
 pub use machine::{Disk, Layout, Machine, Share};
 pub use prepare::{Upgrade, prepare};
-pub use quota::{Quotas, Statistics};
+pub use quota::Statistics;
 pub use socket::{Direction, SocketRelay, UnixSocket};
 pub use unpack::{Unpacked, Unpacker};
 pub use zfs::Zfs;
