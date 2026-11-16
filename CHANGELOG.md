@@ -47,6 +47,8 @@
 - Loads and saves OCI archives: tars of an OCI image layout, plain or
   compressed with xz, such as FreeBSD's container images on
   download.freebsd.org. Loaded images are named as the archive names them.
+- Prunes unpacked layers no image needs, but those a container, a build or
+  another layer is cloned from.
 - Publishes ports on the loopback of the guest, a jail or a container on
   the host, relaying each connection. A container publishes its ports
   while it runs.
