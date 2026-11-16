@@ -4,6 +4,7 @@
 use crate::listener;
 use crate::process::{self, Process};
 use crate::relay::{self, Connection};
+use crate::sys;
 use containerization_freebsd_protocol::{
   Address, CONTROL, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
 };
@@ -233,6 +234,12 @@ impl<W: Write> Agent<W> {
         self.write(&answer)
       }
       Ok((_, Message::Ping(number))) => self.send(CONTROL, Message::Pong(number)),
+      Ok((_, Message::SetTime { seconds, nanoseconds })) => {
+        if let Err(error) = sys::set_time(seconds, nanoseconds) {
+          eprintln!("agent: setting the clock: {error}");
+        }
+        Ok(())
+      }
       Ok((_, Message::Exec(exec))) => self.exec(channel, &exec),
       Ok((_, Message::Connect(connect))) => self.connect(channel, &connect),
       Ok((_, Message::Listen(listen))) => self.listen(channel, &listen),

@@ -327,6 +327,18 @@ fn fexecve(_: &Rescue) -> io::Error {
   io::ErrorKind::Unsupported.into()
 }
 
+/// Sets the clock to `seconds` and `nanoseconds` past the Unix epoch.
+pub(crate) fn set_time(seconds: u64, nanoseconds: u32) -> io::Result<()> {
+  let time = libc::timespec {
+    tv_sec: seconds as libc::time_t,
+    tv_nsec: libc::c_long::from(nanoseconds.min(999_999_999)),
+  };
+
+  // SAFETY: clock_settime reads a timespec, which outlives the call.
+  check(unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const time) })?;
+  Ok(())
+}
+
 /// Sends `signal` to `target`: a pid, or a process group's id negated.
 pub(crate) fn signal(target: libc::pid_t, signal: i32) -> io::Result<()> {
   // SAFETY: kill touches no memory.

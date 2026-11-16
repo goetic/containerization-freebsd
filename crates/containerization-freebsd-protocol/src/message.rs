@@ -21,6 +21,12 @@ pub enum Message {
   /// From the guest, how many more of the console's bytes it has read: the
   /// host's credit to send more. Control.
   Received(u32),
+  /// From the host, the time since the Unix epoch, to set the guest's
+  /// clock to. Control.
+  SetTime {
+    seconds: u64,
+    nanoseconds: u32,
+  },
   /// Runs a process in the guest. Opens a channel, from the host.
   Exec(Exec),
   /// Relays to a socket in the guest. Opens a channel, from the host.
@@ -175,6 +181,7 @@ mod kind {
   pub const PING: u8 = 0x02;
   pub const PONG: u8 = 0x03;
   pub const RECEIVED: u8 = 0x04;
+  pub const SET_TIME: u8 = 0x05;
   pub const EXEC: u8 = 0x10;
   pub const CONNECT: u8 = 0x11;
   pub const LISTEN: u8 = 0x12;
@@ -196,6 +203,7 @@ impl Message {
       Self::Ping(_) => "ping",
       Self::Pong(_) => "pong",
       Self::Received(_) => "received",
+      Self::SetTime { .. } => "set time",
       Self::Exec(_) => "exec",
       Self::Connect(_) => "connect",
       Self::Listen(_) => "listen",
@@ -229,6 +237,10 @@ impl Message {
       Self::Received(bytes) => {
         payload.u32(*bytes);
         kind::RECEIVED
+      }
+      Self::SetTime { seconds, nanoseconds } => {
+        payload.u64(*seconds).u32(*nanoseconds);
+        kind::SET_TIME
       }
       Self::Exec(exec) => {
         payload.strings(&exec.argv).u32(length(exec.env.len()));
@@ -362,6 +374,10 @@ impl Message {
       kind::PING => Self::Ping(reader.u64()?),
       kind::PONG => Self::Pong(reader.u64()?),
       kind::RECEIVED => Self::Received(reader.u32()?),
+      kind::SET_TIME => Self::SetTime {
+        seconds: reader.u64()?,
+        nanoseconds: reader.u32()?,
+      },
       kind::EXEC => Self::Exec(Exec {
         argv: reader.strings()?,
         env: (0..reader.u32()?)
@@ -572,6 +588,10 @@ mod tests {
       Message::Ping(7),
       Message::Pong(u64::MAX),
       Message::Received(16 << 10),
+      Message::SetTime {
+        seconds: 1_794_787_200,
+        nanoseconds: 999_999_999,
+      },
       Message::Exec(Exec {
         argv: vec!["sh".into(), "-c".into(), "echo hi".into()],
         env: vec![("TERM".into(), "xterm".into())],

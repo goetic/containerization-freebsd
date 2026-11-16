@@ -233,13 +233,14 @@ impl Mux {
     Ok((channel, frame))
   }
 
-  /// Ping, Pong or, from the guest, Received on [`CONTROL`]; or a message on
-  /// an open channel.
+  /// Ping, Pong, from the guest Received, or from the host SetTime on
+  /// [`CONTROL`]; or a message on an open channel.
   pub fn send(&mut self, channel: u32, message: Message) -> Result<Frame, Error> {
     if channel == CONTROL {
       return match message {
         Message::Ping(_) | Message::Pong(_) => Ok(message.frame(CONTROL)),
         Message::Received(_) if self.side == Side::Guest => Ok(message.frame(CONTROL)),
+        Message::SetTime { .. } if self.side == Side::Host => Ok(message.frame(CONTROL)),
         _ => Err(not_allowed(channel, &message)),
       };
     }
@@ -263,6 +264,7 @@ impl Mux {
         Message::Hello { version, answer } => self.hear_hello(version, answer)?,
         Message::Ping(_) | Message::Pong(_) => {}
         Message::Received(_) if self.side == Side::Host => {}
+        Message::SetTime { .. } if self.side == Side::Guest => {}
         _ => return Err(not_allowed(channel, &message)),
       }
       return Ok((channel, message));

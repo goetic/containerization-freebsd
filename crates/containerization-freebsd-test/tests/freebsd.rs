@@ -201,6 +201,11 @@ fn prepares_boots_and_restores() {
       SECONDS,
     )
     .expect("stop using the share");
+  // A clock an hour behind, which restoring sets right.
+  cold
+    .agent
+    .check(&sh("date -f %s $(($(date +%s) - 3600))"), SECONDS)
+    .expect("set the guest's clock back");
   cold.save(&state).expect("save");
   cold.stop().expect("stop");
   drop(cold);
@@ -212,6 +217,22 @@ fn prepares_boots_and_restores() {
   restored
     .wait_ready(SECONDS)
     .expect("the agent answers after restoring");
+  let guest: u64 = restored
+    .agent
+    .check(&["date", "+%s"], SECONDS)
+    .expect("read the guest's clock")
+    .stdout
+    .trim()
+    .parse()
+    .expect("seconds");
+  let host = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .expect("the host's clock")
+    .as_secs();
+  assert!(
+    guest.abs_diff(host) <= 5,
+    "the guest's clock is {guest}, the host's {host}"
+  );
   restored
     .mount_share("shared", "/mnt/shared")
     .expect("mount the share again");

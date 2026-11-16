@@ -127,6 +127,26 @@ fn lets_only_the_guest_say_what_it_received() {
 }
 
 #[test]
+fn lets_only_the_host_set_the_time() {
+  let (mut host, mut guest) = session();
+  let time = Message::SetTime {
+    seconds: 1,
+    nanoseconds: 2,
+  };
+
+  let frame = host.send(CONTROL, time.clone()).unwrap();
+  assert_eq!(deliver(&mut guest, [frame]), [(CONTROL, time.clone())]);
+  assert_eq!(
+    guest.send(CONTROL, time.clone()).unwrap_err(),
+    not_allowed(CONTROL, "set time")
+  );
+  assert_eq!(
+    host.receive(time.frame(CONTROL)).unwrap_err(),
+    not_allowed(CONTROL, "set time")
+  );
+}
+
+#[test]
 fn keeps_interleaved_channels_apart() {
   let (mut host, mut guest) = session();
   let (plain, open_plain) = host.open(exec(&["make"], None)).unwrap();

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use containerization_freebsd_protocol::{Exec, Exit, Limit, Resource, User, WindowSize};
 
@@ -320,6 +320,12 @@ impl Agent {
     }
   }
 
+  /// Sets the guest's clock to the host's, if there is a session. Each new
+  /// session does, and a machine every 30 seconds while it runs.
+  pub fn sync_clock(&self) -> Result<()> {
+    self.shared.lock().sync_clock()
+  }
+
   /// Starts `argv` in the guest without waiting for it, for a command that
   /// may never report back, such as one that powers the guest off.
   pub fn launch(&self, argv: &[&str]) -> Result<()> {
@@ -602,6 +608,24 @@ impl State {
     self.write(&hello)
   }
 
+  fn sync_clock(&mut self) -> Result<()> {
+    if !self.mux.in_session() {
+      return Ok(());
+    }
+    let now = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap_or_default();
+    let time = Message::SetTime {
+      seconds: now.as_secs(),
+      nanoseconds: now.subsec_nanos(),
+    };
+    let frame = self
+      .mux
+      .send(CONTROL, time)
+      .map_err(|error| Error::Guest(format!("setting the guest's clock: {error}")))?;
+    self.write(&frame)
+  }
+
   fn close(&mut self, channel: u32, reason: &str) {
     if let Ok(frame) = self.mux.send(channel, Message::Error(reason.to_string())) {
       let _ = self.write(&frame);
@@ -622,7 +646,12 @@ impl State {
         let _ = self.hello();
         Heard::Nothing
       }
-      Ok((_, Message::Hello { answer: true, .. })) => Heard::Changed,
+      // A session: the guest booted or was restored, and its clock may be
+      // behind.
+      Ok((_, Message::Hello { answer: true, .. })) => {
+        let _ = self.sync_clock();
+        Heard::Changed
+      }
       // The console reader counted it.
       Ok((_, Message::Received(_))) => Heard::Nothing,
       Ok((_, Message::Ping(number))) => {

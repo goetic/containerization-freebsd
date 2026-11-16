@@ -2,6 +2,7 @@
 //! drive it.
 
 use crate::agent::Agent;
+use crate::clock::ClockSync;
 use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]
 use crate::memory::Memory;
@@ -69,6 +70,7 @@ pub struct Layout {
 
 pub struct Machine {
   pub agent: Agent,
+  clock: ClockSync,
   #[cfg_attr(not(feature = "kernel-messages"), allow(dead_code))]
   debug: DebugDevices,
   machine: VirtualMachine,
@@ -256,8 +258,10 @@ impl Layout {
       Ok::<_, Error>((machine, output, input))
     })?;
 
+    let agent = Agent::new(output, input);
     Ok(Machine {
-      agent: Agent::new(output, input),
+      clock: ClockSync::start(agent.share()),
+      agent,
       debug,
       machine,
       queue,
@@ -313,17 +317,23 @@ impl Machine {
   }
 
   pub fn pause(&self) -> Result<f64> {
-    self.completed("pause", |machine, done| {
+    let seconds = self.completed("pause", |machine, done| {
       machine.pause(done);
       Ok(())
-    })
+    })?;
+    self.clock.set_paused(true);
+    Ok(seconds)
   }
 
+  /// Resumes the machine, and sets its clock, which the pause left behind.
   pub fn resume(&self) -> Result<f64> {
-    self.completed("resume", |machine, done| {
+    let seconds = self.completed("resume", |machine, done| {
       machine.resume(done);
       Ok(())
-    })
+    })?;
+    self.clock.set_paused(false);
+    let _ = self.agent.sync_clock();
+    Ok(seconds)
   }
 
   /// Stops the machine at once, as pulling its plug would.
@@ -394,6 +404,7 @@ done; true"#;
     let seconds = self.completed("restore the machine's state", |machine, done| {
       machine.restore_machine_state_from(&url, done)
     })?;
+    self.clock.set_paused(true);
     self.agent.rejoin()?;
     Ok(seconds)
   }

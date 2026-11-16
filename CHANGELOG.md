@@ -64,6 +64,10 @@
   `/rescue` tools in the jail, so it needs nothing from the image, and
   paths resolve as the jail sees them. Exec's new `rescue` runs one of
   those tools. Also protocol version 3.
+- Keeps the guest's clock with the host's, as Containerization's TimeSyncer
+  does: at each new session with the agent, as after a boot or a restore,
+  on resuming, and every 30 seconds while the machine runs. Also protocol
+  version 3.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited

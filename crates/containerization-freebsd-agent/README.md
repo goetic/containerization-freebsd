@@ -20,6 +20,8 @@ the host will.
 - **Sessions:** the agent announces itself at startup and after losing frames.
   A new session kills the process groups of the old session's
   channels.
+- **Clock:** SetTime sets the guest's clock, as `vminitd`'s setTime does.
+  The host sends it at each new session and every 30 seconds.
 - **Exec:** the environment adds to the agent's own. Signal numbers are the
   guest's, as are resource numbers. Exited follows the end of output, so a
   process whose child holds its output open stays open until that child
