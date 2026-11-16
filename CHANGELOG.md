@@ -44,9 +44,10 @@
   read-only if asked. A mount point resolves as the jail sees it, so its
   symbolic links can't lead out. Stopping a jail unmounts all mounted in
   it.
-- Loads and saves OCI archives: tars of an OCI image layout, plain or
-  compressed with xz, such as FreeBSD's container images on
-  download.freebsd.org. Loaded images are named as the archive names them.
+- Loads and saves images as OCI image layout directories, as
+  Containerization does; unpack an archive of one, such as FreeBSD's
+  container images on download.freebsd.org, to load it. Loaded images are
+  named as the layout names them.
 - Pushes images to registries: the blobs a registry lacks, then the
   manifests, an index's before the index.
 - Limits a container's processes together to Containerization's `cpus`

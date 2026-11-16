@@ -5,16 +5,14 @@
 use crate::error::{Error, Result};
 use crate::oci::{
   ContentStore, Credentials, Descriptor, ImageConfig, Index, Manifest, Platform, REF_NAME, Reference, RegistryClient,
-  parse,
+  parse, sha256_hex,
 };
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 const LAYOUT: &str = r#"{"imageLayoutVersion":"1.0.0"}"#;
-/// How an xz stream starts.
-const XZ: &[u8] = b"\xfd7zXZ\0";
 
 pub struct ImageStore {
   root: PathBuf,
@@ -219,54 +217,18 @@ impl ImageStore {
     })
   }
 
-  /// Loads the images in the OCI archive at `path`: a tar of an OCI image
-  /// layout, plain or compressed with xz, as FreeBSD's container images on
-  /// download.freebsd.org are. Each is named by its
-  /// `org.opencontainers.image.ref.name`, normalized as references are:
-  /// `freebsd-static:15.1-RELEASE-aarch64` is
-  /// `docker.io/library/freebsd-static:15.1-RELEASE-aarch64`. Blobs the store
-  /// holds already are skipped.
-  pub fn load(&self, path: &Path) -> Result<Vec<Image>> {
-    let reading = || format!("reading {}", path.display());
-    let mut file = BufReader::new(File::open(path).map_err(Error::io(reading()))?);
-    let compressed = file
-      .fill_buf()
-      .map_err(Error::io(reading()))?
-      .starts_with(XZ);
-    let reader: Box<dyn Read> = if compressed {
-      Box::new(xz2::bufread::XzDecoder::new(file))
-    } else {
-      Box::new(file)
-    };
-    let mut archive = tar::Archive::new(reader);
-    let mut index = None;
+  /// Loads the images in the OCI image layout at `directory`, as
+  /// Containerization's `load(from:)` does. To load an archive of one, such
+  /// as FreeBSD's container images on download.freebsd.org, unpack it
+  /// first. Each image is named by its `org.opencontainers.image.ref.name`,
+  /// normalized as references are: `freebsd-static:15.1-RELEASE-aarch64`
+  /// is `docker.io/library/freebsd-static:15.1-RELEASE-aarch64`. Blobs the
+  /// store holds already are skipped.
+  pub fn load(&self, directory: &Path) -> Result<Vec<Image>> {
+    let path = directory.join("index.json");
+    let bytes = std::fs::read(&path).map_err(Error::io(format!("reading {}", path.display())))?;
+    let index: Index = parse(&bytes, &path.display().to_string())?;
 
-    for entry in archive.entries().map_err(Error::io(reading()))? {
-      let mut entry = entry.map_err(Error::io(reading()))?;
-      let name = entry
-        .path()
-        .map_err(Error::io(reading()))?
-        .to_string_lossy()
-        .into_owned();
-      let name = name.trim_start_matches("./");
-      if name == "index.json" {
-        let mut bytes = Vec::new();
-        entry
-          .read_to_end(&mut bytes)
-          .map_err(Error::io(reading()))?;
-        index = Some(parse::<Index>(&bytes, &format!("{}'s index.json", path.display()))?);
-      } else if let Some(hex) = name.strip_prefix("blobs/sha256/")
-        && entry.header().entry_type().is_file()
-      {
-        let digest = format!("sha256:{hex}");
-        if !self.content.has(&digest) {
-          self.content.ingest_from(&mut entry, &digest)?;
-        }
-      }
-    }
-
-    let index =
-      index.ok_or_else(|| Error::Invalid(format!("{} has no index.json: it isn't an OCI archive", path.display())))?;
     index
       .manifests
       .into_iter()
@@ -276,6 +238,7 @@ impl ImageStore {
           .get(REF_NAME)
           .cloned()
           .ok_or_else(|| Error::Invalid(format!("{} has an image with no {REF_NAME}", path.display())))?;
+        self.import(directory, &descriptor)?;
         let alone = Index {
           manifests: vec![descriptor.clone()],
           ..Index::default()
@@ -283,7 +246,7 @@ impl ImageStore {
         if let Some(missing) = self.missing(&alone)? {
           return Err(Error::Invalid(format!(
             "{} lacks blob {missing} of {name}",
-            path.display()
+            directory.display()
           )));
         }
         self.create(&name, descriptor)
@@ -291,10 +254,10 @@ impl ImageStore {
       .collect()
   }
 
-  /// Saves the images named `references` in an OCI archive at `path`, with
-  /// every blob they need, for `load`. Its bytes depend only on what it
-  /// holds.
-  pub fn save(&self, references: &[&str], path: &Path) -> Result<()> {
+  /// Saves the images named `references` as an OCI image layout at `out`,
+  /// with every blob they need, as Containerization's `save(references:out:)`
+  /// does. `out` is made if need be, and an `index.json` there replaced.
+  pub fn save(&self, references: &[&str], out: &Path) -> Result<()> {
     let images = references
       .iter()
       .map(|reference| self.get(reference))
@@ -308,35 +271,64 @@ impl ImageStore {
         "the store lacks blob {missing} of {references:?}"
       )));
     }
-    let blobs = self
-      .reachable(&index)?
-      .into_iter()
-      .map(|digest| {
-        Ok((
-          format!("blobs/sha256/{}", &digest["sha256:".len()..]),
-          self.content.path(&digest)?,
-        ))
-      })
-      .collect::<Result<Vec<_>>>()?;
-    let index = serde_json::to_vec(&index).map_err(|error| Error::Invalid(format!("an index to save: {error}")))?;
 
-    let writing = || format!("writing {}", path.display());
-    let file = File::create(path).map_err(Error::io(writing()))?;
-    let written = (|| {
-      let mut archive = tar::Builder::new(BufWriter::new(file));
-      append(&mut archive, "oci-layout", LAYOUT.len() as u64, LAYOUT.as_bytes())?;
-      append(&mut archive, "index.json", index.len() as u64, index.as_slice())?;
-      for (name, blob) in &blobs {
-        let blob = File::open(blob)?;
-        let size = blob.metadata()?.len();
-        append(&mut archive, name, size, blob)?;
+    let blobs = out.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).map_err(Error::io(format!("making {}", blobs.display())))?;
+    for digest in self.reachable(&index)? {
+      let saved = layout_blob(out, &digest)?;
+      if !saved.exists() {
+        std::fs::copy(self.content.path(&digest)?, &saved)
+          .map_err(Error::io(format!("writing {}", saved.display())))?;
       }
-      archive.into_inner()?.flush()
-    })();
-    if written.is_err() {
-      let _ = std::fs::remove_file(path);
     }
-    written.map_err(Error::io(writing()))
+    let index = serde_json::to_vec(&index).map_err(|error| Error::Invalid(format!("an index to save: {error}")))?;
+    for (name, bytes) in [("oci-layout", LAYOUT.as_bytes()), ("index.json", &index)] {
+      let partial = out.join(format!("{name}.partial"));
+      std::fs::write(&partial, bytes)
+        .and_then(|()| std::fs::rename(&partial, out.join(name)))
+        .map_err(Error::io(format!("writing {}", out.join(name).display())))?;
+    }
+    Ok(())
+  }
+
+  /// Copies `descriptor`'s blob from the layout at `directory`, and those
+  /// it lists, unless the store holds them. A manifest an index lists may
+  /// be missing, as a pull leaves it; anything else missing, `missing`
+  /// finds.
+  fn import(&self, directory: &Path, descriptor: &Descriptor) -> Result<()> {
+    if !self.copy_in(directory, &descriptor.digest)? {
+      return Ok(());
+    }
+    let bytes = self.content.read(&descriptor.digest)?;
+
+    if descriptor.is_index() {
+      let index: Index = parse(&bytes, &format!("index {}", descriptor.digest))?;
+      index
+        .manifests
+        .iter()
+        .try_for_each(|child| self.import(directory, child))
+    } else {
+      let manifest: Manifest = parse(&bytes, &format!("manifest {}", descriptor.digest))?;
+      for blob in std::iter::once(&manifest.config).chain(&manifest.layers) {
+        self.copy_in(directory, &blob.digest)?;
+      }
+      Ok(())
+    }
+  }
+
+  /// Copies the blob `digest` from the layout at `directory` unless the
+  /// store holds it: whether the store holds it now.
+  fn copy_in(&self, directory: &Path, digest: &str) -> Result<bool> {
+    if self.content.has(digest) {
+      return Ok(true);
+    }
+    let path = layout_blob(directory, digest)?;
+
+    match File::open(&path) {
+      Ok(mut file) => self.content.ingest_from(&mut file, digest).map(|()| true),
+      Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+      Err(error) => Err(Error::io(format!("reading {}", path.display()))(error)),
+    }
   }
 
   /// A blob the index's images need that the store lacks, if any. A
@@ -481,16 +473,11 @@ fn name(entry: &Descriptor) -> Option<&String> {
   entry.annotations.get(REF_NAME)
 }
 
-/// Adds the file `name` to `archive`, owned by root and dated 1970.
-fn append(archive: &mut tar::Builder<impl Write>, name: &str, size: u64, data: impl Read) -> io::Result<()> {
-  let mut header = tar::Header::new_ustar();
-  header.set_entry_type(tar::EntryType::Regular);
-  header.set_size(size);
-  header.set_mode(0o644);
-  header.set_uid(0);
-  header.set_gid(0);
-  header.set_mtime(0);
-  archive.append_data(&mut header, name, data)
+/// Where the layout at `root` keeps the blob `digest`.
+fn layout_blob(root: &Path, digest: &str) -> Result<PathBuf> {
+  let hex = sha256_hex(digest).ok_or_else(|| Error::Invalid(format!("{digest:?} is not a sha256 digest")))?;
+
+  Ok(root.join("blobs/sha256").join(hex))
 }
 
 #[cfg(test)]
@@ -498,7 +485,7 @@ mod tests {
   use super::*;
   use crate::oci::{RootFs, RunConfig, media_type, sha256_digest};
   use std::collections::HashMap;
-  use std::io::{BufRead, BufReader, Write};
+  use std::io::{BufRead, BufReader, Read, Write};
   use std::net::TcpListener;
 
   const TOKEN: &str = "secret";
@@ -540,18 +527,6 @@ mod tests {
       layers: vec![descriptor(media_type::LAYER_GZIP, &layer, None)],
     });
     (layer, config, manifest)
-  }
-
-  /// A tar of `entries`, by name.
-  fn tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for (name, bytes) in entries {
-      let mut header = tar::Header::new_ustar();
-      header.set_size(bytes.len() as u64);
-      header.set_mode(0o644);
-      builder.append_data(&mut header, name, *bytes).unwrap();
-    }
-    builder.into_inner().unwrap()
   }
 
   /// A registry on loopback, serving `test/image:1` behind a bearer token as
@@ -867,7 +842,7 @@ mod tests {
   }
 
   #[test]
-  fn saves_images_in_an_archive_that_loads_them_again() {
+  fn saves_images_as_a_layout_that_loads_them_again() {
     let (pulled, loaded, work) = (
       tempfile::tempdir().unwrap(),
       tempfile::tempdir().unwrap(),
@@ -877,18 +852,14 @@ mod tests {
     let reference = format!("{}/test/image:1", registry());
     store.pull(&reference, &Platform::default(), None).unwrap();
     store.tag(&reference, "ghcr.io/test/other:2").unwrap();
-    let archive = work.path().join("images.tar");
+    let layout = work.path().join("layout");
 
     store
-      .save(&[&reference, "ghcr.io/test/other:2"], &archive)
+      .save(&[&reference, "ghcr.io/test/other:2"], &layout)
       .unwrap();
-    let again = work.path().join("again.tar");
-    store
-      .save(&[&reference, "ghcr.io/test/other:2"], &again)
-      .unwrap();
-    assert_eq!(std::fs::read(&archive).unwrap(), std::fs::read(&again).unwrap());
+    assert_eq!(std::fs::read_to_string(layout.join("oci-layout")).unwrap(), LAYOUT);
     let other = ImageStore::new(loaded.path()).unwrap();
-    let images = other.load(&archive).unwrap();
+    let images = other.load(&layout).unwrap();
 
     let names: Vec<&str> = images
       .iter()
@@ -912,33 +883,38 @@ mod tests {
     assert_eq!(loaded_digests, digests);
   }
 
-  #[test]
-  fn loads_an_xz_archive_naming_its_image_as_freebsd_does() {
-    let root = tempfile::tempdir().unwrap();
-    let store = ImageStore::new(root.path()).unwrap();
-    let (layer, config, manifest) = documents();
-    let mut entry = descriptor(media_type::MANIFEST, &manifest, None);
+  /// An OCI image layout at `root` holding the blobs `files`, its index
+  /// naming `manifest`'s image `name`.
+  fn layout(root: &Path, name: &str, manifest: &[u8], files: &[&[u8]]) -> PathBuf {
+    let mut entry = descriptor(media_type::MANIFEST, manifest, None);
     entry
       .annotations
-      .insert(REF_NAME.to_string(), "freebsd-static:15.1-RELEASE-aarch64".to_string());
+      .insert(REF_NAME.to_string(), name.to_string());
     let index = json(&Index {
       manifests: vec![entry],
       ..Index::default()
     });
-    let blob = |bytes: &[u8]| format!("blobs/sha256/{}", &sha256_digest(bytes)["sha256:".len()..]);
-    let plain = tar(&[
-      ("index.json", &index),
-      ("oci-layout", LAYOUT.as_bytes()),
-      (&blob(&manifest), &manifest),
-      (&blob(&config), &config),
-      (&blob(&layer), &layer),
-    ]);
-    let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
-    encoder.write_all(&plain).unwrap();
-    let archive = root.path().join("image.txz");
-    std::fs::write(&archive, encoder.finish().unwrap()).unwrap();
+    std::fs::create_dir_all(root.join("blobs/sha256")).unwrap();
+    std::fs::write(root.join("index.json"), index).unwrap();
+    for file in files {
+      std::fs::write(layout_blob(root, &sha256_digest(file)).unwrap(), file).unwrap();
+    }
+    root.to_path_buf()
+  }
 
-    let images = store.load(&archive).unwrap();
+  #[test]
+  fn loads_a_layout_naming_its_image_as_freebsd_does() {
+    let (root, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store = ImageStore::new(root.path()).unwrap();
+    let (layer, config, manifest) = documents();
+    let directory = layout(
+      work.path(),
+      "freebsd-static:15.1-RELEASE-aarch64",
+      &manifest,
+      &[&manifest, &config, &layer],
+    );
+
+    let images = store.load(&directory).unwrap();
 
     assert_eq!(
       images[0].reference,
@@ -948,45 +924,23 @@ mod tests {
   }
 
   #[test]
-  fn refuses_an_archive_with_a_blob_missing_or_not_its_digest() {
-    let root = tempfile::tempdir().unwrap();
+  fn refuses_a_layout_with_a_blob_missing_or_not_its_digest() {
+    let (root, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let store = ImageStore::new(root.path()).unwrap();
     let (layer, config, manifest) = documents();
-    let mut entry = descriptor(media_type::MANIFEST, &manifest, None);
-    entry
-      .annotations
-      .insert(REF_NAME.to_string(), "ghcr.io/test/image:1".to_string());
-    let index = json(&Index {
-      manifests: vec![entry],
-      ..Index::default()
-    });
-    let blob = |bytes: &[u8]| format!("blobs/sha256/{}", &sha256_digest(bytes)["sha256:".len()..]);
-    let write = |name: &str, entries: &[(&str, &[u8])]| {
-      let path = root.path().join(name);
-      std::fs::write(&path, tar(entries)).unwrap();
-      path
-    };
+    let name = "ghcr.io/test/image:1";
 
-    let empty = write("empty.tar", &[("index.json", &index)]);
+    let empty = layout(&work.path().join("empty"), name, &manifest, &[]);
     let error = store.load(&empty).unwrap_err();
     assert!(error.to_string().contains(&sha256_digest(&manifest)), "{error}");
 
-    let lacking = write(
-      "lacking.tar",
-      &[
-        ("index.json", &index),
-        (&blob(&manifest), &manifest),
-        (&blob(&config), &config),
-      ],
-    );
+    let lacking = layout(&work.path().join("lacking"), name, &manifest, &[&manifest, &config]);
     let error = store.load(&lacking).unwrap_err();
     assert!(error.to_string().contains(&sha256_digest(&layer)), "{error}");
 
     // The store has the manifest and config now, but not the layer.
-    let forged = write(
-      "forged.tar",
-      &[("index.json", &index), (&blob(&layer), b"something else")],
-    );
+    let forged = layout(&work.path().join("forged"), name, &manifest, &[]);
+    std::fs::write(layout_blob(&forged, &sha256_digest(&layer)).unwrap(), "something else").unwrap();
     assert!(matches!(store.load(&forged).unwrap_err(), Error::Checksum { .. }));
     assert!(store.list().unwrap().is_empty());
   }
