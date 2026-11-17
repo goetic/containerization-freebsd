@@ -39,6 +39,27 @@ jexec "$1" ifconfig lo0 inet 127.0.0.1/8 up
 jexec "$1" ifconfig "$2" inet "$3/16" up
 jexec "$1" route -q add default "$4""#;
 
+/// Ends the processes of the jail named `$1` as `jail -r` would, with
+/// SIGTERM and 10 seconds to exit, then drops the TCP connections they
+/// left, which would keep it dying through TIME_WAIT once removed. A VNET
+/// jail's, `$2` being `new`, are its own, so only its own tcpdrop, if any,
+/// reaches them; another's are the guest's, listed by netstat.
+const DROP: &str = r#"jid=$(jls -j "$1" jid)
+pkill -j "$jid"
+tries=100
+while pgrep -j "$jid" >/dev/null && [ "$tries" -gt 0 ]; do sleep 0.1; tries=$((tries - 1)); done
+if [ "$2" = new ]; then
+  jexec "$jid" tcpdrop -a >/dev/null 2>&1
+else
+  netstat -j "$jid" -n -p tcp -a | awk 'NR > 2 && $6 != "LISTEN" {
+    local = $4; local_port = $4; foreign = $5; foreign_port = $5
+    sub(/\.[^.]*$/, "", local); sub(/.*\./, "", local_port)
+    sub(/\.[^.]*$/, "", foreign); sub(/.*\./, "", foreign_port)
+    print local, local_port, foreign, foreign_port
+  }' | while read -r l lp f fp; do tcpdrop "$l" "$lp" "$f" "$fp" >/dev/null 2>&1; done
+fi
+true"#;
+
 /// Waits for the jail named `$1` to be gone: once removed, it is dying
 /// until what it left closes, such as a TCP connection in TIME_WAIT, and
 /// until then holds its root and its network.
@@ -380,8 +401,9 @@ impl<'a> Jail<'a> {
     self.agent.check(&self.jexec(argv), timeout)
   }
 
-  /// Stops the jail, killing its processes, and waits for it to be gone,
-  /// which a TCP connection it made can hold up for a minute. Then lifts
+  /// Stops the jail, killing its processes and dropping the TCP
+  /// connections they left, and waits for it to be gone, which a
+  /// connection it can't drop holds up for a minute. Then lifts
   /// its limits, unmounts what is mounted in it but datasets, and destroys
   /// its epair. Its interfaces' devices are back in the guest by then.
   pub fn stop(self) -> Result<()> {
@@ -405,6 +427,9 @@ impl<'a> Jail<'a> {
       Vec::new()
     };
 
+    self
+      .agent
+      .check(&["sh", "-c", DROP, "sh", &self.name, vnet], QUICK)?;
     self.agent.check(&["jail", "-r", &self.name], QUICK)?;
     self
       .agent

@@ -73,6 +73,9 @@
   does: at each new session with the agent, as after a boot or a restore,
   on resuming, and every 30 seconds while the machine runs. Also protocol
   version 3.
+- Stopping a jail ends its processes, then drops the TCP connections they
+  left, so one in TIME_WAIT no longer holds the jail up for a minute: with
+  the guest's tcpdrop, or a VNET jail's own, which an image may lack.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited

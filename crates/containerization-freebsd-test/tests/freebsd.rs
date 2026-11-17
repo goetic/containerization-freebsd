@@ -370,8 +370,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
 
   jail.stop().expect("stop the jail");
 
-  // Each way to the network, tried by pinging the guest's gateway: only pf's
-  // NAT gets a NAT jail an answer, as the gateway has no route to 10.66/16.
+  // Each way to the network, tried by pinging the guest's gateway, and by
+  // connecting through the guest's resolver to where the Mac downloaded the
+  // image: only pf's NAT gets a NAT jail answers, as the gateway has no route
+  // to 10.66/16.
+  let internet = ["nc", "-4", "-z", "-w", "10", "download.freebsd.org", "443"];
   let gateway = machine
     .agent
     .check(&sh("route -n get default | awk '/gateway:/ { print $2 }'"), SECONDS)
@@ -392,9 +395,24 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       .run(&["ping", "-c", "1", "-t", "5", &gateway], SECONDS)
       .unwrap_or_else(|error| panic!("ping with {network:?}: {error}"));
     assert_eq!(ran.exit == Exit::Code(0), reaches, "{network:?}: {ran:?}");
+    let ran = jail
+      .run(&internet, SECONDS)
+      .unwrap_or_else(|error| panic!("connect out with {network:?}: {error}"));
+    assert_eq!(
+      ran.exit == Exit::Code(0),
+      reaches,
+      "{network:?} to the internet: {ran:?}"
+    );
+    // Its connection dropped, not left in TIME_WAIT to hold it for a minute.
+    let stopping = Instant::now();
     jail
       .stop()
       .unwrap_or_else(|error| panic!("stop the jail with {network:?}: {error}"));
+    assert!(
+      stopping.elapsed() < Duration::from_secs(30),
+      "{network:?} took {:?} to stop",
+      stopping.elapsed()
+    );
   }
   machine
     .agent
@@ -742,7 +760,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   assert_eq!(ran.stdout, "", "its rules outlived it");
 
   // One with its own interface on the NAT's network, which the host
-  // reaches; its device is the guest's again once it is gone.
+  // reaches and which reaches the internet; its device is the guest's again
+  // once it is gone.
   let guest = machine
     .agent
     .check(
@@ -790,6 +809,9 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   // nc reads until the host closes.
   drop(stream);
   assert_eq!(finish(&server), (String::new(), Exit::Code(0)));
+  reachable
+    .check(&internet, SECONDS)
+    .expect("connect out from its interface");
   reachable
     .delete()
     .expect("delete the container with an interface");
