@@ -32,13 +32,6 @@ printf 'set skip on lo0\nnat on %s inet from 10.66.0.0/16 to any -> (%s)\npass a
   pfctl -q -f -
 pfctl -s info | grep -q 'Status: Enabled' || pfctl -q -e"#;
 
-/// Gives a NAT jail, `$1`, its loopback, its end of the epair `$2` at
-/// address `$3`, and a default route through the bridge at `$4`.
-const NAT_JAIL: &str = r#"set -e
-jexec "$1" ifconfig lo0 inet 127.0.0.1/8 up
-jexec "$1" ifconfig "$2" inet "$3/16" up
-jexec "$1" route -q add default "$4""#;
-
 /// Ends the processes of the jail named `$1` as `jail -r` would, with
 /// SIGTERM and 10 seconds to exit, then drops the TCP connections they
 /// left, which would keep it dying through TIME_WAIT once removed. A VNET
@@ -458,11 +451,10 @@ impl<'a> Jail<'a> {
   /// networked jail's resolver.
   fn configure(&self, path: &str, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
-      let inside = format!("{}b", epair.name);
-      self.agent.check(
-        &["sh", "-c", NAT_JAIL, "sh", &self.name, &inside, &epair.address, GATEWAY],
-        QUICK,
-      )?;
+      let (inside, address) = (format!("{}b", epair.name), format!("{}/16", epair.address));
+      self.rescue(&["ifconfig", "lo0", "inet", "127.0.0.1/8", "up"])?;
+      self.rescue(&["ifconfig", &inside, "inet", &address, "up"])?;
+      self.rescue(&["route", "-q", "add", "default", GATEWAY])?;
     }
     if let Network::Interfaces(interfaces) = network {
       self.rescue(&["ifconfig", "lo0", "inet", "127.0.0.1/8", "up"])?;

@@ -369,6 +369,14 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("the userland does not");
 
   jail.stop().expect("stop the jail");
+  // Setting up a NAT jail's network needs neither its ifconfig nor its route.
+  machine
+    .agent
+    .check(
+      &["rm", &format!("{root}/sbin/ifconfig"), &format!("{root}/sbin/route")],
+      SECONDS,
+    )
+    .expect("remove the clone's ifconfig and route");
 
   // Each way to the network, tried by pinging the guest's gateway, and by
   // connecting through the guest's resolver to where the Mac downloaded the
