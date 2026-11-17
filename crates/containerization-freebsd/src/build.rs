@@ -120,7 +120,7 @@ impl<'a> Builder<'a> {
   fn in_jail(&self, dataset: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
     let root = self.zfs.mountpoint(dataset)?;
     let name = format!("cfbsd-build-{}", &key[..16]);
-    let jail = Jail::start(self.agent, &name, &root, step.network, &["mount.devfs"])?;
+    let jail = Jail::start(self.agent, &name, &root, &step.network, &["mount.devfs"])?;
 
     let exit = run_script(&jail, &step.script, output);
     jail.stop()?;

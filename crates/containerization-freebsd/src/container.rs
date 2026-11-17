@@ -311,7 +311,7 @@ fn set_up<'a>(agent: &'a Agent, id: &str, dataset: &str, configuration: &Configu
   let hostname = format!("host.hostname={}", configuration.hostname.as_deref().unwrap_or(id));
   let mut parameters = vec!["mount.devfs", hostname.as_str()];
   parameters.extend(configuration.parameters.iter().map(String::as_str));
-  let jail = Jail::start(agent, id, &root, configuration.network, &parameters)?;
+  let jail = Jail::start(agent, id, &root, &configuration.network, &parameters)?;
   // Even without limits, to lift rules a jail of the same name left.
   let furnished = jail
     .limit(configuration.cpus, configuration.memory_in_bytes)

@@ -64,6 +64,11 @@
   `/rescue` tools in the jail, so it needs nothing from the image, and
   paths resolve as the jail sees them. Exec's new `rescue` runs one of
   those tools. Also protocol version 3.
+- Containers and jails with their own interfaces on Virtualization's NAT
+  network, as Containerization's `interfaces`, so the host reaches them at
+  their addresses: `Network::Interfaces`, each a spare network device from
+  `Layout::interfaces`, moved into the jail. `Jail::start` takes the
+  network by reference.
 - Keeps the guest's clock with the host's, as Containerization's TimeSyncer
   does: at each new session with the agent, as after a boot or a restore,
   on resuming, and every 30 seconds while the machine runs. Also protocol

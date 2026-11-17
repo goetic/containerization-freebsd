@@ -66,6 +66,10 @@ pub struct Layout {
   pub variables: PathBuf,
   pub identifier: Vec<u8>,
   pub mac: [u8; 6],
+  /// More NAT network devices, by MAC address, for jails' interfaces
+  /// (`Network::Interfaces`): each moves into the jail that names it, and
+  /// Virtualization can't add them to a running machine.
+  pub interfaces: Vec<[u8; 6]>,
 }
 
 pub struct Machine {
@@ -117,6 +121,7 @@ impl Layout {
       mac: MACAddress::random_locally_administered()
         .map_err(Error::virtualization("make a MAC address"))?
         .ethernet_address(),
+      interfaces: Vec::new(),
     })
   }
 
@@ -177,12 +182,24 @@ impl Layout {
     );
     configuration.set_storage_devices(&storage);
 
-    if self.nat {
-      let network = VirtioNetworkDeviceConfiguration::new().map_err(failed("make the network device"))?;
-      network.set_attachment(Some(&NATNetworkDeviceAttachment::new().map_err(failed("make NAT"))?));
-      network.set_mac_address(&MACAddress::new(self.mac).map_err(failed("set the MAC address"))?);
-      configuration.set_network_devices(&[&network]);
-    }
+    let macs = self
+      .nat
+      .then_some(self.mac)
+      .into_iter()
+      .chain(self.interfaces.iter().copied());
+    let networks = macs
+      .map(|mac| {
+        let network = VirtioNetworkDeviceConfiguration::new().map_err(failed("make a network device"))?;
+        network.set_attachment(Some(&NATNetworkDeviceAttachment::new().map_err(failed("make NAT"))?));
+        network.set_mac_address(&MACAddress::new(mac).map_err(failed("set a MAC address"))?);
+        Ok(network)
+      })
+      .collect::<Result<Vec<_>>>()?;
+    let networks: Vec<&dyn NetworkDeviceConfiguration> = networks
+      .iter()
+      .map(|network| network as &dyn NetworkDeviceConfiguration)
+      .collect();
+    configuration.set_network_devices(&networks);
 
     // The control channel: a single-port virtio console, `/dev/ttyV0.0` in the
     // guest. Not a multiport console device: vtcon(4) attaching one stalls rc

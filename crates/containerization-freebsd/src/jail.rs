@@ -92,8 +92,21 @@ const UNMOUNT: &str = r#"set -e
 mount -p | awk -v under="$1/" 'index($2, under) == 1 && $3 != "zfs" { print $2 }' | tail -r |
   while read -r point; do umount "$(printf '%b' "$point")"; done"#;
 
+/// Moves the guest's network device with MAC address `$2` into the jail
+/// named `$1`, and prints its name.
+const CLAIM: &str = r#"set -e
+for device in $(ifconfig -l ether); do
+  if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $2"; then
+    ifconfig "$device" vnet "$1"
+    echo "$device"
+    exit 0
+  fi
+done
+echo "the guest has no network device with MAC address $2: is it in the layout's interfaces, and in no other jail?" >&2
+exit 1"#;
+
 /// How a jail reaches the network.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Network {
   /// It has none.
   None,
@@ -104,6 +117,30 @@ pub enum Network {
   /// guest, and pf NATs it out through the guest's address. Needs the
   /// machine's NAT (`Layout::nat`).
   Nat,
+  /// A stack of its own with these interfaces, as Containerization's
+  /// `interfaces`: the host reaches it at their addresses.
+  Interfaces(Vec<Interface>),
+}
+
+/// A jail's interface on Virtualization's NAT network, which the host is
+/// on, as Containerization's `NATInterface`: one of the machine's spare
+/// network devices (`Layout::interfaces`), which only that jail sees.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Interface {
+  /// The device's MAC address.
+  pub mac: [u8; 6],
+  /// Its IPv4 address and prefix length, such as `192.168.64.3/24`. The
+  /// NAT's DHCP server leases from the same network, so choose one it
+  /// hasn't leased.
+  pub address: String,
+  /// The default route's gateway, such as `192.168.64.1`; or none.
+  pub gateway: Option<String>,
+}
+
+impl Interface {
+  fn mac(&self) -> String {
+    self.mac.map(|byte| format!("{byte:02x}")).join(":")
+  }
 }
 
 /// A file system mounted into a jail, as Containerization's `Mount` is into
@@ -160,7 +197,7 @@ impl<'a> Jail<'a> {
   /// jail(8)'s, as `key=value` or a bare flag such as `mount.devfs`. A jail
   /// with a network gets the guest's resolver configuration if it has none
   /// of its own.
-  pub fn start(agent: &'a Agent, name: &str, path: &str, network: Network, parameters: &[&str]) -> Result<Self> {
+  pub fn start(agent: &'a Agent, name: &str, path: &str, network: &Network, parameters: &[&str]) -> Result<Self> {
     let (name_parameter, path_parameter, hostname) = (
       format!("name={name}"),
       format!("path={path}"),
@@ -181,6 +218,10 @@ impl<'a> Jail<'a> {
         None
       }
       Network::Nat => Some(epair(agent)?),
+      Network::Interfaces(_) => {
+        argv.push("vnet");
+        None
+      }
     };
     let interface = epair
       .as_ref()
@@ -342,7 +383,7 @@ impl<'a> Jail<'a> {
   /// Stops the jail, killing its processes, and waits for it to be gone,
   /// which a TCP connection it made can hold up for a minute. Then lifts
   /// its limits, unmounts what is mounted in it but datasets, and destroys
-  /// its epair.
+  /// its epair. Its interfaces' devices are back in the guest by then.
   pub fn stop(self) -> Result<()> {
     let ran = self
       .agent
@@ -355,7 +396,7 @@ impl<'a> Jail<'a> {
     // Only a VNET jail's interfaces are its own: another sees the guest's.
     let epairs = if vnet == "new" {
       self
-        .check(&["ifconfig", "-g", "epair"], QUICK)?
+        .rescue(&["ifconfig", "-g", "epair"])?
         .lines()
         .iter()
         .map(|inside| inside.trim().to_string())
@@ -388,9 +429,9 @@ impl<'a> Jail<'a> {
     Ok(())
   }
 
-  /// Sets up a new NAT jail's end of `epair`, and a networked jail's
-  /// resolver.
-  fn configure(&self, path: &str, network: Network, epair: Option<&Epair>) -> Result<()> {
+  /// Sets up a new NAT jail's end of `epair`, or its interfaces, and a
+  /// networked jail's resolver.
+  fn configure(&self, path: &str, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
       let inside = format!("{}b", epair.name);
       self.agent.check(
@@ -398,12 +439,38 @@ impl<'a> Jail<'a> {
         QUICK,
       )?;
     }
-    if network != Network::None {
+    if let Network::Interfaces(interfaces) = network {
+      self.rescue(&["ifconfig", "lo0", "inet", "127.0.0.1/8", "up"])?;
+      for interface in interfaces {
+        let claimed = self
+          .agent
+          .check(&["sh", "-c", CLAIM, "sh", &self.name, &interface.mac()], QUICK)?;
+        let device = claimed.stdout.trim();
+        self.rescue(&["ifconfig", device, "inet", &interface.address, "up"])?;
+        if let Some(gateway) = &interface.gateway {
+          self.rescue(&["route", "-q", "add", "default", gateway])?;
+        }
+      }
+    }
+    if *network != Network::None {
       self
         .agent
         .check(&["sh", "-c", RESOLVER, "sh", path], QUICK)?;
     }
     Ok(())
+  }
+
+  /// As `check`, running the guest's `/rescue` tool `argv` names, which
+  /// the jail needn't have.
+  fn rescue(&self, argv: &[&str]) -> Result<Ran> {
+    let exec = Exec {
+      argv: argv.iter().map(|arg| arg.to_string()).collect(),
+      jail: Some(self.name.clone()),
+      rescue: true,
+      ..Exec::default()
+    };
+
+    self.agent.check_exec(exec, QUICK)
   }
 
   fn jexec<'b>(&'b self, argv: &[&'b str]) -> Vec<&'b str> {

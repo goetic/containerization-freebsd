@@ -6,8 +6,8 @@
 
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
-  Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Jail, Limit, Mount, Network,
-  Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
+  Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Interface, Jail, Limit,
+  Mount, Network, Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -296,6 +296,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   image::create_disk(&images.path, 8 << 30).expect("make the images disk");
   layout.disks.push(images);
   layout.nat = true;
+  let spare = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01];
+  layout.interfaces.push(spare);
   let userland = userland();
   layout.shares.push(Share {
     tag: "userland".into(),
@@ -333,7 +335,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .mountpoint("images/jails/first")
     .expect("find the clone");
 
-  let jail = Jail::start(&machine.agent, "first", &root, Network::None, &["mount.devfs"]).expect("start a jail");
+  let jail = Jail::start(&machine.agent, "first", &root, &Network::None, &["mount.devfs"]).expect("start a jail");
   let ran = jail
     .check(&["freebsd-version", "-u"], SECONDS)
     .expect("run a command in the jail");
@@ -382,7 +384,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       &machine.agent,
       "first",
       &root,
-      network,
+      &network,
       &["mount.devfs", "allow.raw_sockets"],
     )
     .unwrap_or_else(|error| panic!("start a jail with {network:?}: {error}"));
@@ -493,8 +495,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
         },
         hostname: Some("web.test".into()),
         network: Network::Nat,
+        // Its own loopback, where nothing answers: getent asks DNS before
+        // /etc/hosts, and a nameserver off the guest would stall it until
+        // the Mac's network drops the query.
         dns: Some(Dns {
-          nameservers: vec!["192.0.2.53".into()],
+          nameservers: vec!["127.0.0.1".into()],
           search: vec!["test".into()],
           ..Dns::default()
         }),
@@ -536,7 +541,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   let lines = ran.lines();
   assert_eq!(
     lines[..3],
-    ["web.test", "search test", "nameserver 192.0.2.53"],
+    ["web.test", "search test", "nameserver 127.0.0.1"],
     "{ran:?}"
   );
   assert_eq!(
@@ -735,6 +740,63 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .check(&["rctl", "jail:limited:"], SECONDS)
     .expect("list its rules again");
   assert_eq!(ran.stdout, "", "its rules outlived it");
+
+  // One with its own interface on the NAT's network, which the host
+  // reaches; its device is the guest's again once it is gone.
+  let guest = machine
+    .agent
+    .check(
+      &sh("until ifconfig vtnet0 inet | grep -q 'inet '; do sleep 0.5; done; ifconfig vtnet0 inet | awk '/inet / { print $2 }'"),
+      SECONDS,
+    )
+    .expect("the guest's address");
+  let network = guest
+    .stdout
+    .trim()
+    .rsplit_once('.')
+    .expect("an IPv4 address")
+    .0
+    .to_string();
+  let reachable = containers
+    .create(
+      "reachable",
+      "images/userland@base",
+      Configuration {
+        network: Network::Interfaces(vec![Interface {
+          mac: spare,
+          address: format!("{network}.250/24"),
+          gateway: Some(format!("{network}.1")),
+        }]),
+        ..Configuration::default()
+      },
+    )
+    .expect("create a container with an interface");
+  let server = reachable
+    .exec(Exec {
+      argv: sh("echo reached | nc -N -l 8080")
+        .map(String::from)
+        .to_vec(),
+      ..Exec::default()
+    })
+    .expect("serve in the container");
+  let address: std::net::SocketAddr = format!("{network}.250:8080").parse().expect("its address");
+  let mut stream = eventually(|| std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok());
+  stream
+    .set_read_timeout(Some(SECONDS))
+    .expect("time out reading");
+  let mut answer = String::new();
+  stream.read_to_string(&mut answer).expect("read from it");
+  assert_eq!(answer, "reached\n");
+  // nc reads until the host closes.
+  drop(stream);
+  assert_eq!(finish(&server), (String::new(), Exit::Code(0)));
+  reachable
+    .delete()
+    .expect("delete the container with an interface");
+  machine
+    .agent
+    .check(&sh("ifconfig -a | grep -q 'ether 02:00:5e:10:00:01'"), SECONDS)
+    .expect("its device is back in the guest");
 
   // One whose handle is gone, deleted by id, mounts and all.
   drop(
