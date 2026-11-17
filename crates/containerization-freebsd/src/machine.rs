@@ -68,7 +68,9 @@ pub struct Layout {
   pub mac: [u8; 6],
   /// More NAT network devices, by MAC address, for jails' interfaces
   /// (`Network::Interfaces`): each moves into the jail that names it, and
-  /// Virtualization can't add them to a running machine.
+  /// Virtualization can't add them to a running machine. The guest runs
+  /// DHCP only on `vtnet0`: `nat`'s device, or without `nat` the first of
+  /// these.
   pub interfaces: Vec<[u8; 6]>,
 }
 

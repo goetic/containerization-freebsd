@@ -313,6 +313,35 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   machine
     .mount_share("userland", "/mnt/userland")
     .expect("mount the userland's share");
+  // The guest's DHCP runs on its NAT device only, leaving the spare for a
+  // jail to claim. rc starts the agent before the network, and devd after.
+  machine
+    .agent
+    .check(&sh("until pgrep -qx devd; do sleep 0.5; done"), SECONDS)
+    .expect("rc configures the network");
+  let mac = layout.mac.map(|byte| format!("{byte:02x}")).join(":");
+  machine
+    .agent
+    .check(
+      &sh(&format!(
+        "ifconfig vtnet0 | grep -q 'ether {mac}' && ifconfig vtnet0 | grep -q ACCEPT_RTADV"
+      )),
+      SECONDS,
+    )
+    .expect("vtnet0 is the NAT device, taking router advertisements");
+  machine
+    .agent
+    .check(
+      &sh(
+        "for device in $(ifconfig -l ether); do \
+           if ifconfig \"$device\" ether | grep -q 'ether 02:00:5e:10:00:01'; then \
+             ! ifconfig \"$device\" inet | grep -q 'inet '; exit; \
+           fi; \
+         done; exit 1",
+      ),
+      SECONDS,
+    )
+    .expect("the spare has no address");
 
   let device = machine.disk_device("images").expect("find the images disk");
   let zfs = Zfs::new(&machine.agent);

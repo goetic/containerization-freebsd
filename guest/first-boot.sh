@@ -19,5 +19,9 @@ sysrc cfbsd_agent_enable=YES
 # The image boots at once already (autoboot_delay=-1). Later boots skip the
 # first boot's package upgrade, which needs the network.
 sysrc firstboot_pkg_upgrade_enable=NO
+# DHCP and IPv6 autoconfiguration on the first network device only, the NAT
+# device: the others stay unconfigured until a jail claims one.
+sysrc -x ifconfig_DEFAULT
+sysrc ifconfig_vtnet0=SYNCDHCP ifconfig_vtnet0_ipv6="inet6 accept_rtadv"
 
 service cfbsd_agent start
