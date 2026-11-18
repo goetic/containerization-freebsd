@@ -11,18 +11,21 @@ members = [
     "crates/containerization-freebsd",
     "crates/containerization-freebsd-agent",
     "crates/containerization-freebsd-protocol",
+    "crates/containerization-freebsd-sys",
     "crates/containerization-freebsd-test",
 ]
 default-members = [
     "crates/containerization-freebsd",
     "crates/containerization-freebsd-agent",
     "crates/containerization-freebsd-protocol",
+    "crates/containerization-freebsd-sys",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 containerization-freebsd = { path = "crates/containerization-freebsd", version = "0.1.0" }
 containerization-freebsd-protocol = { path = "crates/containerization-freebsd-protocol", version = "0.1.0" }
+containerization-freebsd-sys = { path = "crates/containerization-freebsd-sys" }
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -9,8 +9,8 @@ mod listener;
 mod process;
 mod relay;
 mod session;
-mod sys;
 mod user;
 
+use containerization_freebsd_sys as sys;
 pub use session::serve;
 pub use sys::make_raw;

@@ -36,6 +36,7 @@ Pre-release.
 | `crates/containerization-freebsd` | The library: images, machines, and the agent client. |
 | `crates/containerization-freebsd-protocol` | The protocol between host and agent. |
 | `crates/containerization-freebsd-agent` | The guest agent. |
+| `crates/containerization-freebsd-sys` | The agent's system calls, its only unsafe code. |
 | `crates/containerization-freebsd-test` | The integration suite. |
 | `guest/` | The guest bundle: virtiofs patches, agent setup, and build scripts. |
 

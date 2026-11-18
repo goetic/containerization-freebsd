@@ -1,12 +1,13 @@
-//! The calls std has no safe API for: pseudo-terminals, raw mode, signals,
-//! waiting for an exit without reaping it, jails, what a process takes on
-//! before it starts, and sockets opened from inside a jail. The crate's only
-//! unsafe code.
+//! The calls containerization-freebsd's guest agent makes that std has no
+//! safe API for: pseudo-terminals, raw mode, signals, waiting for an exit
+//! without reaping it, the clock, jails, what a process takes on before it
+//! starts, and sockets opened from inside a jail. The agent's only unsafe
+//! code.
+//!
+//! The descriptors it opens close on exec, but are inheritable for a moment
+//! first: spawn processes from one thread only, as the agent's session loop
+//! does, or a process spawned meanwhile holds them.
 
-#![allow(unsafe_code)]
-
-use crate::user::Ids;
-use containerization_freebsd_protocol::{Limit, WindowSize};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
@@ -25,6 +26,31 @@ fn check(result: libc::c_int) -> io::Result<libc::c_int> {
   } else {
     Ok(result)
   }
+}
+
+/// A terminal's size, in characters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowSize {
+  pub rows: u16,
+  pub columns: u16,
+}
+
+/// A resource limit: setrlimit(2)'s resource number, and its soft and hard
+/// values, any past `RLIM_INFINITY` being none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limit {
+  pub resource: i32,
+  pub soft: u64,
+  pub hard: u64,
+}
+
+/// The user and groups a process takes on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ids {
+  pub uid: u32,
+  pub gid: u32,
+  /// Supplementary groups.
+  pub groups: Vec<u32>,
 }
 
 /// Puts a terminal in raw mode, at 115200 baud: bytes pass as they are, with
@@ -46,9 +72,9 @@ pub fn make_raw(terminal: &impl AsFd) -> io::Result<()> {
   Ok(())
 }
 
-/// A pseudo-terminal of `size`: the end the agent reads and writes, and the
+/// A pseudo-terminal of `size`: the end the caller reads and writes, and the
 /// end a process takes as its terminal.
-pub(crate) fn open_terminal(size: WindowSize) -> io::Result<(File, OwnedFd)> {
+pub fn open_terminal(size: WindowSize) -> io::Result<(File, OwnedFd)> {
   let (mut controller, mut child) = (-1, -1);
   let mut size = window(size);
 
@@ -67,8 +93,7 @@ pub(crate) fn open_terminal(size: WindowSize) -> io::Result<(File, OwnedFd)> {
   let (controller, child) = unsafe { (OwnedFd::from_raw_fd(controller), OwnedFd::from_raw_fd(child)) };
 
   // openpty leaves both inheritable, so every process spawned later would hold
-  // them, and the terminal would not end until those exit too. Only the
-  // session loop spawns processes, so none can start before this.
+  // them, and the terminal would not end until those exit too.
   close_on_exec(controller.as_fd())?;
   close_on_exec(child.as_fd())?;
   Ok((File::from(controller), child))
@@ -85,7 +110,7 @@ fn close_on_exec(fd: BorrowedFd) -> io::Result<()> {
 
 /// Has the command's process start a session of its own, whose controlling
 /// terminal is the process's stdin.
-pub(crate) fn take_terminal_on_exec(command: &mut Command) {
+pub fn take_terminal_on_exec(command: &mut Command) {
   // SAFETY: between fork and exec, the closure calls only setsid and ioctl,
   // which are async-signal-safe, and allocates nothing.
   unsafe {
@@ -97,7 +122,7 @@ pub(crate) fn take_terminal_on_exec(command: &mut Command) {
   }
 }
 
-pub(crate) fn resize(terminal: &File, size: WindowSize) -> io::Result<()> {
+pub fn resize(terminal: &File, size: WindowSize) -> io::Result<()> {
   let size = window(size);
 
   // SAFETY: TIOCSWINSZ reads a winsize, which outlives the call.
@@ -116,7 +141,7 @@ fn window(size: WindowSize) -> libc::winsize {
 
 /// The running jail named `name`: its id, and its root's path in the guest.
 #[cfg(target_os = "freebsd")]
-pub(crate) fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
+pub fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
   use std::ffi::{CStr, OsString};
   use std::os::unix::ffi::OsStringExt;
 
@@ -158,7 +183,7 @@ pub(crate) fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
 }
 
 #[cfg(not(target_os = "freebsd"))]
-pub(crate) fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
+pub fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
   Err(io::Error::new(
     io::ErrorKind::Unsupported,
     format!("jail {name:?}: jails are FreeBSD's"),
@@ -166,7 +191,7 @@ pub(crate) fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
 }
 
 /// The id of the running jail named `name`, if a name is given.
-pub(crate) fn jail_id(name: Option<&str>) -> io::Result<Option<libc::c_int>> {
+pub fn jail_id(name: Option<&str>) -> io::Result<Option<libc::c_int>> {
   name
     .map(|name| find_jail(name).map(|(jid, _)| jid))
     .transpose()
@@ -186,12 +211,12 @@ fn attach(_: libc::c_int) -> io::Result<()> {
 }
 
 /// What a process takes on before it starts.
-pub(crate) struct Entry {
-  pub(crate) jail: Option<libc::c_int>,
-  pub(crate) limits: Vec<Limit>,
-  pub(crate) umask: Option<u16>,
-  pub(crate) ids: Option<Ids>,
-  pub(crate) cwd: Option<CString>,
+pub struct Entry {
+  pub jail: Option<libc::c_int>,
+  pub limits: Vec<Limit>,
+  pub umask: Option<u16>,
+  pub ids: Option<Ids>,
+  pub cwd: Option<CString>,
 }
 
 /// Has the command's process take on `entry` between fork and exec, in
@@ -200,7 +225,7 @@ pub(crate) struct Entry {
 // rlim_t is signed on FreeBSD, and mode_t is u16 on FreeBSD and macOS but
 // u32 on Linux.
 #[allow(clippy::unnecessary_cast)]
-pub(crate) fn enter_on_exec(command: &mut Command, entry: Entry) {
+pub fn enter_on_exec(command: &mut Command, entry: Entry) {
   let rlim = |value: u64| value.min(libc::RLIM_INFINITY as u64) as libc::rlim_t;
   let limits: Vec<(libc::c_int, libc::rlimit)> = entry
     .limits
@@ -210,7 +235,7 @@ pub(crate) fn enter_on_exec(command: &mut Command, entry: Entry) {
         rlim_cur: rlim(limit.soft),
         rlim_max: rlim(limit.hard),
       };
-      (limit.resource.0, rlimit)
+      (limit.resource, rlimit)
     })
     .collect();
   let umask = entry.umask.map(|umask| umask as libc::mode_t);
@@ -265,7 +290,7 @@ unsafe impl Sync for Rescue {}
 /// `argv[0]`, with `argv`, once it has taken on all else: in its jail too,
 /// whose root needn't hold the tool. The environment is the agent's, with
 /// the command's on top.
-pub(crate) fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> {
+pub fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> {
   use std::collections::BTreeMap;
   use std::os::unix::ffi::OsStrExt;
 
@@ -328,7 +353,7 @@ fn fexecve(_: &Rescue) -> io::Error {
 }
 
 /// Sets the clock to `seconds` and `nanoseconds` past the Unix epoch.
-pub(crate) fn set_time(seconds: u64, nanoseconds: u32) -> io::Result<()> {
+pub fn set_time(seconds: u64, nanoseconds: u32) -> io::Result<()> {
   let time = libc::timespec {
     tv_sec: seconds as libc::time_t,
     tv_nsec: libc::c_long::from(nanoseconds.min(999_999_999)),
@@ -340,7 +365,7 @@ pub(crate) fn set_time(seconds: u64, nanoseconds: u32) -> io::Result<()> {
 }
 
 /// Sends `signal` to `target`: a pid, or a process group's id negated.
-pub(crate) fn signal(target: libc::pid_t, signal: i32) -> io::Result<()> {
+pub fn signal(target: libc::pid_t, signal: i32) -> io::Result<()> {
   // SAFETY: kill touches no memory.
   check(unsafe { libc::kill(target, signal) })?;
   Ok(())
@@ -348,7 +373,7 @@ pub(crate) fn signal(target: libc::pid_t, signal: i32) -> io::Result<()> {
 
 /// Waits for `pid` to exit, leaving it for std to reap. Until then, its pid
 /// cannot be another process's.
-pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
+pub fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
   loop {
     let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
 
@@ -370,19 +395,19 @@ pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
 }
 
 /// `path` as system calls take it.
-pub(crate) fn path(path: &str) -> io::Result<CString> {
+pub fn path(path: &str) -> io::Result<CString> {
   CString::new(path).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{path:?} has a NUL")))
 }
 
 /// A socket's address, as the kernel takes it.
-pub(crate) struct SocketAddress {
+pub struct SocketAddress {
   storage: libc::sockaddr_storage,
   length: libc::socklen_t,
 }
 
 impl SocketAddress {
   /// Port `port` on 127.0.0.1, and on ::1.
-  pub(crate) fn loopback(port: u16) -> [Self; 2] {
+  pub fn loopback(port: u16) -> [Self; 2] {
     // SAFETY: all zeros is an unspecified address of either family, given
     // its fields below.
     let (mut ipv4, mut ipv6): (libc::sockaddr_in, libc::sockaddr_in6) = unsafe { (mem::zeroed(), mem::zeroed()) };
@@ -400,7 +425,7 @@ impl SocketAddress {
   }
 
   /// The Unix socket at `path`.
-  pub(crate) fn unix(path: &CStr) -> io::Result<Self> {
+  pub fn unix(path: &CStr) -> io::Result<Self> {
     // SAFETY: all zeros is an unnamed Unix socket's address, named below.
     let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -450,7 +475,7 @@ impl SocketAddress {
 
 /// Connects to the first of `addresses` that answers, from a child process
 /// in jail `jid`, so paths and loopback are the jail's.
-pub(crate) fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::Result<OwnedFd> {
+pub fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::Result<OwnedFd> {
   // SAFETY: the child makes only system calls, on what it was handed, and
   // allocates nothing.
   let connected = unsafe {
@@ -478,7 +503,7 @@ pub(crate) fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::R
 /// With `mode`, it is made with those permissions.
 // mode_t is u16 on FreeBSD and macOS, but u32 on Linux.
 #[allow(clippy::unnecessary_cast)]
-pub(crate) fn listen_in(jid: libc::c_int, path: &CStr, mode: Option<u16>) -> io::Result<OwnedFd> {
+pub fn listen_in(jid: libc::c_int, path: &CStr, mode: Option<u16>) -> io::Result<OwnedFd> {
   let address = SocketAddress::unix(path)?;
   let mask = mode.map(|mode| !mode & 0o777);
 
@@ -504,7 +529,7 @@ pub(crate) fn listen_in(jid: libc::c_int, path: &CStr, mode: Option<u16>) -> io:
 
 /// Removes the socket at `path`, if there is one, from a child process in
 /// jail `jid`.
-pub(crate) fn remove_socket_in(jid: libc::c_int, path: &CStr) -> io::Result<()> {
+pub fn remove_socket_in(jid: libc::c_int, path: &CStr) -> io::Result<()> {
   // SAFETY: as in `connect_in`.
   unsafe { in_jail(jid, || unlink_socket(path).map(|()| -1)) }?;
   Ok(())
@@ -683,15 +708,13 @@ fn receive_fd(socket: &UnixStream) -> io::Result<Option<OwnedFd>> {
     OwnedFd::from_raw_fd(ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>()))
   };
 
-  // Only the session loop receives descriptors and spawns processes, so
-  // none can start before this.
   close_on_exec(fd.as_fd())?;
   Ok(Some(fd))
 }
 
 /// Waits for a connection to `listener`, or for `stop` to be readable:
 /// whether a connection came.
-pub(crate) fn wait_for_connection(listener: BorrowedFd, stop: BorrowedFd) -> io::Result<bool> {
+pub fn wait_for_connection(listener: BorrowedFd, stop: BorrowedFd) -> io::Result<bool> {
   let mut descriptors = [listener, stop].map(|fd| libc::pollfd {
     fd: fd.as_raw_fd(),
     events: libc::POLLIN,

@@ -26,3 +26,6 @@ tempfile = "3"
 
 [features]
 kernel-messages = []
+
+[lints.rust]
+unsafe_code = "deny"

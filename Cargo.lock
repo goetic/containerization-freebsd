@@ -98,12 +98,20 @@ name = "containerization-freebsd-agent"
 version = "0.1.0"
 dependencies = [
  "containerization-freebsd-protocol",
+ "containerization-freebsd-sys",
  "libc",
 ]
 
 [[package]]
 name = "containerization-freebsd-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "containerization-freebsd-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "containerization-freebsd-test"

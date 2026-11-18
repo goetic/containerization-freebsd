@@ -50,7 +50,7 @@ impl Process {
 
   pub(crate) fn resize(&self, size: WindowSize) -> io::Result<()> {
     match &self.terminal {
-      Some(terminal) => sys::resize(terminal, size),
+      Some(terminal) => sys::resize(terminal, window(size)),
       None => Ok(()),
     }
   }
@@ -137,13 +137,32 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<()> {
     command,
     sys::Entry {
       jail,
-      limits: exec.limits.clone(),
+      limits: exec
+        .limits
+        .iter()
+        .map(|limit| sys::Limit {
+          resource: limit.resource.0,
+          soft: limit.soft,
+          hard: limit.hard,
+        })
+        .collect(),
       umask: exec.umask,
-      ids,
+      ids: ids.map(|ids| sys::Ids {
+        uid: ids.uid,
+        gid: ids.gid,
+        groups: ids.groups,
+      }),
       cwd,
     },
   );
   Ok(())
+}
+
+fn window(size: WindowSize) -> sys::WindowSize {
+  sys::WindowSize {
+    rows: size.rows,
+    columns: size.columns,
+  }
 }
 
 fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
@@ -172,7 +191,7 @@ fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
 }
 
 fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Result<Handle> {
-  let (terminal, child_end) = sys::open_terminal(size)?;
+  let (terminal, child_end) = sys::open_terminal(window(size))?;
   let (reader, writer, resizer) = (terminal.try_clone()?, terminal.try_clone()?, terminal);
   command
     .stdin(child_end.try_clone()?)

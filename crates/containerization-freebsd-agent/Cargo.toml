@@ -10,7 +10,8 @@ version = "0.1.0"
 
 [dependencies]
 containerization-freebsd-protocol.workspace = true
+containerization-freebsd-sys.workspace = true
 libc.workspace = true
 
 [lints.rust]
-unsafe_code = "deny"
+unsafe_code = "forbid"

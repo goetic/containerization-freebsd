@@ -47,4 +47,5 @@ the host will.
   Eof; an Error, or the session's end, leaves the file for a later Listen
   to replace.
 
-Unsafe code is confined to `src/sys.rs`.
+The agent forbids unsafe code: the system calls std has no safe API for are
+`containerization-freebsd-sys`'s.

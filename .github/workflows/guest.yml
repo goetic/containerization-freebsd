@@ -17,6 +17,7 @@ on:
       - "guest/**"
       - "crates/containerization-freebsd-agent/**"
       - "crates/containerization-freebsd-protocol/**"
+      - "crates/containerization-freebsd-sys/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"

@@ -3,6 +3,11 @@
 //!
 //! Guest memory is reachable only through a custom virtio device, which
 //! breaks save (`VZErrorDomain` 11): hence the `kernel-messages` feature.
+//!
+//! The library's only unsafe code: copying out of Virtualization's mapping
+//! of guest memory.
+
+#![allow(unsafe_code)]
 
 use crate::machine::on_queue;
 use dispatch2::{DispatchQueue, DispatchRetained};
