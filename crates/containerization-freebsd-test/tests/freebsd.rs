@@ -119,6 +119,7 @@ fn prepares_boots_and_restores() {
     path: shared.clone(),
     read_only: false,
   });
+  layout.nat = true;
   layout
     .validate_save_restore()
     .expect("the layout can be saved");
@@ -217,6 +218,15 @@ fn prepares_boots_and_restores() {
   restored
     .wait_ready(SECONDS)
     .expect("the agent answers after restoring");
+  // Its NAT network as saved, once its link is back: a default route,
+  // through which the Mac answers.
+  restored
+    .agent
+    .check(
+      &sh("ping -c 1 -t 5 $(route -n get default | awk '/gateway:/ { print $2 }')"),
+      SECONDS,
+    )
+    .expect("ping the gateway after restoring");
   let guest: u64 = restored
     .agent
     .check(&["date", "+%s"], SECONDS)
@@ -310,6 +320,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   machine
     .wait_ready(Duration::from_secs(300))
     .expect("the agent starts");
+  // Ready with its NAT network up, though rc starts the agent first.
+  machine
+    .agent
+    .check(&["route", "-n", "get", "default"], SECONDS)
+    .expect("a default route");
   machine
     .mount_share("userland", "/mnt/userland")
     .expect("mount the userland's share");
@@ -801,10 +816,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   // once it is gone.
   let guest = machine
     .agent
-    .check(
-      &sh("until ifconfig vtnet0 inet | grep -q 'inet '; do sleep 0.5; done; ifconfig vtnet0 inet | awk '/inet / { print $2 }'"),
-      SECONDS,
-    )
+    .check(&sh("ifconfig vtnet0 inet | awk '/inet / { print $2 }'"), SECONDS)
     .expect("the guest's address");
   let network = guest
     .stdout

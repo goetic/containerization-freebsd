@@ -28,6 +28,12 @@ use virtualization::{
 /// jails' limits and statistics.
 pub const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\nkern.racct.enable=1\n";
 
+/// Waits for the guest's default route, and for its interface's link.
+const ROUTED: &str = r#"until interface=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2 }') &&
+  [ -n "$interface" ] && ifconfig "$interface" | grep -q 'status: active'; do
+  sleep 0.1
+done"#;
+
 /// A host directory the guest mounts with `Machine::mount_share`.
 ///
 /// On a case-insensitive volume, macOS's default, names differing only in
@@ -77,6 +83,7 @@ pub struct Layout {
 pub struct Machine {
   pub agent: Agent,
   clock: ClockSync,
+  nat: bool,
   #[cfg_attr(not(feature = "kernel-messages"), allow(dead_code))]
   debug: DebugDevices,
   machine: VirtualMachine,
@@ -281,6 +288,7 @@ impl Layout {
     Ok(Machine {
       clock: ClockSync::start(agent.share()),
       agent,
+      nat: self.nat,
       debug,
       machine,
       queue,
@@ -434,11 +442,29 @@ done; true"#;
     on_queue(&self.queue, || machine.state())
   }
 
-  /// Waits for a session with the guest's agent; returns the seconds it took.
+  /// Waits for a session with the guest's agent, and with NAT for the
+  /// guest's default route and its interface's link: rc sets up the route
+  /// after starting the agent, and a restored machine's link comes up
+  /// after the agent answers. Returns the seconds it took.
   pub fn wait_ready(&self, timeout: Duration) -> Result<f64> {
     let started = Instant::now();
 
     self.agent.wait_ready(timeout)?;
+    if self.nat {
+      let routed = ["sh", "-c", ROUTED];
+      match self
+        .agent
+        .check(&routed, timeout.saturating_sub(started.elapsed()))
+      {
+        Err(Error::Timeout(_)) => {
+          return Err(Error::Timeout(format!(
+            "the guest's NAT network was not up within {}s",
+            timeout.as_secs()
+          )));
+        }
+        result => result?,
+      };
+    }
     Ok(started.elapsed().as_secs_f64())
   }
 

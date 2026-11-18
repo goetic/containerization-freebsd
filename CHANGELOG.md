@@ -78,6 +78,10 @@
 - Stopping a jail ends its processes, then drops the TCP connections they
   left, so one in TIME_WAIT no longer holds the jail up for a minute: with
   the guest's tcpdrop, or a VNET jail's own, which an image may lack.
+- Fixes `Machine::wait_ready` returning before a machine with NAT has its
+  network: rc starts the agent before it sets up the default route, and a
+  restored machine's link comes up after the agent answers. It waits for
+  both.
 - Fixes a NAT jail needing ifconfig and route of its own: its network is
   set up with the guest's `/rescue` tools, as an interface jail's is.
 - Fixes a relay losing the host's last Data when the host's end finished
