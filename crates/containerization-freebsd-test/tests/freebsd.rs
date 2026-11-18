@@ -344,18 +344,16 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       SECONDS,
     )
     .expect("vtnet0 is the NAT device, taking router advertisements");
+  let unconfigured = sh(
+    "for device in $(ifconfig -l ether); do \
+       if ifconfig \"$device\" ether | grep -q 'ether 02:00:5e:10:00:01'; then \
+         ! ifconfig \"$device\" inet | grep -q 'inet '; exit; \
+       fi; \
+     done; exit 1",
+  );
   machine
     .agent
-    .check(
-      &sh(
-        "for device in $(ifconfig -l ether); do \
-           if ifconfig \"$device\" ether | grep -q 'ether 02:00:5e:10:00:01'; then \
-             ! ifconfig \"$device\" inet | grep -q 'inet '; exit; \
-           fi; \
-         done; exit 1",
-      ),
-      SECONDS,
-    )
+    .check(&unconfigured, SECONDS)
     .expect("the spare has no address");
 
   let device = machine.disk_device("images").expect("find the images disk");
@@ -811,18 +809,19 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("list its rules again");
   assert_eq!(ran.stdout, "", "its rules outlived it");
 
-  // One with its own interface on the NAT's network, which the host
-  // reaches and which reaches the internet; its device is the guest's again
-  // once it is gone.
-  let guest = machine
+  // One with its own interface on the NAT's network, at an address the
+  // NAT's DHCP server leased, which the host reaches and which reaches the
+  // internet; its device is the guest's again once it is gone.
+  let interface = Interface::leased(&machine.agent, spare).expect("lease an address");
+  assert_eq!(interface.gateway.as_deref(), Some(gateway.as_str()), "{interface:?}");
+  machine
     .agent
-    .check(&sh("ifconfig vtnet0 inet | awk '/inet / { print $2 }'"), SECONDS)
-    .expect("the guest's address");
-  let network = guest
-    .stdout
-    .trim()
-    .rsplit_once('.')
-    .expect("an IPv4 address")
+    .check(&unconfigured, SECONDS)
+    .expect("leasing configures nothing");
+  let address = interface
+    .address
+    .split_once('/')
+    .expect("a prefix length")
     .0
     .to_string();
   let reachable = containers
@@ -830,11 +829,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       "reachable",
       "images/userland@base",
       Configuration {
-        network: Network::Interfaces(vec![Interface {
-          mac: spare,
-          address: format!("{network}.250/24"),
-          gateway: Some(format!("{network}.1")),
-        }]),
+        network: Network::Interfaces(vec![interface]),
         ..Configuration::default()
       },
     )
@@ -847,7 +842,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       ..Exec::default()
     })
     .expect("serve in the container");
-  let address: std::net::SocketAddr = format!("{network}.250:8080").parse().expect("its address");
+  let address: std::net::SocketAddr = format!("{address}:8080").parse().expect("its address");
   let mut stream = eventually(|| std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok());
   stream
     .set_read_timeout(Some(SECONDS))

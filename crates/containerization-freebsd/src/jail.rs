@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::quota::{self, Statistics};
 use crate::socket::{SocketRelay, UnixSocket};
 use containerization_freebsd_protocol::{Address, Connect};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -119,6 +120,27 @@ done
 echo "the guest has no network device with MAC address $2: is it in the layout's interfaces, and in no other jail?" >&2
 exit 1"#;
 
+/// Prints the lease the NAT's DHCP server gives the guest's network device
+/// with MAC address `$1`, as dhclient.leases(5), configuring nothing with
+/// it: dhclient's script does nothing, and dhclient is killed once bound.
+const LEASE: &str = r#"set -e
+for device in $(ifconfig -l ether); do
+  if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $1"; then
+    work=$(mktemp -d)
+    trap 'pkill -f "^dhclient: $device( |\$)" || :
+      while pgrep -qf "^dhclient: $device( |\$)"; do sleep 0.1; done
+      ifconfig "$device" down
+      rm -rf "$work"' EXIT
+    printf 'timeout 30;\nscript "/usr/bin/true";\n' >"$work/conf"
+    ifconfig "$device" up
+    dhclient -c "$work/conf" -l "$work/leases" "$device" >/dev/null 2>&1
+    cat "$work/leases" 2>/dev/null || :
+    exit 0
+  fi
+done
+echo "the guest has no network device with MAC address $1: is it in the layout's interfaces, and in no jail?" >&2
+exit 1"#;
+
 /// How a jail reaches the network.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Network {
@@ -145,16 +167,56 @@ pub struct Interface {
   pub mac: [u8; 6],
   /// Its IPv4 address and prefix length, such as `192.168.64.3/24`. The
   /// NAT's DHCP server leases from the same network, so choose one it
-  /// hasn't leased.
+  /// hasn't leased, or take one it has: `Interface::leased`.
   pub address: String,
   /// The default route's gateway, such as `192.168.64.1`; or none.
   pub gateway: Option<String>,
 }
 
 impl Interface {
-  fn mac(&self) -> String {
-    self.mac.map(|byte| format!("{byte:02x}")).join(":")
+  /// One on the spare device with MAC address `mac`, at the address the
+  /// NAT's DHCP server leases it, which the server gives no other machine
+  /// while the lease lasts, and with the lease's router as its gateway.
+  /// Nothing renews the lease, but the server leases a MAC address the
+  /// same address again. Lease before a jail claims the device.
+  pub fn leased(agent: &Agent, mac: [u8; 6]) -> Result<Self> {
+    let colons = colons(mac);
+    let ran = agent.check(&["sh", "-c", LEASE, "sh", &colons], LEASING)?;
+    let (address, gateway) =
+      lease(&ran.stdout).ok_or_else(|| Error::Guest(format!("the NAT's DHCP server leased {colons} no address")))?;
+
+    Ok(Self { mac, address, gateway })
   }
+}
+
+/// dhclient's timeout in `LEASE`, and more.
+const LEASING: Duration = Duration::from_secs(45);
+
+/// `mac` as ifconfig prints it.
+fn colons(mac: [u8; 6]) -> String {
+  mac.map(|byte| format!("{byte:02x}")).join(":")
+}
+
+/// The address, with its prefix length, and the first router of the last
+/// lease in `leases`, a dhclient.leases(5) file.
+fn lease(leases: &str) -> Option<(String, Option<String>)> {
+  let (_, last) = leases.rsplit_once("lease {")?;
+  let value = |key: &str| {
+    last.lines().find_map(|line| {
+      line
+        .trim()
+        .strip_prefix(key)?
+        .strip_suffix(';')
+        .map(str::trim)
+    })
+  };
+  let address: Ipv4Addr = value("fixed-address ")?.parse().ok()?;
+  let mask: Ipv4Addr = value("option subnet-mask ")?.parse().ok()?;
+  let gateway = value("option routers ")
+    .and_then(|routers| routers.split(',').next())
+    .map(|router| router.trim().to_string());
+
+  Some((format!("{address}/{}", u32::from(mask).count_ones()), gateway))
 }
 
 /// A file system mounted into a jail, as Containerization's `Mount` is into
@@ -461,7 +523,7 @@ impl<'a> Jail<'a> {
       for interface in interfaces {
         let claimed = self
           .agent
-          .check(&["sh", "-c", CLAIM, "sh", &self.name, &interface.mac()], QUICK)?;
+          .check(&["sh", "-c", CLAIM, "sh", &self.name, &colons(interface.mac)], QUICK)?;
         let device = claimed.stdout.trim();
         self.rescue(&["ifconfig", device, "inet", &interface.address, "up"])?;
         if let Some(gateway) = &interface.gateway {
@@ -533,6 +595,31 @@ mod tests {
   use std::os::unix::fs::symlink;
   use std::path::Path;
   use std::process::Command;
+
+  #[test]
+  fn reads_the_last_lease() {
+    let leases = "lease {\n  interface \"vtnet1\";\n  fixed-address 192.168.64.98;\n  option subnet-mask 255.255.255.0;\n}\n\
+                  lease {\n  interface \"vtnet1\";\n  fixed-address 192.168.64.140;\n  option subnet-mask 255.255.0.0;\n  \
+                  option routers 192.168.64.1, 192.168.64.2;\n  renew 3 2026/11/18 02:00:00;\n}\n";
+
+    assert_eq!(
+      lease(leases),
+      Some(("192.168.64.140/16".into(), Some("192.168.64.1".into())))
+    );
+  }
+
+  #[test]
+  fn reads_a_lease_without_a_router() {
+    let leases = "lease {\n  fixed-address 10.0.0.5;\n  option subnet-mask 255.255.255.0;\n}\n";
+
+    assert_eq!(lease(leases), Some(("10.0.0.5/24".into(), None)));
+  }
+
+  #[test]
+  fn reads_no_lease_from_nothing() {
+    assert_eq!(lease(""), None);
+    assert_eq!(lease("lease {\n  option subnet-mask 255.255.255.0;\n}\n"), None);
+  }
 
   /// What RESOLVE makes of `path` in `root`, through the host's sh: the
   /// guest path it prints, or its error.

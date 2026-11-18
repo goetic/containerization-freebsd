@@ -68,9 +68,11 @@
   network, as Containerization's `interfaces`, so the host reaches them at
   their addresses: `Network::Interfaces`, each a spare network device from
   `Layout::interfaces`, moved into the jail. `Jail::start` takes the
-  network by reference. Preparing a base now runs DHCP and IPv6
-  autoconfiguration on the first network device only, so spare devices
-  stay unconfigured until a jail claims one: prepare older bases again.
+  network by reference. `Interface::leased` takes an address the NAT's DHCP
+  server leases the device, which it gives no other machine. Preparing a
+  base now runs DHCP and IPv6 autoconfiguration on the first network device
+  only, so spare devices stay unconfigured until a jail claims one: prepare
+  older bases again.
 - Keeps the guest's clock with the host's, as Containerization's TimeSyncer
   does: at each new session with the agent, as after a boot or a restore,
   on resuming, and every 30 seconds while the machine runs. Also protocol
