@@ -4,9 +4,11 @@ use std::fmt;
 use std::str::FromStr;
 
 const DOCKER_HUB: &str = "docker.io";
+const LEGACY_DOCKER_HUB: &str = "index.docker.io";
 
 /// An image's name, and the tag or digest that picks a version of it, as
-/// Docker normalizes them: `alpine` is `docker.io/library/alpine:latest`.
+/// Docker normalizes them: `alpine`, `docker.io/alpine` and
+/// `index.docker.io/alpine` are all `docker.io/library/alpine:latest`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Reference {
   /// The registry, such as `ghcr.io` or `localhost:5000`.
@@ -32,10 +34,19 @@ impl Reference {
       None => (rest, None),
     };
 
-    let (domain, repository) = match name.split_once('/') {
-      Some((first, rest)) if first.contains(['.', ':']) || first == "localhost" => (first, rest.to_string()),
-      _ if name.contains('/') => (DOCKER_HUB, name.to_string()),
-      _ => (DOCKER_HUB, format!("library/{name}")),
+    let (domain, remainder) = match name.split_once('/') {
+      Some((first, rest)) if first.contains(['.', ':']) || first == "localhost" => (first, rest),
+      _ => (DOCKER_HUB, name),
+    };
+    let domain = if domain == LEGACY_DOCKER_HUB {
+      DOCKER_HUB
+    } else {
+      domain
+    };
+    let repository = if domain == DOCKER_HUB && !remainder.contains('/') {
+      format!("library/{remainder}")
+    } else {
+      remainder.to_string()
     };
 
     if domain.is_empty()
@@ -161,6 +172,12 @@ mod tests {
   #[test]
   fn normalizes_as_docker_does() {
     assert_eq!(normalized("alpine"), "docker.io/library/alpine:latest");
+    assert_eq!(normalized("docker.io/alpine"), "docker.io/library/alpine:latest");
+    assert_eq!(normalized("index.docker.io/alpine:3"), "docker.io/library/alpine:3");
+    assert_eq!(
+      normalized("index.docker.io/freebsd/freebsd-runtime"),
+      "docker.io/freebsd/freebsd-runtime:latest"
+    );
     assert_eq!(
       normalized("freebsd/freebsd-runtime:15.1"),
       "docker.io/freebsd/freebsd-runtime:15.1"
