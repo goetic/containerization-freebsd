@@ -5,7 +5,8 @@
 //! breaks save (`VZErrorDomain` 11): hence the `kernel-messages` feature.
 //!
 //! The library's only unsafe code: copying out of Virtualization's mapping
-//! of guest memory.
+//! of guest memory, which can't be made safe, as Apple doesn't promise the
+//! memory stays readable.
 
 #![allow(unsafe_code)]
 
@@ -95,9 +96,12 @@ fn copy(device: &CustomVirtioDevice, address: u64, length: u64) -> Option<Vec<u8
   let mapped = usize::try_from(mapping.length()).ok()?;
   let mut bytes = vec![0u8; mapped];
 
-  // SAFETY: Virtualization maps `mapped` bytes at `mutable_bytes` for as long
-  // as `mapping` lives. The guest may write them meanwhile; a torn read only
-  // garbles text we print.
+  // SAFETY: not guaranteed. Virtualization maps `mapped` bytes at
+  // `mutable_bytes` while `mapping` lives, but Apple doesn't promise they stay
+  // readable: if the machine stops or reboots during the copy, it can fault.
+  // Only an off-by-default debugging aid reads them, from a running machine.
+  // The guest may write them meanwhile; a torn read only garbles text we
+  // print.
   unsafe {
     std::ptr::copy_nonoverlapping(mapping.mutable_bytes().cast::<u8>(), bytes.as_mut_ptr(), mapped);
   }
