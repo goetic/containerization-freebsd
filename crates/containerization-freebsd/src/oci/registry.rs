@@ -1,6 +1,7 @@
 use super::{ContentStore, Descriptor, Reference, media_type, sha256_file, sha256_hex};
 use crate::error::{Error, Result};
 use std::collections::HashMap;
+use std::fmt;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -13,11 +14,46 @@ const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, \
                                 application/vnd.docker.distribution.manifest.list.v2+json, \
                                 application/vnd.docker.distribution.manifest.v2+json";
 
+/// A password or token, which prints as asterisks, whether displayed or
+/// debugged; `expose` gives its text.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+  pub fn expose(&self) -> &str {
+    &self.0
+  }
+}
+
+impl From<String> for Secret {
+  fn from(text: String) -> Self {
+    Self(text)
+  }
+}
+
+impl From<&str> for Secret {
+  fn from(text: &str) -> Self {
+    Self(text.to_string())
+  }
+}
+
+impl fmt::Display for Secret {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str("********")
+  }
+}
+
+impl fmt::Debug for Secret {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fmt::Display::fmt(self, formatter)
+  }
+}
+
 /// A registry account, for the registries that want one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
   pub username: String,
-  pub password: String,
+  pub password: Secret,
 }
 
 /// Pulls from and pushes to registries over the OCI distribution API,
@@ -28,13 +64,13 @@ pub struct RegistryClient {
   credentials: Option<Credentials>,
   /// The bearer token for each registry and repository, to pull or to
   /// push.
-  tokens: Mutex<HashMap<(String, bool), String>>,
+  tokens: Mutex<HashMap<(String, bool), Secret>>,
 }
 
 #[derive(Clone, Debug)]
 enum Auth {
   None,
-  Bearer(String),
+  Bearer(Secret),
   Basic(Credentials),
 }
 
@@ -291,10 +327,11 @@ impl RegistryClient {
         }
 
         let token: TokenResponse = super::parse(&bytes, "the registry's token")?;
-        let token = token
+        let token: Secret = token
           .token
           .or(token.access_token)
-          .ok_or_else(|| Error::Guest(format!("{} sent no token", reference.domain)))?;
+          .ok_or_else(|| Error::Guest(format!("{} sent no token", reference.domain)))?
+          .into();
         self
           .tokens
           .lock()
@@ -366,11 +403,11 @@ fn curl(request: &Request, auth: &Auth) -> Result<Response> {
     Auth::None => {}
     Auth::Bearer(token) => config.push_str(&format!(
       "header = {}\n",
-      quote(&format!("Authorization: Bearer {token}"))
+      quote(&format!("Authorization: Bearer {}", token.expose()))
     )),
     Auth::Basic(credentials) => config.push_str(&format!(
       "user = {}\n",
-      quote(&format!("{}:{}", credentials.username, credentials.password))
+      quote(&format!("{}:{}", credentials.username, credentials.password.expose()))
     )),
   }
 
@@ -574,6 +611,31 @@ mod tests {
     assert_eq!(scheme, "Basic");
     assert_eq!(parameters["realm"], r#"a "quoted" realm"#);
     assert_eq!(parameters["charset"], "UTF-8");
+  }
+
+  #[test]
+  fn debugs_without_its_secrets() {
+    let client = RegistryClient::new(Some(Credentials {
+      username: "someone".into(),
+      password: "hunter2".into(),
+    }));
+    client
+      .tokens
+      .lock()
+      .unwrap()
+      .insert(("ghcr.io/a/b".into(), true), "a-token".into());
+
+    let debugged = format!("{client:?}");
+
+    assert!(
+      debugged.contains("someone") && debugged.contains("ghcr.io/a/b"),
+      "{debugged}"
+    );
+    assert!(
+      !debugged.contains("hunter2") && !debugged.contains("a-token"),
+      "{debugged}"
+    );
+    assert_eq!(Secret::from("hunter2").to_string(), "********");
   }
 
   #[test]

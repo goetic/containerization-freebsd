@@ -7,7 +7,7 @@ mod registry;
 
 pub use content::ContentStore;
 pub use reference::Reference;
-pub use registry::{Credentials, RegistryClient};
+pub use registry::{Credentials, RegistryClient, Secret};
 
 use crate::agent::{Exec, User};
 use crate::error::{Error, Result};
