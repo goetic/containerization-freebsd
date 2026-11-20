@@ -129,6 +129,19 @@ pub struct Manifest {
   pub layers: Vec<Descriptor>,
 }
 
+impl Manifest {
+  /// The config, then the layers.
+  pub fn blobs(&self) -> impl Iterator<Item = &Descriptor> {
+    std::iter::once(&self.config).chain(&self.layers)
+  }
+}
+
+/// The index or manifest a descriptor names, as its media type says.
+pub(crate) enum Document {
+  Index(Index),
+  Manifest(Manifest),
+}
+
 /// An image's configuration: the process it runs, and the digests of its
 /// uncompressed layers.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

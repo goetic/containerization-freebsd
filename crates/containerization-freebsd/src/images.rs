@@ -5,10 +5,11 @@
 
 use crate::error::{Error, Result};
 use crate::oci::{
-  ContentStore, Credentials, Descriptor, ImageConfig, Index, Manifest, Platform, REF_NAME, Reference, RegistryClient,
-  parse, sha256_hex,
+  ContentStore, Credentials, Descriptor, Document, ImageConfig, Index, Manifest, Platform, REF_NAME, Reference,
+  RegistryClient, parse, sha256_hex,
 };
 use std::collections::BTreeSet;
+use std::fmt::Display;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,39 +57,21 @@ impl ImageStore {
     let client = RegistryClient::new(credentials);
     let top = client.fetch_manifest(&reference, reference.target(), &self.content)?;
 
-    let manifest = if top.is_index() {
-      let index: Index = parse(&self.content.read(&top.digest)?, &format!("{reference}'s index"))?;
-      let chosen = choose(&index, platform).ok_or_else(|| {
-        Error::Invalid(format!(
-          "{reference} has no image for {platform}, only {}",
-          platforms(&index)
-        ))
-      })?;
-      if !self.content.has(&chosen.digest) {
-        client.fetch_manifest(&reference, &chosen.digest, &self.content)?;
+    let manifest = match self.content.document(&top)? {
+      Document::Index(index) => {
+        let chosen = choose(&index, platform, &reference)?;
+        if !self.content.has(&chosen.digest) {
+          client.fetch_manifest(&reference, &chosen.digest, &self.content)?;
+        }
+        self.content.manifest(&chosen)?
       }
-      chosen
-    } else {
-      top.clone()
+      Document::Manifest(manifest) => manifest,
     };
-    let manifest: Manifest = parse(
-      &self.content.read(&manifest.digest)?,
-      &format!("{reference}'s manifest"),
-    )?;
 
     if !self.content.has(&manifest.config.digest) {
       client.fetch_blob(&reference, &manifest.config, &self.content)?;
     }
-    let config: ImageConfig = parse(
-      &self.content.read(&manifest.config.digest)?,
-      &format!("{reference}'s config"),
-    )?;
-    if !platform.runs(&config.platform()) {
-      return Err(Error::Invalid(format!(
-        "{reference} is an image for {}, not {platform}",
-        config.platform()
-      )));
-    }
+    check_runs(&self.content.config(&manifest)?, platform, &reference)?;
     for layer in &manifest.layers {
       if !self.content.has(&layer.digest) {
         client.fetch_blob(&reference, layer, &self.content)?;
@@ -145,30 +128,24 @@ impl ImageStore {
     descriptor: &Descriptor,
     remote: Option<(&RegistryClient, &Reference)>,
   ) -> Result<Vec<Platform>> {
-    let bytes = self.content.read(&descriptor.digest)?;
-    if descriptor.is_index() {
-      let index: Index = parse(&bytes, &format!("index {}", descriptor.digest))?;
-      return Ok(
+    match self.content.document(descriptor)? {
+      Document::Index(index) => Ok(
         index
           .manifests
           .into_iter()
           .filter_map(|manifest| manifest.platform)
           .filter(|platform| platform.os != "unknown" && platform.architecture != "unknown")
           .collect(),
-      );
+      ),
+      Document::Manifest(manifest) => {
+        if !self.content.has(&manifest.config.digest)
+          && let Some((client, reference)) = remote
+        {
+          client.fetch_blob(reference, &manifest.config, &self.content)?;
+        }
+        Ok(vec![self.content.config(&manifest)?.platform()])
+      }
     }
-
-    let manifest: Manifest = parse(&bytes, &format!("manifest {}", descriptor.digest))?;
-    if !self.content.has(&manifest.config.digest)
-      && let Some((client, reference)) = remote
-    {
-      client.fetch_blob(reference, &manifest.config, &self.content)?;
-    }
-    let config: ImageConfig = parse(
-      &self.content.read(&manifest.config.digest)?,
-      &format!("config {}", manifest.config.digest),
-    )?;
-    Ok(vec![config.platform()])
   }
 
   /// The descriptor to push or save for `image` and `platform`. For an index,
@@ -179,23 +156,13 @@ impl ImageStore {
     let Some(platform) = platform else {
       return Ok(image.descriptor.clone());
     };
-    if !image.descriptor.is_index() {
-      let config = image.config(platform)?;
-      return if platform.runs(&config.platform()) {
-        Ok(image.descriptor.clone())
-      } else {
-        Err(Error::Invalid(format!(
-          "{} is an image for {}, not {platform}",
-          image.reference,
-          config.platform()
-        )))
-      };
-    }
-
-    let mut index: Index = parse(
-      &self.content.read(&image.descriptor.digest)?,
-      &format!("{}'s index", image.reference),
-    )?;
+    let mut index = match self.content.document(&image.descriptor)? {
+      Document::Index(index) => index,
+      Document::Manifest(manifest) => {
+        check_runs(&self.content.config(&manifest)?, platform, &image.reference)?;
+        return Ok(image.descriptor.clone());
+      }
+    };
     let all = index.manifests.len();
     index.manifests.retain(|manifest| {
       manifest
@@ -227,15 +194,14 @@ impl ImageStore {
   /// Pushes everything `descriptor` refers to: a manifest's config and
   /// layers, or an index's manifests (by digest) and their contents.
   fn push_children(&self, client: &RegistryClient, reference: &Reference, descriptor: &Descriptor) -> Result<()> {
-    let bytes = self.content.read(&descriptor.digest)?;
-    if !descriptor.is_index() {
-      let manifest: Manifest = parse(&bytes, &format!("{reference}'s manifest"))?;
-      return std::iter::once(&manifest.config)
-        .chain(&manifest.layers)
-        .try_for_each(|blob| client.push_blob(reference, blob, &self.content));
-    }
-
-    let index: Index = parse(&bytes, &format!("{reference}'s index"))?;
+    let index = match self.content.document(descriptor)? {
+      Document::Index(index) => index,
+      Document::Manifest(manifest) => {
+        return manifest
+          .blobs()
+          .try_for_each(|blob| client.push_blob(reference, blob, &self.content));
+      }
+    };
     for child in &index.manifests {
       if !self.content.has(&child.digest) {
         let platform = child
@@ -416,20 +382,15 @@ impl ImageStore {
     if !self.copy_in(directory, &descriptor.digest)? {
       return Ok(());
     }
-    let bytes = self.content.read(&descriptor.digest)?;
 
-    if descriptor.is_index() {
-      let index: Index = parse(&bytes, &format!("index {}", descriptor.digest))?;
-      index
+    match self.content.document(descriptor)? {
+      Document::Index(index) => index
         .manifests
         .iter()
-        .try_for_each(|child| self.import(directory, child))
-    } else {
-      let manifest: Manifest = parse(&bytes, &format!("manifest {}", descriptor.digest))?;
-      for blob in std::iter::once(&manifest.config).chain(&manifest.layers) {
-        self.copy_in(directory, &blob.digest)?;
-      }
-      Ok(())
+        .try_for_each(|child| self.import(directory, child)),
+      Document::Manifest(manifest) => manifest
+        .blobs()
+        .try_for_each(|blob| self.copy_in(directory, &blob.digest).map(drop)),
     }
   }
 
@@ -471,14 +432,9 @@ impl ImageStore {
       if !self.content.has(&descriptor.digest) || !needed.insert(descriptor.digest.clone()) {
         continue;
       }
-      let bytes = self.content.read(&descriptor.digest)?;
-      if descriptor.is_index() {
-        let index: Index = parse(&bytes, &format!("index {}", descriptor.digest))?;
-        pending.extend(index.manifests);
-      } else {
-        let manifest: Manifest = parse(&bytes, &format!("manifest {}", descriptor.digest))?;
-        needed.insert(manifest.config.digest);
-        needed.extend(manifest.layers.into_iter().map(|layer| layer.digest));
+      match self.content.document(&descriptor)? {
+        Document::Index(index) => pending.extend(index.manifests),
+        Document::Manifest(manifest) => needed.extend(manifest.blobs().map(|blob| blob.digest.clone())),
       }
     }
     Ok(needed)
@@ -523,37 +479,21 @@ impl ImageStore {
 impl Image {
   /// The manifest for `platform`, with its descriptor.
   pub fn manifest(&self, platform: &Platform) -> Result<(Descriptor, Manifest)> {
-    let descriptor = if self.descriptor.is_index() {
-      let index: Index = parse(
-        &self.content.read(&self.descriptor.digest)?,
-        &format!("{}'s index", self.reference),
-      )?;
-      choose(&index, platform).ok_or_else(|| {
-        Error::Invalid(format!(
-          "{} has no image for {platform}, only {}",
-          self.reference,
-          platforms(&index)
-        ))
-      })?
-    } else {
-      self.descriptor.clone()
-    };
-    let manifest = parse(
-      &self.content.read(&descriptor.digest)?,
-      &format!("{}'s manifest", self.reference),
-    )?;
-
-    Ok((descriptor, manifest))
+    match self.content.document(&self.descriptor)? {
+      Document::Index(index) => {
+        let descriptor = choose(&index, platform, &self.reference)?;
+        let manifest = self.content.manifest(&descriptor)?;
+        Ok((descriptor, manifest))
+      }
+      Document::Manifest(manifest) => Ok((self.descriptor.clone(), manifest)),
+    }
   }
 
   /// The config for `platform`.
   pub fn config(&self, platform: &Platform) -> Result<ImageConfig> {
     let (_, manifest) = self.manifest(platform)?;
 
-    parse(
-      &self.content.read(&manifest.config.digest)?,
-      &format!("{}'s config", self.reference),
-    )
+    self.content.config(&manifest)
   }
 
   pub(crate) fn content(&self) -> &ContentStore {
@@ -561,31 +501,42 @@ impl Image {
   }
 }
 
-/// The first manifest in `index` that runs on `platform`, if any.
-fn choose(index: &Index, platform: &Platform) -> Option<Descriptor> {
-  index
-    .manifests
-    .iter()
-    .find(|entry| {
-      entry
-        .platform
-        .as_ref()
-        .is_some_and(|other| platform.runs(other))
-    })
-    .cloned()
-}
+/// The first manifest in `reference`'s index that runs on `platform`.
+fn choose(index: &Index, platform: &Platform, reference: &impl Display) -> Result<Descriptor> {
+  let runs = |entry: &&Descriptor| {
+    entry
+      .platform
+      .as_ref()
+      .is_some_and(|other| platform.runs(other))
+  };
+  if let Some(chosen) = index.manifests.iter().find(runs) {
+    return Ok(chosen.clone());
+  }
 
-fn platforms(index: &Index) -> String {
   let names: Vec<String> = index
     .manifests
     .iter()
     .filter_map(|entry| entry.platform.as_ref().map(Platform::to_string))
     .collect();
-
-  if names.is_empty() {
+  let names = if names.is_empty() {
     "none".to_string()
   } else {
     names.join(", ")
+  };
+  Err(Error::Invalid(format!(
+    "{reference} has no image for {platform}, only {names}"
+  )))
+}
+
+/// Fails unless the image `reference`, with `config`, runs on `platform`.
+fn check_runs(config: &ImageConfig, platform: &Platform, reference: &impl Display) -> Result<()> {
+  if platform.runs(&config.platform()) {
+    Ok(())
+  } else {
+    Err(Error::Invalid(format!(
+      "{reference} is an image for {}, not {platform}",
+      config.platform()
+    )))
   }
 }
 

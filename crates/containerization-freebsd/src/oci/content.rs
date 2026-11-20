@@ -1,4 +1,4 @@
-use super::{Descriptor, sha256_digest, sha256_file, sha256_hex};
+use super::{Descriptor, Document, ImageConfig, Manifest, parse, sha256_digest, sha256_file, sha256_hex};
 use crate::error::{Error, Result};
 use std::fs::File;
 use std::io::{self, Read};
@@ -38,6 +38,32 @@ impl ContentStore {
     let path = self.path(digest)?;
 
     std::fs::read(&path).map_err(Error::io(format!("reading blob {digest}")))
+  }
+
+  /// Reads the index or manifest that `descriptor` names.
+  pub(crate) fn document(&self, descriptor: &Descriptor) -> Result<Document> {
+    if descriptor.is_index() {
+      let bytes = self.read(&descriptor.digest)?;
+      parse(&bytes, &format!("index {}", descriptor.digest)).map(Document::Index)
+    } else {
+      self.manifest(descriptor).map(Document::Manifest)
+    }
+  }
+
+  /// Reads the manifest that `descriptor` names.
+  pub(crate) fn manifest(&self, descriptor: &Descriptor) -> Result<Manifest> {
+    parse(
+      &self.read(&descriptor.digest)?,
+      &format!("manifest {}", descriptor.digest),
+    )
+  }
+
+  /// Reads `manifest`'s config.
+  pub(crate) fn config(&self, manifest: &Manifest) -> Result<ImageConfig> {
+    parse(
+      &self.read(&manifest.config.digest)?,
+      &format!("config {}", manifest.config.digest),
+    )
   }
 
   /// Stores `bytes` as a blob and returns its digest.
