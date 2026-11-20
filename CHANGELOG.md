@@ -102,6 +102,9 @@
   addresses changed: a step's key now names how it reaches the network,
   not the addresses. The host computes it, sparing the guest a command
   each step.
+- Fixes the agent removing a socket relayed into a jail from a thread of
+  its own, forking there while another thread could be starting a process
+  that would inherit the fork's descriptors.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited

@@ -1,7 +1,7 @@
 //! The session loop. One thread owns the protocol's state and writes the
 //! console; the console's reader and every channel's threads send it events.
 
-use crate::listener;
+use crate::listener::{self, Listening};
 use crate::process::{self, Process};
 use crate::relay::{self, Connection};
 use crate::sys;
@@ -9,7 +9,7 @@ use containerization_freebsd_protocol::{
   Address, CONTROL, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
 };
 use std::collections::HashMap;
-use std::io::{self, PipeWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -91,20 +91,19 @@ pub(crate) enum Handle {
     input: Sender<Input>,
     connection: Connection,
   },
-  /// See `listener::listen`.
-  Listener { stop: PipeWriter },
+  Listener(Listening),
 }
 
 impl Handle {
   /// Ends it before it finishes: kills the process and its group, closes
-  /// the relay, or stops the listener, closing its `stop`.
+  /// the relay, or closes the listener's socket.
   fn stop(self) {
     match self {
       Self::Process { process, .. } => process.kill(),
       Self::Relay { connection, .. } => {
         let _ = connection.shutdown(Shutdown::Both);
       }
-      Self::Listener { .. } => {}
+      Self::Listener(_) => {}
     }
   }
 }
@@ -275,7 +274,7 @@ impl<W: Write> Agent<W> {
         let _ = input.send(Input::Eof);
         Ok(())
       }
-      (Message::Eof, Handle::Listener { stop }) => stop.write_all(&[1]),
+      (Message::Eof, Handle::Listener(listening)) => listening.remove(),
       (Message::Resize(size), Handle::Process { process, .. }) => process.resize(size),
       (Message::Signal(signal), Handle::Process { process, .. }) => process.signal(signal),
       (Message::Error(reason), _) => {

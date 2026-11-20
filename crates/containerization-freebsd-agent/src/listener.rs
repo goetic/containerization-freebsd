@@ -5,16 +5,34 @@ use crate::session::{Handle, Outbox};
 use crate::sys;
 use containerization_freebsd_protocol::{Listen, Message};
 use std::fs;
-use std::io::{self, PipeReader, Read};
+use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::thread;
 
-/// Listens as `listen` says: from inside its jail, if it has one. Writing
-/// to the handle's `stop` closes and removes the socket, then sends Eof;
-/// closing `stop` closes the socket, leaving its file for a later Listen to
-/// replace.
+/// The session loop's hold on a listening socket, whose thread accepts its
+/// connections. Dropping it closes the socket, leaving its file for a later
+/// Listen to replace.
+pub(crate) struct Listening {
+  stop: PipeWriter,
+  jail: Option<libc::c_int>,
+  path: String,
+}
+
+impl Listening {
+  /// Removes the socket's file, then has its thread close it and send Eof.
+  /// The session loop removes it, not the thread: removing it from inside a
+  /// jail forks, which only the session loop may.
+  pub(crate) fn remove(&mut self) -> io::Result<()> {
+    let removed =
+      remove(self.jail, &self.path).map_err(|error| io::Error::other(format!("removing {:?}: {error}", self.path)));
+    self.stop.write_all(&[1])?;
+    removed
+  }
+}
+
+/// Listens as `listen` says: from inside its jail, if it has one.
 pub(crate) fn listen(listen: &Listen, outbox: Outbox) -> io::Result<Handle> {
   let jail = sys::jail_id(listen.jail.as_deref())?;
   let path = listen.path.clone();
@@ -24,17 +42,14 @@ pub(crate) fn listen(listen: &Listen, outbox: Outbox) -> io::Result<Handle> {
   let (stopped, stop) = io::pipe()?;
 
   thread::spawn(move || {
-    let removing = accept(&listener, stopped, &outbox);
+    let removed = accept(&listener, stopped, &outbox);
     drop(listener);
 
-    if removing {
-      if let Err(error) = remove(jail, &path) {
-        eprintln!("agent: removing {path:?}: {error}");
-      }
+    if removed {
       outbox.send(Message::Eof);
     }
   });
-  Ok(Handle::Listener { stop })
+  Ok(Handle::Listener(Listening { stop, jail, path }))
 }
 
 /// A socket listening at `path`, in place of any socket there.
@@ -64,7 +79,8 @@ fn remove(jail: Option<libc::c_int>, path: &str) -> io::Result<()> {
 }
 
 /// Hands the session loop each connection until `stopped` is readable:
-/// whether something was written to it, rather than it closing.
+/// whether something was written to it, the socket's file having been
+/// removed, rather than it closing.
 fn accept(listener: &UnixListener, mut stopped: PipeReader, outbox: &Outbox) -> bool {
   loop {
     match sys::wait_for_connection(listener.as_fd(), stopped.as_fd()) {
