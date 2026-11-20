@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 #
-# Downloads FreeBSD's VM image into the integration suites' cache, which they
-# read but never fill. Does nothing once it is there.
+# Downloads FreeBSD's VM image, the pinned guest bundle and the userland into
+# the integration suites' cache. The suites read the cache but never fill it.
+# Files already in the cache are not downloaded again.
 
 set -e
 

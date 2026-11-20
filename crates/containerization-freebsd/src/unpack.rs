@@ -1,7 +1,8 @@
-//! Images unpacked into ZFS in the guest. Each layer becomes a snapshot of
-//! a clone of the layer beneath it, named by its chain id, so a layer images
-//! share is unpacked once. The top layer's snapshot is a root to clone, as
-//! for a container.
+//! Unpacks images into ZFS in the guest. Each layer is applied to a clone of
+//! the layer beneath it and then snapshotted. The dataset is named by the
+//! layer's chain id, so a layer shared by several images is unpacked only
+//! once. The top layer's snapshot is the root filesystem to clone for a
+//! container.
 
 use crate::agent::{Agent, Exec, Exit, Output, Process};
 use crate::error::{Error, Result};
@@ -12,12 +13,12 @@ use std::io::Read;
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
-/// Extracting a layer the size of a userland takes a minute or so.
+/// Extracting a userland-sized layer takes about a minute.
 const UNPACKING: Duration = Duration::from_secs(600);
-/// The name of the snapshot each layer's dataset ends as.
+/// The snapshot name each layer's dataset gets once the layer is applied.
 const UNPACKED: &str = "unpacked";
 
-/// Writes stdin, decompressed as `$1` says, to the file `$2`.
+/// Decompresses stdin with the method `$1` and writes it to the file `$2`.
 const DECOMPRESS: &str = r#"set -e
 case "$1" in
   gzip) gzip -dc ;;
@@ -26,8 +27,9 @@ case "$1" in
 esac > "$2""#;
 
 /// Applies the layer tarball `$2`, whose sha256 must be `$3`, to the root
-/// `$1`. Whiteouts hide what the layers beneath made, so they go first, each
-/// only within the root; then the layer's own files.
+/// `$1`. Whiteouts delete files from the layers beneath, so they are applied
+/// before the layer's own files are extracted. A whiteout that resolves
+/// outside the root is an error.
 const APPLY: &str = r#"set -e
 root=$(realpath -- "$1")
 layer=$2
@@ -69,19 +71,20 @@ pub struct Unpacker<'a> {
   store: String,
 }
 
-/// What an unpack made.
+/// The result of an unpack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unpacked {
   /// The top layer's snapshot.
   pub snapshot: String,
-  /// How many layers were unpacked, and how many were already.
+  /// The number of layers unpacked by this call, and the number that were
+  /// already unpacked.
   pub unpacked: usize,
   pub cached: usize,
 }
 
 impl<'a> Unpacker<'a> {
-  /// Unpacks into datasets under `store`, such as `images/layers`, which it
-  /// creates, mounted, if need be.
+  /// An unpacker that puts layers in datasets under `store`, such as
+  /// `images/layers`. `unpack` creates and mounts `store` if needed.
   pub fn new(agent: &'a Agent, store: &str) -> Self {
     Self {
       agent,
@@ -91,10 +94,10 @@ impl<'a> Unpacker<'a> {
   }
 
   /// Unpacks `image`'s layers for `platform`, streaming each through the
-  /// agent, and skips those unpacked before. The guest checks each against
-  /// the digest the image's config gives it uncompressed, so a layer's
-  /// snapshot holds what its chain id says. Unpacks into the same store must
-  /// not run at once.
+  /// agent and skipping layers already unpacked. The guest verifies each
+  /// decompressed layer against its diff id in the image config, so a
+  /// snapshot always holds the content its chain id names. Unpacks into the
+  /// same store must not run concurrently.
   pub fn unpack(&self, image: &Image, platform: &Platform) -> Result<Unpacked> {
     let (_, manifest) = image.manifest(platform)?;
     let config = image.config(platform)?;
@@ -148,8 +151,9 @@ impl<'a> Unpacker<'a> {
     Ok(unpacked)
   }
 
-  /// Unpacks `layer` into a fresh `dataset` on `below`, by way of the
-  /// decompressed tarball at `staging`; leaves neither behind if it fails.
+  /// Unpacks `layer` into a new `dataset` cloned from the snapshot `below`,
+  /// via the decompressed tarball at `staging`. The tarball is always
+  /// removed, and the dataset is destroyed if the unpack fails.
   fn layer(
     &self,
     image: &Image,
@@ -159,8 +163,8 @@ impl<'a> Unpacker<'a> {
     dataset: &str,
     staging: &str,
   ) -> Result<()> {
-    // Left by an unpack that failed without cleaning up, such as when the
-    // guest stopped.
+    // An earlier unpack can leave the dataset behind if it failed without
+    // cleaning up, such as when the guest stopped.
     if self.zfs.exists(dataset)? {
       self.zfs.destroy(dataset)?;
     }
@@ -183,7 +187,8 @@ impl<'a> Unpacker<'a> {
     result
   }
 
-  /// Streams `layer`'s blob through the agent into `staging`, decompressed.
+  /// Streams `layer`'s blob through the agent and writes it, decompressed, to
+  /// `staging`.
   fn receive(&self, image: &Image, layer: &Descriptor, staging: &str) -> Result<()> {
     let compression = compression(&layer.media_type)?;
     let path = image.content().path(&layer.digest)?;
@@ -215,7 +220,8 @@ impl<'a> Unpacker<'a> {
 
     match written {
       Ok(()) => finish(&process, UNPACKING),
-      // A decompressor that fails stops reading: its error says why.
+      // A failed write usually means the decompressor exited early, so its
+      // error is more useful than the write error.
       Err(error) => match finish(&process, QUICK) {
         Err(failed @ Error::Guest(_)) => Err(failed),
         _ => Err(error),
@@ -224,7 +230,7 @@ impl<'a> Unpacker<'a> {
   }
 }
 
-/// How a layer of `media_type` is compressed.
+/// The compression of a layer of `media_type`, as `DECOMPRESS` names it.
 fn compression(media_type: &str) -> Result<&'static str> {
   match media_type {
     media_type::LAYER | "application/vnd.docker.image.rootfs.diff.tar" => Ok("none"),
@@ -234,7 +240,8 @@ fn compression(media_type: &str) -> Result<&'static str> {
   }
 }
 
-/// Waits up to `timeout` for `process` to exit, failing unless it exits 0.
+/// Waits up to `timeout` for `process` to exit. Any exit status but 0 is an
+/// error.
 fn finish(process: &Process, timeout: Duration) -> Result<()> {
   let mut stderr = Vec::new();
 

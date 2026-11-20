@@ -1,19 +1,20 @@
 #!/usr/bin/env sh
 #
 # Builds the virtiofs modules (fusefs.ko, vtfs.ko, virtiofs.ko) for FreeBSD
-# 15.1 arm64, from a non-FreeBSD host: FreeBSD's source at the commit the
-# patches were rebased onto, plus guest/virtiofs-15.1.patch, then our
-# guest/virtiofs-makefile.patch and guest/virtiofs-remount.patch.
+# 15.1 arm64 on a non-FreeBSD host. It checks out FreeBSD's source at the
+# commit the patches were rebased onto, applies guest/virtiofs-15.1.patch,
+# then this repository's guest/virtiofs-makefile.patch and
+# guest/virtiofs-remount.patch.
 #
 #   guest/build-modules <work-dir> <out-dir>
 #
-# The source and objects go in <work-dir>, the three modules in <out-dir>.
+# The source and objects go in <work-dir>, and the three modules in <out-dir>.
 #
-# FreeBSD's own tools/build/make.py drives the build: it bootstraps bmake,
+# FreeBSD's own tools/build/make.py drives the build. It bootstraps bmake,
 # which Linux and macOS lack, and points the build at the host's LLVM. It is
-# Python from FreeBSD's tree, not this repository. CROSS_BINDIR names the
-# directory holding clang and ld.lld, as make.py's --cross-bindir takes it;
-# the same LLVM builds the host tools.
+# Python from FreeBSD's tree, not from this repository. Set CROSS_BINDIR to the
+# directory holding clang and ld.lld, as make.py's --cross-bindir expects. The
+# same LLVM builds the host tools.
 
 set -eu
 
@@ -49,7 +50,7 @@ if [ "$actual" != "$patch_sha256" ]; then
   exit 1
 fi
 
-# One commit, shallow: the full history is gigabytes.
+# Fetch only the one commit, because the full history is gigabytes.
 if [ ! -d "$src/.git" ]; then
   git init --quiet "$src"
   git -C "$src" remote add origin "$repository"
@@ -57,7 +58,7 @@ fi
 git -C "$src" fetch --quiet --depth 1 origin "$commit"
 git -C "$src" checkout --quiet --force FETCH_HEAD
 git -C "$src" clean --quiet -fdx
-# Upstream's patch has trailing whitespace, which is not ours to fix.
+# Upstream's patch has trailing whitespace, which this repository leaves as is.
 git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-15.1.patch"
 git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-makefile.patch"
 git -C "$src" apply --whitespace=nowarn "$guest/virtiofs-remount.patch"
@@ -86,9 +87,9 @@ for module in fusefs vtfs virtiofs; do
   cp "$built" "$out/$module.ko"
 done
 
-# Each must be an aarch64 ELF shared object (amd64 modules are relocatable
-# instead) with FreeBSD module metadata. file(1) says SYSV, not FreeBSD:
-# modules carry no OS ABI brand.
+# Each module must be an aarch64 ELF shared object (amd64 modules are
+# relocatable objects instead) with FreeBSD module metadata. file(1) reports
+# SYSV rather than FreeBSD, because modules carry no OS ABI brand.
 for module in "$out"/*.ko; do
   description="$(file -b "$module")"
   case "$description" in

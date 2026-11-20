@@ -16,7 +16,7 @@ argv = ["bin/dev/fetch-image"]
 [host.commands.fmt]
 argv = ["cargo", "fmt", "--all"]
 
-# Exact: no arguments, the whole suite.
+# Takes no arguments and runs the whole suite.
 [host.commands.test]
 argv = ["cargo", "nextest", "run"]
 tty = true
@@ -25,7 +25,7 @@ tty = true
 argv = ["bin/dev/test-integration"]
 tty = true
 
-# Widened deliberately, for the iterate-on-one-failing-test loop.
+# Accepts arguments, to iterate on one failing test.
 [host.commands.test-one]
 arguments = true
 argv = ["cargo", "nextest", "run"]
@@ -36,8 +36,8 @@ tty = true
 image = "compostbin/base:latest"
 name = "cfbsd"
 
-# guest/build-modules, as CI runs it: FreeBSD's make.py (python3) builds bmake
-# against libarchive and libbz2, then cross-builds with LLVM 19
+# Packages for guest/build-modules, as CI runs it. FreeBSD's make.py (python3)
+# builds bmake against libarchive and libbz2, then cross-builds with LLVM 19
 # (CROSS_BINDIR=/usr/lib/llvm-19/bin).
 [image]
 packages = [
@@ -57,10 +57,10 @@ packages = [
     "time",
     "zlib1g-dev",
 ]
-# guest/build-agent: the toolchain rust-toolchain.toml pins, with the rust-src
-# that -Zbuild-std builds FreeBSD's std from.
+# For guest/build-agent: the toolchain that rust-toolchain.toml pins, with the
+# rust-src that -Zbuild-std builds FreeBSD's std from.
 run = [
     "curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1 --component rust-src",
-    # rustup adds itself to ~/.profile only, which non-login shells skip.
+    # rustup adds itself only to ~/.profile, which non-login shells don't read.
     """echo '. "$HOME/.cargo/env"' >> ~/.bashrc""",
 ]

@@ -1,5 +1,5 @@
-//! Unix sockets the host has the agent listen on with Listen. The session
-//! loop relays each connection on a channel it opens with Accepted.
+//! Unix sockets that the host asks the agent to listen on with Listen. The
+//! session loop relays each connection on a new Accepted channel.
 
 use crate::session::{Handle, Outbox};
 use crate::sys;
@@ -11,9 +11,9 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::thread;
 
-/// The session loop's hold on a listening socket, whose thread accepts its
-/// connections. Dropping it closes the socket, leaving its file for a later
-/// Listen to replace.
+/// The session loop's handle on a listening socket, whose connections a
+/// thread accepts. Dropping the handle closes the socket but leaves its file
+/// for a later Listen to replace.
 pub(crate) struct Listening {
   stop: PipeWriter,
   jail: Option<libc::c_int>,
@@ -21,9 +21,10 @@ pub(crate) struct Listening {
 }
 
 impl Listening {
-  /// Removes the socket's file, then has its thread close it and send Eof.
-  /// The session loop removes it, not the thread: removing it from inside a
-  /// jail forks, which only the session loop may.
+  /// Removes the socket's file, then tells the accepting thread to close the
+  /// socket and send Eof. The session loop removes the file rather than the
+  /// thread because removing it inside a jail forks, and only the session
+  /// loop may fork.
   pub(crate) fn remove(&mut self) -> io::Result<()> {
     let removed =
       remove(self.jail, &self.path).map_err(|error| io::Error::other(format!("removing {:?}: {error}", self.path)));
@@ -32,12 +33,13 @@ impl Listening {
   }
 }
 
-/// Listens as `listen` says: from inside its jail, if it has one.
+/// Listens as `listen` describes, from inside its jail if it names one.
 pub(crate) fn listen(listen: &Listen, outbox: Outbox) -> io::Result<Handle> {
   let jail = sys::jail_id(listen.jail.as_deref())?;
   let path = listen.path.clone();
   let listener = bind(jail, &path, listen.mode)?;
-  // So a connection gone before it is accepted can't hold up the thread.
+  // Nonblocking, so a connection that goes away before it is accepted cannot
+  // block the thread.
   listener.set_nonblocking(true)?;
   let (stopped, stop) = io::pipe()?;
 
@@ -52,7 +54,7 @@ pub(crate) fn listen(listen: &Listen, outbox: Outbox) -> io::Result<Handle> {
   Ok(Handle::Listener(Listening { stop, jail, path }))
 }
 
-/// A socket listening at `path`, in place of any socket there.
+/// Binds a socket listening at `path`, replacing any socket already there.
 fn bind(jail: Option<libc::c_int>, path: &str, mode: Option<u16>) -> io::Result<UnixListener> {
   if let Some(jid) = jail {
     return Ok(sys::listen_in(jid, &sys::path(path)?, mode)?.into());
@@ -73,14 +75,14 @@ fn remove(jail: Option<libc::c_int>, path: &str) -> io::Result<()> {
   match fs::symlink_metadata(path) {
     Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path),
     Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-    // Binding fails on anything else there.
+    // Anything other than a socket is left alone, and binding fails on it.
     _ => Ok(()),
   }
 }
 
-/// Hands the session loop each connection until `stopped` is readable:
-/// whether something was written to it, the socket's file having been
-/// removed, rather than it closing.
+/// Passes each connection to the session loop until `stopped` is readable.
+/// Returns true if a byte was written to `stopped`, meaning the socket's file
+/// was removed; returns false if its write end closed or accepting failed.
 fn accept(listener: &UnixListener, mut stopped: PipeReader, outbox: &Outbox) -> bool {
   loop {
     match sys::wait_for_connection(listener.as_fd(), stopped.as_fd()) {
@@ -93,7 +95,7 @@ fn accept(listener: &UnixListener, mut stopped: PipeReader, outbox: &Outbox) -> 
     }
 
     match listener.accept() {
-      // On FreeBSD, a connection takes on its listener's O_NONBLOCK.
+      // On FreeBSD, an accepted socket inherits its listener's O_NONBLOCK.
       Ok((stream, _)) => {
         if stream.set_nonblocking(false).is_ok() && !outbox.accepted(stream) {
           return false;

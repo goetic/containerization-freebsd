@@ -1,20 +1,21 @@
 experimental = ["setup-scripts"]
 
-# Before the integration suites: FreeBSD's image and the userland, downloaded
-# once, and the guest bundle, built from the working tree every run.
+# Setup for the integration suites. fetch-image downloads FreeBSD's image, the
+# userland and the pinned bundle once; guest-bundle rebuilds the bundle from
+# the working tree on every run.
 [scripts.setup.fetch-image]
 command = "bin/dev/fetch-image"
 
 [scripts.setup.guest-bundle]
 command = "bin/dev/build-guest-bundle"
 
-# Under a booting guest's load, a test's output can close more than nextest's
-# default 100ms after it exits. A real leak still outlasts 1s.
+# While a guest boots, a test's output can close more than nextest's default
+# 100ms after the test exits. A real leak still lasts longer than 1s.
 [profile.default]
 leak-timeout = "1s"
 
-# A boot that stalls fails rather than hanging the run. The suite takes about
-# 30s; its own timeouts allow minutes.
+# A stalled boot fails instead of hanging the run. The suite takes about 30s,
+# and its own timeouts allow minutes.
 [[profile.default.overrides]]
 filter = 'package(containerization-freebsd-test)'
 slow-timeout = { period = "60s", terminate-after = 10 }

@@ -1,5 +1,5 @@
-//! Unix sockets relayed between the host and the guest, or a jail, as
-//! Containerization's `UnixSocketConfiguration`s are.
+//! Relays Unix sockets between the host and the guest or a jail, like
+//! Containerization's `UnixSocketConfiguration`.
 
 use crate::agent::{Agent, Listener, Relay};
 use crate::error::{Error, Result};
@@ -20,13 +20,13 @@ const READ: usize = 64 << 10;
 /// A Unix socket relayed between the host and the guest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnixSocket {
-  /// Its path on the host.
+  /// The socket's path on the host.
   pub host: PathBuf,
-  /// Its path in the guest, or in the jail.
+  /// The socket's path in the guest, or in the jail.
   pub guest: String,
   pub direction: Direction,
-  /// The permissions of the socket the relay makes: in the guest, going
-  /// into it; on the host, coming out. Or those the umask leaves.
+  /// The permissions of the socket the relay creates: in the guest for
+  /// `Into`, on the host for `OutOf`. `None` leaves what the umask gives.
   pub mode: Option<u16>,
 }
 
@@ -41,9 +41,10 @@ pub enum Direction {
   OutOf,
 }
 
-/// A socket relayed, as `Agent::relay_socket` started it. Connections it
-/// relayed carry on after it stops. Dropping it stops it; going into the
-/// guest, that leaves the socket's file there, which `close` removes.
+/// A running socket relay started by `Agent::relay_socket`. Connections
+/// already relayed continue after the relay stops. Dropping the relay stops
+/// it, but for `Into` it leaves the socket file in the guest; `close` removes
+/// that file.
 pub struct SocketRelay {
   relaying: Relaying,
 }
@@ -53,22 +54,22 @@ enum Relaying {
   OutOf(HostListener),
 }
 
-/// The host's end of a relay out of the guest: its socket, and whether its
-/// accepting thread should stop.
+/// The host's end of a relay out of the guest: the socket's path, and a flag
+/// that tells the accepting thread to stop.
 struct HostListener {
   path: PathBuf,
   stopped: Arc<AtomicBool>,
 }
 
 impl Agent {
-  /// Relays `socket` between the host and the guest. A socket already
-  /// where the relay listens is replaced; going into the guest, its
-  /// directory must exist.
+  /// Relays `socket` between the host and the guest. An existing socket at
+  /// the path where the relay listens is replaced. For `Into`, the socket's
+  /// directory in the guest must exist.
   pub fn relay_socket(&self, socket: &UnixSocket) -> Result<SocketRelay> {
     self.relay_socket_in(socket, None)
   }
 
-  /// As `relay_socket`, with the socket's guest path in `jail`, if given.
+  /// Like `relay_socket`, with the socket's guest path in `jail`, if given.
   pub(crate) fn relay_socket_in(&self, socket: &UnixSocket, jail: Option<&str>) -> Result<SocketRelay> {
     let jail = jail.map(str::to_string);
     let relaying = match socket.direction {
@@ -97,8 +98,9 @@ impl Agent {
 }
 
 impl SocketRelay {
-  /// Stops it, and removes its socket: going into the guest, once the
-  /// agent has closed it, so it no longer holds the file system it is on.
+  /// Stops the relay and removes its socket. For `Into`, the file is removed
+  /// after the agent closes the listener, so that the listener no longer
+  /// keeps the socket's file system busy.
   pub fn close(self) -> Result<()> {
     match self.relaying {
       Relaying::Into(listener) => listener.close(),
@@ -111,8 +113,8 @@ impl SocketRelay {
 }
 
 impl HostListener {
-  /// Listens at `socket.host`, and relays each connection as `connect`
-  /// says.
+  /// Listens at `socket.host` and relays each connection to the guest
+  /// address in `connect`.
   fn start(agent: Agent, socket: &UnixSocket, connect: Connect) -> io::Result<Self> {
     let path = socket.host.clone();
     remove_socket(&path)?;
@@ -130,7 +132,7 @@ impl HostListener {
         }
         let Ok(local) = local else { continue };
         let (agent, connect) = (agent.share(), connect.clone());
-        // One the guest refuses is closed.
+        // If the guest refuses the connection, dropping `local` closes it.
         thread::spawn(move || {
           if let Ok(relay) = agent.relay(connect) {
             pump(relay, local);
@@ -143,8 +145,8 @@ impl HostListener {
 }
 
 impl Drop for HostListener {
-  /// Stops accepting, waking the thread with a connection of its own, and
-  /// removes the socket.
+  /// Stops accepting connections and removes the socket. A connection of its
+  /// own wakes the accepting thread so it sees the stop flag.
   fn drop(&mut self) {
     self.stopped.store(true, Ordering::Relaxed);
     let _ = UnixStream::connect(&self.path);
@@ -157,13 +159,13 @@ fn remove_socket(path: &Path) -> io::Result<()> {
   match fs::symlink_metadata(path) {
     Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path),
     Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-    // Binding fails on anything else there.
+    // Any other file there is left alone, so binding fails on it.
     _ => Ok(()),
   }
 }
 
-/// Relays between `relay` and `local`, a connection on the host, until
-/// both have finished.
+/// Relays between `relay` and `local`, a connection on the host, until both
+/// directions have finished.
 pub(crate) fn pump(relay: Relay, local: UnixStream) {
   let Ok(mut to_local) = local.try_clone() else {
     return;
@@ -179,7 +181,7 @@ pub(crate) fn pump(relay: Relay, local: UnixStream) {
             let _ = to_local.shutdown(Shutdown::Write);
             return;
           }
-          // Either end failed: so does the other.
+          // If either end failed, shut down the other one too.
           _ => {
             let _ = to_local.shutdown(Shutdown::Both);
             return;
@@ -221,8 +223,8 @@ mod tests {
     }
   }
 
-  /// Answers each connection to `listener`, once it ends, with what it
-  /// sent in capitals.
+  /// Answers each connection to `listener`, once the client finishes
+  /// sending, with what it sent in capitals.
   fn answer_in_capitals(listener: UnixListener) {
     thread::spawn(move || {
       for stream in listener.incoming() {
@@ -234,8 +236,8 @@ mod tests {
     });
   }
 
-  /// What a connection to `path` answers `text` with: nothing, if it closes
-  /// first.
+  /// Sends `text` over a connection to `path` and returns the answer, which
+  /// is empty if the connection closes first.
   fn ask(path: &Path, text: &str) -> String {
     let mut stream = UnixStream::connect(path).unwrap();
     let _ = stream.write_all(text.as_bytes());
@@ -260,7 +262,7 @@ mod tests {
     let relay = agent.relay_socket(&into).unwrap();
     assert_eq!(mode(&guest), 0o600);
     assert_eq!(ask(&guest, "into"), "INTO");
-    // Dropped, it leaves its socket for the next relay to replace.
+    // A dropped relay leaves its socket for the next relay to replace.
     drop(relay);
     let relay = agent.relay_socket(&into).unwrap();
     assert_eq!(ask(&guest, "again"), "AGAIN");
@@ -293,7 +295,7 @@ mod tests {
     let directory = tempfile::tempdir().unwrap();
     let path = |name: &str| directory.path().join(name);
 
-    // Nothing listens at the far end of either.
+    // Nothing listens at the far end of either relay.
     let _into = agent
       .relay_socket(&socket(path("absent.sock"), &path("into.sock"), Direction::Into, None))
       .unwrap();

@@ -1,39 +1,41 @@
-//! Limits on a jail's processes together, and what they use, through
-//! rctl(8): the counterpart of Containerization's per-container cpus and
-//! memory, which size its VMs, and of its statistics. They need
-//! `kern.racct.enable` set at boot, which preparing a base does. Network
-//! counters come from netstat(1), and a container's block IO from ZFS.
+//! Limits and usage statistics for a jail's processes as a group, through
+//! rctl(8). These correspond to Containerization's per-container `cpus` and
+//! memory, which size its VMs, and to its statistics. rctl needs
+//! `kern.racct.enable` set at boot, which `LOADER_ENV` does. Network counters
+//! come from netstat(1), and a container's block IO from ZFS.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 
-/// What a jail's processes use together, as Containerization's
-/// `ContainerStatistics`.
+/// The combined resource usage of a jail's processes, like
+/// Containerization's `ContainerStatistics`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Statistics {
   /// CPU time, in whole seconds.
   pub cpu_seconds: u64,
-  /// Recent CPU, in percent of one core.
+  /// Recent CPU usage, in percent of one core.
   pub cpu_percent: u64,
   /// Resident memory, in bytes.
   pub memory: u64,
   pub processes: u64,
   pub threads: u64,
   pub open_files: u64,
-  /// Recent file system reads and writes a second.
+  /// Recent file system reads and writes per second.
   pub read_bytes_per_second: u64,
   pub write_bytes_per_second: u64,
   pub read_operations_per_second: u64,
   pub write_operations_per_second: u64,
-  /// The interfaces of a jail with a network of its own, loopback too. A
-  /// jail sharing the guest's has none: those counters are the guest's.
+  /// The interfaces, including loopback, of a jail with its own network
+  /// stack. A jail that shares the guest's stack has none here, because
+  /// those counters belong to the guest.
   pub networks: Vec<NetworkStatistics>,
-  /// A container's dataset, the counterpart of Containerization's block
-  /// devices: FreeBSD counts no jail's block IO. A jail has none.
+  /// A container's dataset IO, in place of Containerization's block devices,
+  /// because FreeBSD does not count block IO per jail. Empty for a plain
+  /// jail.
   pub block_io: Vec<DatasetIo>,
 }
 
-/// An interface's counters since it was made.
+/// An interface's counters since it was created.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NetworkStatistics {
   pub interface: String,
@@ -48,7 +50,7 @@ pub struct NetworkStatistics {
 }
 
 /// A dataset's file reads and writes since it was mounted, as ZFS counts
-/// them: cached reads too.
+/// them, including reads served from cache.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DatasetIo {
   pub dataset: String,
@@ -68,8 +70,9 @@ pub(crate) const DATASET_IO: &str = r#"set -e
 objset=kstat.zfs.${1%%/*}.dataset.objset-$(printf 0x%x "$(zfs get -Hp -o value objsetid "$1")")
 sysctl -n "$objset.reads" "$objset.nread" "$objset.writes" "$objset.nwritten""#;
 
-/// Replaces the rules of the jail named `$1` with the rules after it, if
-/// the kernel accounts.
+/// Replaces the rctl rules of the jail named `$1` with the remaining
+/// arguments. Without kernel resource accounting, it fails if any rules are
+/// given and otherwise does nothing.
 pub(crate) const LIMIT: &str = r#"set -e
 jail=$1
 shift
@@ -81,8 +84,8 @@ elif [ $# -gt 0 ]; then
 fi
 [ $# -eq 0 ] || rctl -a "$@""#;
 
-/// rctl(8)'s rules limiting the jail named `jail` to `cpus` and
-/// `memory_in_bytes` of resident memory.
+/// Returns the rctl(8) rules that limit the jail named `jail` to `cpus` CPUs
+/// and `memory_in_bytes` of resident memory.
 pub(crate) fn rules(jail: &str, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
   let rule = |resource: &str, amount: Option<u64>| amount.map(|amount| format!("jail:{jail}:{resource}:deny={amount}"));
 
@@ -95,7 +98,7 @@ pub(crate) fn rules(jail: &str, cpus: Option<u32>, memory_in_bytes: Option<u64>)
   .collect()
 }
 
-/// The statistics in what `rctl -u` printed.
+/// Parses the output of `rctl -u`.
 pub(crate) fn statistics(usage: &str) -> Result<Statistics> {
   let values: HashMap<&str, &str> = usage
     .lines()
@@ -124,8 +127,8 @@ pub(crate) fn statistics(usage: &str) -> Result<Statistics> {
   })
 }
 
-/// The interfaces in what `INTERFACES` printed: netstat's link rows, read
-/// by its header's names.
+/// Parses the output of `INTERFACES`: netstat's link rows, with columns
+/// found by their header names.
 pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
   let unreadable = || Error::Guest(format!("netstat printed {table:?}"));
   let mut lines = table.lines();
@@ -169,7 +172,7 @@ pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
     .collect()
 }
 
-/// The dataset's counters in what `DATASET_IO` printed.
+/// Parses the dataset's counters from the output of `DATASET_IO`.
 pub(crate) fn dataset_io(dataset: &str, counters: &str) -> Result<DatasetIo> {
   let values = counters
     .lines()

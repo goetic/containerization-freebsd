@@ -1,50 +1,55 @@
-//! What frames carry: a message is a frame's kind and payload.
+//! The messages that frames carry. A message is encoded as a frame's kind and
+//! payload.
 //!
-//! Payloads are little-endian integers, and strings with a u32 length, and
-//! nothing after. Data, Stderr and Error are their bytes alone.
+//! A payload is a sequence of little-endian integers and of strings prefixed
+//! with a u32 length, with no trailing bytes. The payload of Data, Stderr and
+//! Error is the raw bytes alone.
 
 use crate::frame::Frame;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-  /// The version a side speaks, which must match. Control. From the guest,
-  /// `answer` tells an answer to the host's Hello from an announcement that
-  /// the agent has no session, which the host answers by starting one.
+  /// Control. Carries the protocol version a side speaks, which must match
+  /// the other side's. On a guest Hello, `answer` distinguishes an answer to
+  /// the host's Hello from an announcement that the agent has no session.
+  /// The host responds to an announcement by starting a session.
   Hello {
     version: u16,
     answer: bool,
   },
-  /// Answered with a Pong of the same number. Control.
+  /// Control. The receiver answers with a Pong of the same number.
   Ping(u64),
   Pong(u64),
-  /// From the guest, how many more of the console's bytes it has read: the
-  /// host's credit to send more. Control.
+  /// Control, from the guest. The number of console bytes the agent has read
+  /// since its last Received. Each report lets the host send that many more.
   Received(u32),
-  /// From the host, the time since the Unix epoch, to set the guest's
-  /// clock to. Control.
+  /// Control, from the host. The time since the Unix epoch, to which the
+  /// guest sets its clock.
   SetTime {
     seconds: u64,
     nanoseconds: u32,
   },
-  /// Runs a process in the guest. Opens a channel, from the host.
+  /// Opens a channel, from the host, that runs a process in the guest.
   Exec(Exec),
-  /// Relays to a socket in the guest. Opens a channel, from the host.
+  /// Opens a channel, from the host, that relays to a socket in the guest.
   Connect(Connect),
-  /// Listens on a Unix socket in the guest. Opens a channel, from the host.
+  /// Opens a channel, from the host, that listens on a Unix socket in the
+  /// guest.
   Listen(Listen),
-  /// A connection to the socket of the Listen channel `listener`, for the
-  /// host to relay. Opens a channel, from the guest.
+  /// Opens a channel, from the guest, for the host to relay a connection
+  /// accepted on the socket of the Listen channel `listener`.
   Accepted {
     listener: u32,
   },
   /// The runner started the process, connected the relay, or is listening.
   Opened,
-  /// From the opener, stdin or relay bytes; from the runner, stdout or relay bytes.
+  /// Stdin or relay bytes from the opener, or stdout or relay bytes from the
+  /// runner.
   Data(Vec<u8>),
   Stderr(Vec<u8>),
-  /// The end of the sender's Data. On a Listen channel, the host's stops
-  /// the listening, and the agent's follows once the socket is closed and
+  /// Ends the sender's Data. On a Listen channel, the host's Eof stops the
+  /// listener, and the agent sends its own Eof once the socket is closed and
   /// removed.
   Eof,
   Resize(WindowSize),
@@ -58,37 +63,38 @@ pub enum Message {
 pub struct Exec {
   pub argv: Vec<String>,
   pub env: Vec<(String, String)>,
-  /// A path in its jail, if it has one.
+  /// The working directory, as a path inside the jail if there is one.
   pub cwd: Option<String>,
-  /// A pseudo-terminal of this size, which merges stderr into Data; or pipes.
+  /// Runs the process on a pseudo-terminal of this size, which merges stderr
+  /// into Data. `None` uses pipes.
   pub pty: Option<WindowSize>,
-  /// The jail it runs in, by name; or the guest.
+  /// The name of the jail to run in. `None` runs in the guest.
   pub jail: Option<String>,
-  /// Whom it runs as; or root, as the agent does.
+  /// The user to run as. `None` runs as root, like the agent.
   pub user: Option<User>,
-  /// Its file mode creation mask; or the agent's.
+  /// The file mode creation mask. `None` inherits the agent's.
   pub umask: Option<u16>,
   pub limits: Vec<Limit>,
-  /// Runs the guest's `/rescue` tool that `argv[0]` names, a static
-  /// binary, which needn't be in its jail.
+  /// Runs the tool in the guest's `/rescue` that `argv[0]` names. Those tools
+  /// are static binaries, so they need not exist inside the jail.
   pub rescue: bool,
 }
 
-/// Whom a process runs as, looked up in its root's `/etc/passwd` and
-/// `/etc/group`: its jail's, or the guest's.
+/// The user a process runs as. Names are looked up in the `/etc/passwd` and
+/// `/etc/group` of the process's root: its jail's, or the guest's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct User {
-  /// A user's name, or a uid, which needn't be listed.
+  /// A user name, or a uid. A uid need not be listed in `/etc/passwd`.
   pub name: String,
-  /// A group's name, or a gid, in place of the user's own group and the
-  /// groups that list them.
+  /// A group name or gid. If set, it replaces the user's primary group and
+  /// the groups that list the user.
   pub group: Option<String>,
-  /// More groups, by name or gid.
+  /// Additional groups, by name or gid.
   pub groups: Vec<String>,
 }
 
-/// A resource limit, as setrlimit(2) sets it. A value past the guest's
-/// `RLIM_INFINITY`, such as `u64::MAX`, is unlimited.
+/// A resource limit, as setrlimit(2) sets it. A value above the guest's
+/// `RLIM_INFINITY`, such as `u64::MAX`, means unlimited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limit {
   pub resource: Resource,
@@ -96,14 +102,15 @@ pub struct Limit {
   pub hard: u64,
 }
 
-/// A resource setrlimit(2) limits, numbered as in the guest, as signals are.
+/// A resource that setrlimit(2) limits. Like signal numbers, resource numbers
+/// are the guest's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Resource(pub i32);
 
 impl Resource {
   /// CPU time, in seconds.
   pub const CPU: Self = Self(0);
-  /// The size of a file it writes.
+  /// The largest file the process may write.
   pub const FILE_SIZE: Self = Self(1);
   pub const DATA: Self = Self(2);
   pub const STACK: Self = Self(3);
@@ -111,46 +118,46 @@ impl Resource {
   pub const CORE: Self = Self(4);
   pub const RESIDENT: Self = Self(5);
   pub const LOCKED_MEMORY: Self = Self(6);
-  /// Processes for its real user.
+  /// Processes, counted per real user.
   pub const PROCESSES: Self = Self(7);
   pub const OPEN_FILES: Self = Self(8);
-  /// Socket buffers for its real user.
+  /// Socket buffer space, counted per real user.
   pub const SOCKET_BUFFERS: Self = Self(9);
   pub const ADDRESS_SPACE: Self = Self(10);
-  /// Pseudo-terminals for its real user.
+  /// Pseudo-terminals, counted per real user.
   pub const PSEUDO_TERMINALS: Self = Self(11);
-  /// Swap reserved for its real user.
+  /// Reserved swap space, counted per real user.
   pub const SWAP: Self = Self(12);
-  /// Kqueues for its real user.
+  /// Kqueues, counted per real user.
   pub const KQUEUES: Self = Self(13);
 }
 
-/// Where a relay connects, from inside its jail if it has one: so a path
-/// resolves, and loopback is, as there.
+/// Where a relay connects. The agent connects from inside the jail, if there
+/// is one, so that paths and loopback resolve as they do in the jail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connect {
   pub to: Address,
-  /// The jail, by name; or the guest.
+  /// The name of the jail. `None` means the guest.
   pub jail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Address {
-  /// A TCP port on loopback: 127.0.0.1, or failing that ::1.
+  /// A TCP port on loopback: 127.0.0.1, or ::1 if that fails.
   Port(u16),
-  /// A Unix socket, by its path.
+  /// The path of a Unix socket.
   Unix(String),
 }
 
-/// A Unix socket for the agent to listen on, made from inside its jail if
-/// it has one.
+/// A Unix socket for the agent to listen on. The agent creates the socket
+/// from inside the jail, if there is one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Listen {
-  /// Its path. A socket already there is replaced.
+  /// The socket's path. An existing socket at this path is replaced.
   pub path: String,
-  /// The jail, by name; or the guest.
+  /// The name of the jail. `None` means the guest.
   pub jail: Option<String>,
-  /// Its permissions; or those the agent's umask leaves.
+  /// The socket's permissions. `None` leaves those the agent's umask allows.
   pub mode: Option<u16>,
 }
 
@@ -170,7 +177,7 @@ pub enum Exit {
 pub enum DecodeError {
   UnknownKind(u8),
   Truncated,
-  /// Bytes after the message's fields.
+  /// The payload has bytes after the message's last field.
   TooLong,
   NotUtf8,
   UnknownTag(u8),
@@ -441,8 +448,8 @@ impl Message {
   }
 }
 
-/// A length on the wire. Anything over u32 is over MAX_PAYLOAD too, and is
-/// refused before it is sent.
+/// Converts a length for the wire. A length that does not fit in a u32 also
+/// exceeds MAX_PAYLOAD, so the frame is refused before it is sent.
 fn length(length: usize) -> u32 {
   u32::try_from(length).unwrap_or(u32::MAX)
 }

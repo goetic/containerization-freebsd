@@ -1,12 +1,12 @@
-//! ZFS in the guest, through its agent: pools, datasets, snapshots and
-//! clones. Names are passed as arguments, never through a shell.
+//! Manages ZFS pools, datasets, snapshots, and clones in the guest through
+//! the guest agent. Names are passed as arguments, never through a shell.
 
 use crate::agent::Agent;
 use crate::error::Result;
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
-/// Extracting a base system, from a share, takes a minute or so.
+/// Extracting a base system from a share takes about a minute.
 const EXTRACTING: Duration = Duration::from_secs(600);
 
 pub struct Zfs<'a> {
@@ -18,8 +18,8 @@ impl<'a> Zfs<'a> {
     Self { agent }
   }
 
-  /// A new pool on `device`, with lz4 compression and no access times,
-  /// mounted at `/<pool>`.
+  /// Creates a pool on `device`, mounted at `/<pool>`, with lz4 compression
+  /// and access times off.
   pub fn create_pool(&self, pool: &str, device: &str) -> Result<()> {
     self.check(
       &[
@@ -36,8 +36,8 @@ impl<'a> Zfs<'a> {
     )
   }
 
-  /// Imports a pool another machine made or used, such as one on a disk the
-  /// caller keeps across machines.
+  /// Imports a pool that another machine created or used, such as one on a
+  /// disk the caller keeps across machines.
   pub fn import_pool(&self, pool: &str) -> Result<()> {
     self.check(&["zpool", "import", "-f", pool], QUICK)
   }
@@ -52,14 +52,15 @@ impl<'a> Zfs<'a> {
     self.succeeds(&["zfs", "list", "-H", "-t", "all", name])
   }
 
-  /// Creates `dataset`, and any parents it lacks.
+  /// Creates `dataset` and any missing parents.
   pub fn create(&self, dataset: &str) -> Result<()> {
     self.check(&["zfs", "create", "-p", dataset], QUICK)
   }
 
-  /// Creates `dataset` if need be, mounted: at `/<dataset>` if it would
-  /// inherit no mountpoint, as datasets under the pool of FreeBSD's VM image
-  /// do. Its children inherit the mountpoint.
+  /// Creates `dataset` if it does not exist, and makes sure it is mounted.
+  /// If it would inherit no mountpoint, as datasets under the pool of
+  /// FreeBSD's VM image do, it is mounted at `/<dataset>`. Its children
+  /// inherit the mountpoint.
   pub fn create_mounted(&self, dataset: &str) -> Result<()> {
     if !self.exists(dataset)? {
       self.create(dataset)?;
@@ -70,18 +71,19 @@ impl<'a> Zfs<'a> {
     Ok(())
   }
 
-  /// Snapshots `snapshot`, named `<dataset>@<name>`.
+  /// Creates the snapshot `snapshot`, named `<dataset>@<name>`.
   pub fn snapshot(&self, snapshot: &str) -> Result<()> {
     self.check(&["zfs", "snapshot", snapshot], QUICK)
   }
 
-  /// A writable dataset starting as `snapshot`, sharing its blocks.
+  /// Creates `dataset` as a writable clone of `snapshot` that shares its
+  /// blocks.
   pub fn clone(&self, snapshot: &str, dataset: &str) -> Result<()> {
     self.check(&["zfs", "clone", "-p", snapshot, dataset], QUICK)
   }
 
-  /// Destroys a dataset and its snapshots, or a snapshot. Fails if a clone
-  /// depends on it.
+  /// Destroys a dataset and its descendants, or a snapshot. Fails if a clone
+  /// depends on what would be destroyed.
   pub fn destroy(&self, name: &str) -> Result<()> {
     self.check(&["zfs", "destroy", "-r", name], QUICK)
   }
@@ -115,7 +117,8 @@ impl<'a> Zfs<'a> {
     )
   }
 
-  /// Where `dataset` is mounted.
+  /// Returns `dataset`'s `mountpoint` property, which may be `none` or
+  /// `legacy`.
   pub fn mountpoint(&self, dataset: &str) -> Result<String> {
     let ran = self
       .agent
@@ -141,7 +144,8 @@ impl<'a> Zfs<'a> {
   }
 }
 
-/// Whether a `mountpoint` property leaves a dataset where ZFS won't mount it.
+/// Whether a `mountpoint` property value means ZFS does not mount the
+/// dataset.
 pub(crate) fn unmounted(mountpoint: &str) -> bool {
   matches!(mountpoint, "none" | "legacy")
 }

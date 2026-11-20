@@ -1,11 +1,14 @@
 # containerization-freebsd-test
 
-The integration suite, which boots FreeBSD. macOS only, and unpublished.
+The integration suite, which boots FreeBSD. It runs on macOS only and is not
+published.
 
-It isn't a default workspace member, so `cargo nextest run` skips it. It runs
-only signed, through `bin/dev/test-integration`, because Virtualization
-requires the test binary itself to carry `com.apple.security.virtualization`.
+It is not a default workspace member, so `cargo nextest run` skips it. Run it
+through `bin/dev/test-integration`, which signs the test binaries:
+Virtualization requires the test binary itself to carry
+`com.apple.security.virtualization`.
 
-It installs the guest bundle the library pins, which `bin/dev/fetch-image`
-downloads. To try an unreleased bundle, put one from `guest/build-bundle` at
-`tmp/guest-bundle.tar.xz`: the suite uses it instead.
+`bin/dev/fetch-image` downloads FreeBSD's VM image, the userland and the
+pinned guest bundle into the cache. The suite does not install the pinned
+bundle: it boots the bundle that `bin/dev/build-guest-bundle` builds from the
+working tree at `tmp/guest-bundle.tar.xz`.

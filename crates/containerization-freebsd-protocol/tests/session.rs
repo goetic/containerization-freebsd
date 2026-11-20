@@ -1,5 +1,5 @@
-//! Both sides of a session, in memory, their frames crossing one byte stream
-//! as the console carries them.
+//! Runs both sides of a session in memory, passing their frames through an
+//! encoded byte stream as the console would.
 
 use containerization_freebsd_protocol::{
   Address, CONTROL, Connect, Decoder, Error, Exec, Exit, Frame, Listen, MAX_PAYLOAD, Message, Mux, Side, VERSION,
@@ -8,7 +8,7 @@ use containerization_freebsd_protocol::{
 
 const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
 
-/// Frames through the byte stream and out of a decoder.
+/// Encodes `frames` into one byte stream and decodes them again.
 fn carry(frames: impl IntoIterator<Item = Frame>) -> Vec<Frame> {
   let mut bytes = Vec::new();
   for frame in frames {
@@ -22,7 +22,7 @@ fn carry(frames: impl IntoIterator<Item = Frame>) -> Vec<Frame> {
     .collect()
 }
 
-/// What `to` receives of `frames`.
+/// Carries `frames` to `to` and returns what it receives.
 fn deliver(to: &mut Mux, frames: impl IntoIterator<Item = Frame>) -> Vec<(u32, Message)> {
   carry(frames)
     .into_iter()
@@ -98,7 +98,7 @@ fn passes_only_control_messages_before_the_hellos() {
     guest.receive(exec(&["true"], None).frame(2)).unwrap_err(),
     Error::NoSession
   );
-  // A ping finds out whether the agent is there at all.
+  // A ping checks whether the agent is running at all.
   let ping = host.send(CONTROL, Message::Ping(1)).unwrap();
   assert_eq!(deliver(&mut guest, [ping]), [(CONTROL, Message::Ping(1))]);
   // The agent reads the console whether or not there is a session.
@@ -229,7 +229,7 @@ fn closes_a_relay_once_both_ends_have_finished() {
   deliver(&mut guest, [open]);
   deliver(&mut host, [guest.send(relay, Message::Opened).unwrap()]);
 
-  // The host's end is done writing; the guest's can still answer.
+  // The host has finished writing, but the guest can still answer.
   deliver(&mut guest, [host.send(relay, Message::Eof).unwrap()]);
   assert_eq!(
     host
@@ -280,7 +280,7 @@ fn relays_each_connection_to_a_listener_on_a_channel_the_guest_opens() {
   let (first, accepted) = guest.open(Message::Accepted { listener }).unwrap();
   let (second, also_accepted) = guest.open(Message::Accepted { listener }).unwrap();
   assert_eq!([first, second], [1, 3]);
-  // The guest's end may send before the host has connected its own.
+  // The guest may send data before the host has connected its end.
   let early = guest.send(first, Message::Data(b"hello".to_vec())).unwrap();
   assert_eq!(
     deliver(&mut host, [accepted, also_accepted, early]),
@@ -307,7 +307,7 @@ fn relays_each_connection_to_a_listener_on_a_channel_the_guest_opens() {
   );
   deliver(&mut host, [guest.send(first, Message::Eof).unwrap()]);
   assert!(!host.is_open(first) && !guest.is_open(first));
-  // The host couldn't connect this one.
+  // The host could not connect the second connection.
   deliver(
     &mut guest,
     [host.send(second, Message::Error("refused".into())).unwrap()],
@@ -330,7 +330,7 @@ fn closes_a_listener_once_both_sides_have_sent_eof() {
   );
 
   deliver(&mut guest, [host.send(listener, Message::Eof).unwrap()]);
-  // What it accepted before it stopped still opens.
+  // A connection accepted before the listener stopped can still open.
   let (_, accepted) = guest.open(Message::Accepted { listener }).unwrap();
   deliver(&mut host, [accepted]);
   assert!(host.is_open(listener) && guest.is_open(listener));
@@ -374,7 +374,7 @@ fn lets_each_side_open_only_its_own_channels() {
   assert_eq!(guest.open(connect(22)).unwrap_err(), not_allowed(1, "connect"));
   assert_eq!(guest.open(listen("/s")).unwrap_err(), not_allowed(1, "listen"));
   assert_eq!(host.open(accepted.clone()).unwrap_err(), not_allowed(2, "accepted"));
-  // Nor can either pass off its own opening as the other's.
+  // Neither side can send an opening message that belongs to the other.
   assert_eq!(
     host.receive(exec(&["true"], None).frame(3)).unwrap_err(),
     not_allowed(3, "exec")
@@ -392,7 +392,8 @@ fn lets_each_side_open_only_its_own_channels() {
 
 #[test]
 fn forgets_the_old_session_at_a_new_hello() {
-  // As after a restore: the host starts over, and the guest drops what it had.
+  // Simulates a restore: the host starts over, and the guest drops its
+  // channels.
   let (mut host, mut guest) = session();
   let (channel, open) = host.open(exec(&["sleep", "60"], None)).unwrap();
   deliver(&mut guest, [open]);
@@ -458,7 +459,8 @@ fn settles_when_the_agent_starts_as_the_host_says_hello() {
 
 #[test]
 fn refuses_an_answer_to_another_hosts_hello() {
-  // As after a restore: the guest answers the Hello of the host that saved it.
+  // Simulates a restore: the guest answers the Hello of the host that saved
+  // the VM.
   let mut saved = Mux::new(Side::Host);
   let mut guest = Mux::new(Side::Guest);
   deliver(&mut guest, [saved.hello()]);

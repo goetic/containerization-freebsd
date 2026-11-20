@@ -13,13 +13,14 @@ fn octets(text: &str) -> Option<[u8; 6]> {
   parts.next().is_none().then_some(octets)
 }
 
-/// The address the Mac's DHCP server (Virtualization's NAT) leased to `mac`, if any.
+/// Returns the address that the Mac's DHCP server, which serves
+/// Virtualization's NAT network, leased to `mac`, if any.
 pub fn lease(mac: [u8; 6]) -> Option<Ipv4Addr> {
   leased(&std::fs::read_to_string(LEASES).ok()?, mac)
 }
 
-/// bootpd writes one `{ … }` block per lease, its octets without leading zeros:
-/// `hw_address=1,a6:1:2b:…`.
+/// Parses bootpd's lease file, which has one `{ … }` block per lease and
+/// writes MAC octets without leading zeros: `hw_address=1,a6:1:2b:…`.
 fn leased(leases: &str, mac: [u8; 6]) -> Option<Ipv4Addr> {
   leases.split('{').find_map(|block| {
     let field = |name: &str| {

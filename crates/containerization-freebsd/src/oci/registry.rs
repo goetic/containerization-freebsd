@@ -7,15 +7,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 
-/// Manifests and indexes are small; anything bigger is refused.
+/// The largest manifest or index accepted: 4 MiB, the least the OCI
+/// distribution spec says registries should accept.
 const MAX_MANIFEST: u64 = 4 << 20;
 const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, \
                                 application/vnd.oci.image.manifest.v1+json, \
                                 application/vnd.docker.distribution.manifest.list.v2+json, \
                                 application/vnd.docker.distribution.manifest.v2+json";
 
-/// A password or token, which prints as asterisks, whether displayed or
-/// debugged; `expose` gives its text.
+/// A password or token. Both `Display` and `Debug` print it as asterisks;
+/// `expose` returns the actual text.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Secret(String);
 
@@ -49,21 +50,21 @@ impl fmt::Debug for Secret {
   }
 }
 
-/// A registry account, for the registries that want one.
+/// A registry account, for registries that require one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
   pub username: String,
   pub password: Secret,
 }
 
-/// Pulls from and pushes to registries over the OCI distribution API,
-/// through curl(1). Tokens and passwords reach curl on its stdin, never its
-/// arguments.
+/// Pulls from and pushes to registries over the OCI distribution API, using
+/// curl(1). Tokens and passwords are passed to curl on stdin, never as
+/// arguments, so other processes cannot see them.
 #[derive(Debug, Default)]
 pub struct RegistryClient {
   credentials: Option<Credentials>,
-  /// The bearer token for each registry and repository, to pull or to
-  /// push.
+  /// Cached bearer tokens, keyed by `registry/repository` and whether the
+  /// token allows pushing.
   tokens: Mutex<HashMap<(String, bool), Secret>>,
 }
 
@@ -74,7 +75,7 @@ enum Auth {
   Basic(Credentials),
 }
 
-/// What curl is to send.
+/// An HTTP request for curl to send.
 struct Request<'a> {
   method: &'a str,
   url: String,
@@ -82,7 +83,7 @@ struct Request<'a> {
   content_type: Option<&'a str>,
   /// A file to send as the body.
   upload: Option<&'a Path>,
-  /// Where the response's body goes.
+  /// A file to write the response body to.
   output: Option<&'a Path>,
 }
 
@@ -101,7 +102,8 @@ impl<'a> Request<'a> {
 
 struct Response {
   status: u16,
-  /// The last response's, after redirects; names lowercase.
+  /// The headers of the final response after redirects, with lowercase
+  /// names.
   headers: Vec<(String, String)>,
 }
 
@@ -123,7 +125,7 @@ impl RegistryClient {
     }
   }
 
-  /// Fetches the manifest or index `target`, a tag or digest, of
+  /// Fetches the manifest or index named `target`, a tag or digest, from
   /// `reference`'s repository into `store`.
   pub fn fetch_manifest(&self, reference: &Reference, target: &str, store: &ContentStore) -> Result<Descriptor> {
     let partial = store.partial();
@@ -176,8 +178,8 @@ impl RegistryClient {
   }
 
   /// Uploads `descriptor`'s blob from `store` to `reference`'s repository,
-  /// unless the repository has it: in one PUT, after a POST starts the
-  /// upload.
+  /// unless the repository already has it. A POST starts the upload and a
+  /// single PUT sends the whole blob.
   pub fn push_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
     let path = format!("blobs/{}", descriptor.digest);
     let head = Request::new("HEAD", url(reference, &path));
@@ -209,7 +211,8 @@ impl RegistryClient {
     let mut put = Request::new("PUT", upload.to_string());
     put.content_type = Some("application/octet-stream");
     put.upload = Some(&blob);
-    // A location elsewhere, such as storage, gets no credentials.
+    // Credentials go only to the registry itself, not to an upload location
+    // on another origin such as a storage service.
     let response = if same_origin(&post.url, &put.url) {
       self.send(reference, &put, true)?
     } else {
@@ -222,7 +225,7 @@ impl RegistryClient {
   }
 
   /// Uploads the manifest or index `descriptor` from `store` to
-  /// `reference`'s repository as `target`, a tag or its digest.
+  /// `reference`'s repository under `target`, a tag or the document's digest.
   pub fn push_manifest(
     &self,
     reference: &Reference,
@@ -247,8 +250,8 @@ impl RegistryClient {
     result
   }
 
-  /// GETs `path` under the repository into `body`; fails unless it answers
-  /// 200.
+  /// GETs `path` under the repository into the file `body`. Any status other
+  /// than 200 is an error.
   fn get(&self, reference: &Reference, path: &str, accept: Option<&str>, body: &Path) -> Result<Response> {
     let mut get = Request::new("GET", url(reference, path));
     get.accept = accept;
@@ -261,8 +264,9 @@ impl RegistryClient {
     }
   }
 
-  /// Sends `request` to `reference`'s registry, authenticating as it asks,
-  /// to pull from its repository or, with `push`, to push to it too.
+  /// Sends `request` to `reference`'s registry. If the registry answers 401,
+  /// authenticates as its challenge asks and sends the request again. The
+  /// token grants pull access, plus push access when `push` is set.
   fn send(&self, reference: &Reference, request: &Request, push: bool) -> Result<Response> {
     let key = (format!("{}/{}", reference.registry(), reference.repository), push);
     let cached = self
@@ -284,8 +288,8 @@ impl RegistryClient {
     curl(request, &auth)
   }
 
-  /// What the registry's challenge asks for: a bearer token from its realm,
-  /// or the account itself.
+  /// The authorization a WWW-Authenticate challenge asks for: a bearer token
+  /// fetched from the challenge's realm, or basic auth with the account.
   fn authorize(&self, reference: &Reference, key: &(String, bool), challenge: &str) -> Result<Auth> {
     let (scheme, parameters) = parse_challenge(challenge);
 
@@ -367,7 +371,8 @@ fn same_origin(one: &str, other: &str) -> bool {
   }
 }
 
-/// Runs curl, following redirects.
+/// Sends `request` with curl, following redirects. curl reads its options,
+/// including credentials, from a config file on stdin.
 fn curl(request: &Request, auth: &Auth) -> Result<Response> {
   let url = &request.url;
   let headers = tempfile_path();
@@ -378,7 +383,7 @@ fn curl(request: &Request, auth: &Auth) -> Result<Response> {
   );
   match (request.method, request.upload) {
     ("HEAD", _) => config.push_str("head\n"),
-    // Without waiting for a 100 Continue.
+    // An empty Expect header stops curl from waiting for a 100 Continue.
     (_, Some(upload)) => config.push_str(&format!(
       "upload-file = {}\nrequest = {}\nheader = \"Expect:\"\n",
       quote(&upload.to_string_lossy()),
@@ -387,7 +392,7 @@ fn curl(request: &Request, auth: &Auth) -> Result<Response> {
     ("GET", None) => {}
     (method, None) => config.push_str(&format!("request = {}\ndata-binary = \"\"\n", quote(method))),
   }
-  // Stdout carries only the status.
+  // The body goes to a file so that stdout carries only the status code.
   let output = request.output.unwrap_or(Path::new("/dev/null"));
   config.push_str(&format!("output = {}\n", quote(&output.to_string_lossy())));
   if let Some(accept) = request.accept {
@@ -455,7 +460,8 @@ fn curl(request: &Request, auth: &Auth) -> Result<Response> {
   result
 }
 
-/// The error for `request` answering `status`, with a snippet of `body`.
+/// The error for an unexpected `status` in reply to `request`, including the
+/// start of the response body if there is one.
 fn unexpected(request: &Request, status: u16, body: Option<&Path>) -> Error {
   let bytes = body
     .and_then(|body| std::fs::read(body).ok())
@@ -473,7 +479,8 @@ fn snippet(bytes: &[u8]) -> String {
   text.trim().to_string()
 }
 
-/// A path in the temporary directory for one curl run's scratch file.
+/// A unique path in the temporary directory for a scratch file of one curl
+/// run.
 fn tempfile_path() -> std::path::PathBuf {
   use std::sync::atomic::{AtomicU64, Ordering};
   static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -485,7 +492,7 @@ fn tempfile_path() -> std::path::PathBuf {
   ))
 }
 
-/// A string as curl's config file quotes it.
+/// `value` as a double-quoted string in curl's config file syntax.
 fn quote(value: &str) -> String {
   let mut quoted = String::from("\"");
 
@@ -503,7 +510,8 @@ fn quote(value: &str) -> String {
   quoted
 }
 
-/// The headers of the last response curl dumped: after any redirects.
+/// The headers of the last response in curl's header dump, which follows any
+/// redirects.
 fn last_headers(dumped: &str) -> Vec<(String, String)> {
   let block = dumped
     .split("\r\n\r\n")
@@ -519,7 +527,7 @@ fn last_headers(dumped: &str) -> Vec<(String, String)> {
     .collect()
 }
 
-/// A WWW-Authenticate challenge's scheme and parameters, such as
+/// Splits a WWW-Authenticate challenge into its scheme and parameters, such as
 /// `Bearer realm="https://ghcr.io/token",service="ghcr.io"`.
 fn parse_challenge(challenge: &str) -> (String, HashMap<String, String>) {
   let challenge = challenge.trim();
@@ -558,8 +566,9 @@ fn parse_challenge(challenge: &str) -> (String, HashMap<String, String>) {
   (scheme.to_string(), parameters)
 }
 
-/// A manifest's media type: the registry's Content-Type, or failing that the
-/// document's own `mediaType`, or failing that whether it lists manifests.
+/// A manifest's media type. The registry's Content-Type is used if it is a
+/// known type, then the document's own `mediaType`. Failing both, a document
+/// with a `manifests` list is an index and anything else is a manifest.
 fn media_type_of(content_type: Option<&str>, bytes: &[u8]) -> String {
   let known = [
     media_type::INDEX,

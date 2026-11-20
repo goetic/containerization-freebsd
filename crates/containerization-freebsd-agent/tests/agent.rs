@@ -1,5 +1,5 @@
-//! Drives the agent the way the host does: a host-side Mux, over a socket pair
-//! standing in for the console.
+//! Drives the agent as the host does, with a host-side Mux over a socket pair
+//! that stands in for the console.
 
 use containerization_freebsd_protocol::{
   Address, CONTROL, Connect, Decoder, Exec, Exit, Frame, Limit, Listen, Message, Mux, Resource, Side, User, VERSION,
@@ -15,15 +15,16 @@ use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
 const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
-/// FreeBSD and macOS number it alike.
+/// SIGTERM has the same number on FreeBSD and macOS.
 const SIGTERM: i32 = 15;
 
 struct Host {
   mux: Mux,
   console: UnixStream,
   frames: Receiver<Frame>,
-  /// The console bytes written, and those the agent says it Received.
+  /// Bytes written to the console.
   written: usize,
+  /// Bytes the agent has acknowledged with Received.
   received: usize,
 }
 
@@ -36,7 +37,8 @@ struct Finished {
 }
 
 impl Host {
-  /// An agent serving the other end of the console, and a session with it.
+  /// Starts an agent on the other end of the console and opens a session
+  /// with it.
   fn start() -> Self {
     let (console, agent) = UnixStream::pair().unwrap();
     let agent_input = agent.try_clone().unwrap();
@@ -73,7 +75,7 @@ impl Host {
     host
   }
 
-  /// Starts a session, which the agent must answer.
+  /// Starts a session and asserts that the agent answers.
   fn hello(&mut self) {
     let hello = self.mux.hello();
     self.write(&hello);
@@ -97,7 +99,7 @@ impl Host {
     self.written += bytes.len();
   }
 
-  /// The agent's next message, past those saying what it Received.
+  /// The agent's next message, skipping (and counting) Received messages.
   fn next(&mut self) -> (u32, Message) {
     loop {
       let frame = self
@@ -132,7 +134,7 @@ impl Host {
     channel
   }
 
-  /// What the channel sends until it closes.
+  /// Collects what the channel sends until it closes.
   fn finish(&mut self, channel: u32) -> Finished {
     let mut finished = Finished::default();
 
@@ -163,7 +165,7 @@ impl Host {
     }
   }
 
-  /// The channel's Data until it holds `text`.
+  /// The channel's Data until it contains `text`.
   fn read_until(&mut self, channel: u32, text: &str) -> String {
     let mut output = String::new();
 
@@ -202,14 +204,14 @@ fn connect(to: Address) -> Message {
   Message::Connect(Connect { to, jail: None })
 }
 
-/// A path for the test's own socket.
+/// A fresh temporary path for a test's socket.
 fn socket_path(name: &str) -> PathBuf {
   let path = std::env::temp_dir().join(format!("cfbsd-agent-{}-{name}.sock", std::process::id()));
   let _ = std::fs::remove_file(&path);
   path
 }
 
-/// Answers what a connection sends, once it ends, in capitals.
+/// Reads a connection to its end, then writes back what it read in capitals.
 fn answer_in_capitals(mut stream: impl Read + Write) {
   let mut received = Vec::new();
   stream.read_to_end(&mut received).unwrap();
@@ -340,7 +342,8 @@ fn says_it_received_every_byte_it_read() {
   host.send(channel, Message::Eof);
   host.finish(channel);
 
-  // It says so before acting on what it read, so before the process exits.
+  // The agent sends Received before acting on what it read, so every byte is
+  // acknowledged before the process exits.
   assert_eq!(host.received, host.written);
 }
 
@@ -388,7 +391,7 @@ fn says_a_missing_working_directory_failed_not_the_command() {
 
 #[test]
 fn says_a_user_it_cannot_become_failed_not_the_command() {
-  // Only root may become another user.
+  // Only root may setuid to another user.
   if is_root() {
     return;
   }
@@ -410,7 +413,7 @@ fn says_a_user_it_cannot_become_failed_not_the_command() {
   );
 }
 
-/// Whether the tests run as root, by `id -u`.
+/// Whether the tests run as root, according to `id -u`.
 fn is_root() -> bool {
   let output = std::process::Command::new("id").arg("-u").output().unwrap();
   output.stdout == b"0\n"
@@ -478,8 +481,9 @@ fn writes_all_the_host_sent_before_its_eof_closes_a_relay() {
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let port = listener.local_addr().unwrap().port();
   let (eof_sent, wait_for_eof) = mpsc::channel();
-  // It finishes writing first, so the host's Eof closes the relay; and
-  // reads nothing until then, so what the host sent backs up in the agent.
+  // The server half-closes at once, so the host's Eof closes the
+  // relay. It reads nothing until then, so the host's data backs up in the
+  // agent.
   let server = std::thread::spawn(move || {
     let (mut stream, _) = listener.accept().unwrap();
     stream.shutdown(Shutdown::Write).unwrap();
@@ -497,7 +501,7 @@ fn writes_all_the_host_sent_before_its_eof_closes_a_relay() {
     host.send(channel, Message::Data(chunk.to_vec()));
   }
   host.send(channel, Message::Eof);
-  // Time for the agent to act on it.
+  // Give the agent time to act on the Eof.
   std::thread::sleep(Duration::from_millis(200));
   eof_sent.send(()).unwrap();
 
@@ -526,7 +530,7 @@ fn relays_to_a_unix_socket() {
 fn listens_on_a_unix_socket_and_relays_each_connection() {
   let mut host = Host::start();
   let path = socket_path("listen");
-  // A socket left behind, which listening replaces.
+  // Leave a stale socket behind for Listen to replace.
   drop(UnixListener::bind(&path).unwrap());
 
   let listener = host.open(Message::Listen(Listen {
@@ -557,7 +561,7 @@ fn listens_on_a_unix_socket_and_relays_each_connection() {
   host.send(channel, Message::Eof);
   assert_eq!(client.join().unwrap(), "HELLO");
 
-  // The agent answers the host's Eof once its socket is gone.
+  // The agent answers the host's Eof once it has removed the socket.
   host.send(listener, Message::Eof);
   assert_eq!(host.next(), (listener, Message::Eof));
   assert!(!path.exists());
@@ -577,7 +581,7 @@ fn a_new_session_kills_the_old_ones_processes() {
     assert!(started.elapsed() < PATIENCE, "process {pid} outlived its session");
     std::thread::sleep(Duration::from_millis(20));
   }
-  // Nothing of the old channel follows.
+  // Nothing from the old channel arrives in the new session.
   host.send(CONTROL, Message::Ping(1));
   assert_eq!(host.next(), (CONTROL, Message::Pong(1)));
 }

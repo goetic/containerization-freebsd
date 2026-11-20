@@ -1,8 +1,8 @@
-//! Boots FreeBSD's VM image: its first boot, which installs the guest
-//! bundle, a cold boot of the prepared disk, and a restore of its saved
-//! state; jails, builds and containers on ZFS clones, on their own disk; OCI
+//! Integration tests that boot FreeBSD's VM image. They cover the first boot,
+//! which installs the guest bundle; a cold boot of the prepared disk; a
+//! restore from saved state; jails, builds and containers on ZFS clones; OCI
 //! images pulled, unpacked into ZFS and run; and a build-sized workload on a
-//! share. Run signed, through `bin/dev/test-integration`.
+//! share. Run them through `bin/dev/test-integration`, which signs them.
 
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 const DISK_SIZE: u64 = 24 << 30;
 const SECONDS: Duration = Duration::from_secs(60);
 
-/// A fresh directory for the test's disks and state. Under `target`, so on
-/// the same volume as the cache when `target` is: clones are copy-on-write.
+/// Returns a fresh directory for a test's disks and state. It lives under
+/// `target` so that, when `target` shares a volume with the cache, disk clones
+/// are copy-on-write.
 fn work(name: &str) -> PathBuf {
   let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
 
@@ -34,8 +35,8 @@ fn sh(script: &str) -> [&str; 3] {
   ["sh", "-c", script]
 }
 
-/// A process's stdout once it exits, and how it exited. Its stderr fails
-/// the test.
+/// Waits for a process to exit and returns its stdout and exit status. Any
+/// output on stderr fails the test.
 fn finish(process: &Process) -> (String, Exit) {
   let mut stdout = Vec::new();
 
@@ -48,8 +49,8 @@ fn finish(process: &Process) -> (String, Exit) {
   }
 }
 
-/// What `attempt` gives once it gives anything, trying for a minute: for a
-/// server just started.
+/// Retries `attempt` for up to a minute and returns its first `Some` value.
+/// Use it to wait for a server that was just started.
 fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
   let started = Instant::now();
 
@@ -62,8 +63,8 @@ fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
   }
 }
 
-/// Answers each connection to `listener`, once it ends, with what it sent
-/// in capitals.
+/// Answers each connection to `listener` with the bytes it sent, in capitals,
+/// once the client finishes writing.
 fn answer_in_capitals(listener: UnixListener) {
   std::thread::spawn(move || {
     for stream in listener.incoming() {
@@ -79,8 +80,8 @@ fn answer_in_capitals(listener: UnixListener) {
   });
 }
 
-/// What a connection to `path` answers `text` with: nothing, if it closes
-/// first.
+/// Sends `text` to the socket at `path` and returns the reply. The reply is
+/// empty if the server closes the connection first.
 fn ask(path: &Path, text: &str) -> String {
   let mut stream = UnixStream::connect(path).expect("connect");
   let _ = stream.write_all(text.as_bytes());
@@ -111,7 +112,7 @@ fn prepares_boots_and_restores() {
   std::fs::create_dir_all(&shared).expect("make the shared directory");
   std::fs::write(shared.join("from-host"), "written on the host\n").expect("write a shared file");
 
-  // Not `Upgrade::Latest`: that downloads the release's patches, minutes of a run.
+  // `Upgrade::Latest` would download the release's patches, which takes minutes.
   let mut layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
     .expect("prepare the base");
   layout.shares.push(Share {
@@ -135,8 +136,8 @@ fn prepares_boots_and_restores() {
     .expect("run a command");
   assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
 
-  // Input many windows long, which the console would drop if the host
-  // outpaced the agent.
+  // The input spans many flow-control windows. The console would drop data if
+  // the host outpaced the agent.
   let input: Vec<u8> = (0..16usize << 20)
     .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
     .collect();
@@ -160,7 +161,8 @@ fn prepares_boots_and_restores() {
   }
   assert_eq!(String::from_utf8_lossy(&sum).trim(), host_sha256(&work.join("input")));
 
-  // rc loaded the bundle's modules: ours, not the stock fusefs.
+  // rc loaded the bundle's patched modules, including its fusefs rather than
+  // the stock one.
   let ran = cold
     .agent
     .check(&sh("kldstat -v | grep -E 'virtiofs|vtfs|fusefs'"), SECONDS)
@@ -185,7 +187,7 @@ fn prepares_boots_and_restores() {
     "written in the guest\n"
   );
 
-  // Saving unmounts the share, which it can't while the share is in use.
+  // Saving unmounts the share, so saving fails while the share is in use.
   let state = work.join("state.vzvmsave");
   cold
     .agent
@@ -202,7 +204,7 @@ fn prepares_boots_and_restores() {
       SECONDS,
     )
     .expect("stop using the share");
-  // A clock an hour behind, which restoring sets right.
+  // Set the guest's clock an hour behind. Restoring should correct it.
   cold
     .agent
     .check(&sh("date -f %s $(($(date +%s) - 3600))"), SECONDS)
@@ -211,15 +213,16 @@ fn prepares_boots_and_restores() {
   cold.stop().expect("stop");
   drop(cold);
 
-  // Mounting it again is a second mount in the guest's boot.
+  // The restored guest keeps the cold boot's kernel, so mounting the share
+  // below is its second mount in the same boot.
   let restored = layout.machine("restored").expect("make the machine");
   restored.restore(&state).expect("restore");
   restored.resume().expect("resume");
   restored
     .wait_ready(SECONDS)
     .expect("the agent answers after restoring");
-  // Its NAT network as saved, once its link is back: a default route,
-  // through which the Mac answers.
+  // Once its link is back, the guest keeps its saved NAT configuration: the
+  // Mac answers through the default route.
   restored
     .agent
     .check(
@@ -320,7 +323,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   machine
     .wait_ready(Duration::from_secs(300))
     .expect("the agent starts");
-  // Ready with its NAT network up, though rc starts the agent first.
+  // `wait_ready` waits for the NAT network too, although rc starts the agent
+  // before the network.
   machine
     .agent
     .check(&["route", "-n", "get", "default"], SECONDS)
@@ -328,8 +332,9 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   machine
     .mount_share("userland", "/mnt/userland")
     .expect("mount the userland's share");
-  // The guest's DHCP runs on its NAT device only, leaving the spare for a
-  // jail to claim. rc starts the agent before the network, and devd after.
+  // The guest runs DHCP on its NAT device only, leaving the spare interface
+  // for a jail to claim. rc starts devd after the network, so waiting for devd
+  // waits for the network configuration.
   machine
     .agent
     .check(&sh("until pgrep -qx devd; do sleep 0.5; done"), SECONDS)
@@ -382,7 +387,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .check(&["freebsd-version", "-u"], SECONDS)
     .expect("run a command in the jail");
   assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
-  // Its root is the clone: the agent is the guest's, not the jail's.
+  // The jail's root is the clone, which has no agent; only the guest does.
   jail
     .check(
       &["test", "!", "-e", "/usr/local/sbin/containerization-freebsd-agent"],
@@ -390,7 +395,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     )
     .expect("a root of its own");
 
-  // What it writes stays in its clone.
+  // Files the jail writes stay in its clone.
   let process = jail
     .spawn(Exec {
       argv: vec!["sh".into(), "-c".into(), "pwd; echo jailed > mark".into()],
@@ -411,7 +416,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("the userland does not");
 
   jail.stop().expect("stop the jail");
-  // Setting up a NAT jail's network needs neither its ifconfig nor its route.
+  // Setting up a NAT jail's network must not depend on the jail's own
+  // ifconfig or route.
   machine
     .agent
     .check(
@@ -420,10 +426,10 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     )
     .expect("remove the clone's ifconfig and route");
 
-  // Each way to the network, tried by pinging the guest's gateway, and by
-  // connecting through the guest's resolver to where the Mac downloaded the
-  // image: only pf's NAT gets a NAT jail answers, as the gateway has no route
-  // to 10.66/16.
+  // Try each network mode by pinging the guest's gateway and by connecting to
+  // the host the image came from, resolved through the guest's resolver. A
+  // NAT jail gets answers only through pf's NAT, because the gateway has no
+  // route to 10.66/16.
   let internet = ["nc", "-4", "-z", "-w", "10", "download.freebsd.org", "443"];
   let gateway = machine
     .agent
@@ -453,7 +459,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       reaches,
       "{network:?} to the internet: {ran:?}"
     );
-    // Its connection dropped, not left in TIME_WAIT to hold it for a minute.
+    // Stopping drops the jail's connection instead of leaving it in TIME_WAIT,
+    // which would hold the jail for a minute.
     let stopping = Instant::now();
     jail
       .stop()
@@ -474,7 +481,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("destroy the clone");
   assert!(!zfs.exists("images/jails/first").expect("list datasets"));
 
-  // Cached builds: each step a snapshot, a step built before skipped.
+  // Cached builds: each step becomes a snapshot, and a step built before is
+  // skipped.
   let builder = Builder::new(&machine.agent, "images/builds");
   let steps = [
     Step::new("echo one > /one; echo building"),
@@ -508,7 +516,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .check(&["test", "!", "-e", &format!("{built}/etc/resolv.conf")], SECONDS)
     .expect("the guest's resolver is not built in");
 
-  // A changed step builds again from there on; one that fails leaves nothing.
+  // A changed step rebuilds from that step on. A failing step leaves no
+  // dataset.
   let changed = builder
     .build(
       "images/userland@base",
@@ -533,9 +542,10 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     )
     .expect("only the steps that built have datasets");
 
-  // Containers: a main process that stops cleanly on SIGTERM, in its own
-  // jail with its own hostname, resolver, hosts, mounts and sockets. The
-  // work directory's paths are too long for a socket's.
+  // Containers: a main process that stops cleanly on SIGTERM, in a jail with
+  // its own hostname, resolver, hosts, mounts and sockets. The sockets live
+  // in the temp directory because the work directory's paths are too long
+  // for a socket address.
   machine
     .agent
     .check(
@@ -563,9 +573,9 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
         },
         hostname: Some("web.test".into()),
         network: Network::Nat,
-        // Its own loopback, where nothing answers: getent asks DNS before
-        // /etc/hosts, and a nameserver off the guest would stall it until
-        // the Mac's network drops the query.
+        // The container's own loopback, where nothing answers. getent asks
+        // DNS before /etc/hosts, and a nameserver outside the guest would
+        // stall it until the Mac's network dropped the query.
         dns: Some(Dns {
           nameservers: vec!["127.0.0.1".into()],
           search: vec!["test".into()],
@@ -617,7 +627,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     ["192.0.2.1", "db.test", "db"]
   );
 
-  // Its mounts: a host share, a guest directory read-only, and a tmpfs.
+  // The container's mounts: a host share, a read-only guest directory, and a
+  // tmpfs.
   let script = format!(
     "set -e; test -f /mnt/userland/{}; cat /var/data/greeting; \
      touch /var/data/x 2>/dev/null || echo read-only; echo kept > /scratch/x; cat /scratch/x",
@@ -626,8 +637,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   let ran = web.check(&sh(&script), SECONDS).expect("use its mounts");
   assert_eq!(ran.lines(), ["hello", "read-only", "kept"]);
 
-  // Its processes as its own users, with their groups and more, a umask and
-  // limits, in a directory of its own; and as a uid it doesn't list.
+  // Processes run as one of the container's users, with extra groups, a umask,
+  // limits and a working directory; and as a uid the container doesn't list.
   let script = "id -u; id -g; id -G; umask; ulimit -n; echo \"$HOME\"; pwd";
   let (stdout, exit) = finish(
     &web
@@ -673,8 +684,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   );
   assert_eq!((stdout.as_str(), exit), ("4242\n0\n/\n", Exit::Code(0)));
 
-  // The host's socket in it, open to its users; its own socket on the
-  // host; and a port on its own loopback.
+  // Sockets: the host's socket inside the container, open to its users; the
+  // container's socket on the host; and a port on the container's loopback.
   let (stdout, exit) = finish(
     &web
       .exec(Exec {
@@ -718,8 +729,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   assert_eq!(answer, b"pong\n");
   assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
 
-  // Its own network's counters, its loopback carrying what was relayed;
-  // and its dataset's, which its files were written to.
+  // Statistics: the container's network counters, where its loopback carried
+  // the relayed traffic, and its dataset's I/O from the files it wrote.
   let statistics = web.statistics().expect("its statistics");
   let loopback = statistics
     .networks
@@ -743,7 +754,8 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     "{statistics:?}"
   );
 
-  // Stderr is ignored: sh reports there its sleep dying of SIGTERM.
+  // The main process's stderr is ignored below: sh reports there that its
+  // sleep died of SIGTERM.
   web.stop().expect("stop the container");
   assert!(!web_socket.exists(), "its socket on the host outlived it");
   machine
@@ -765,11 +777,13 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     }
   };
   assert_eq!((stdout.as_slice(), exit), (&b"stopping\n"[..], Exit::Code(3)));
-  // Only once the agent has closed the host's socket in it.
+  // Delete only after the agent has closed the host's socket inside the
+  // container.
   web.delete().expect("delete the container");
   std::fs::remove_dir_all(&sockets).expect("remove the sockets' directory");
 
-  // A container's limits and statistics: memory is sampled once a second.
+  // A container's limits and statistics. Memory use is sampled once a second,
+  // so the test waits for a nonzero value.
   let limited = containers
     .create(
       "limited",
@@ -809,9 +823,9 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("list its rules again");
   assert_eq!(ran.stdout, "", "its rules outlived it");
 
-  // One with its own interface on the NAT's network, at an address the
-  // NAT's DHCP server leased, which the host reaches and which reaches the
-  // internet; its device is the guest's again once it is gone.
+  // A container with its own interface on the NAT network, at an address the
+  // NAT's DHCP server leased. The host can reach it and it can reach the
+  // internet. Deleting the container returns the device to the guest.
   let interface = Interface::leased(&machine.agent, spare).expect("lease an address");
   assert_eq!(interface.gateway.as_deref(), Some(gateway.as_str()), "{interface:?}");
   machine
@@ -850,7 +864,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   let mut answer = String::new();
   stream.read_to_string(&mut answer).expect("read from it");
   assert_eq!(answer, "reached\n");
-  // nc reads until the host closes.
+  // nc keeps reading until the host closes the connection.
   drop(stream);
   assert_eq!(finish(&server), (String::new(), Exit::Code(0)));
   reachable
@@ -864,7 +878,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .check(&sh("ifconfig -a | grep -q 'ether 02:00:5e:10:00:01'"), SECONDS)
     .expect("its device is back in the guest");
 
-  // One whose handle is gone, deleted by id, mounts and all.
+  // A container whose handle was dropped can be deleted by id, mounts and all.
   drop(
     containers
       .create(
@@ -880,8 +894,9 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   containers
     .delete("left")
     .expect("delete the container by id");
-  // One whose jail is gone, but not its limits and mounts: removed outside,
-  // or by a stop that failed partway. Deleted all the same, with them.
+  // A container whose jail is gone but whose limits and mounts remain, as
+  // after removal outside the library or a stop that failed partway. Deleting
+  // it removes the limits and mounts too.
   drop(
     containers
       .create(
@@ -923,7 +938,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("power off");
 }
 
-/// Counts what is under `path`, itself included, as find(1) does.
+/// Counts the entries under `path`, including `path` itself, as find(1) does.
 fn entries(path: &std::path::Path) -> usize {
   let children = std::fs::read_dir(path)
     .map(|children| {
@@ -940,7 +955,8 @@ fn entries(path: &std::path::Path) -> usize {
   1 + children
 }
 
-/// A C program of 64 files, built in parallel, which prints 2016.
+/// Writes a C project of 64 units, a `main.c` and a Makefile into `project`.
+/// The built program prints 2016, the sum of the units' return values.
 fn write_project(project: &std::path::Path) {
   const UNITS: usize = 64;
 
@@ -1001,7 +1017,7 @@ fn runs_a_build_sized_workload_on_a_share() {
     .mount_share("userland", "/mnt/userland")
     .expect("mount the userland's share");
 
-  // Many files: the userland, extracted onto the share, less the 45 names
+  // Extract the userland onto the share for many files, minus the 45 names
   // that collide on the Mac's case-insensitive volume (cc and CC, mail and
   // Mail, and man pages).
   let extract = format!(
@@ -1024,7 +1040,7 @@ fn runs_a_build_sized_workload_on_a_share() {
     .stdout;
   assert_eq!(guest_sum.trim(), host_sha256(&tree.join("bin/sh")));
 
-  // A parallel build on the share, whose linker writes through mmap.
+  // A parallel build on the share. The linker writes its output through mmap.
   let ran = machine
     .agent
     .check(
@@ -1035,7 +1051,6 @@ fn runs_a_build_sized_workload_on_a_share() {
   assert_eq!(ran.lines(), ["2016"]);
   assert!(shared.join("project/program").exists());
 
-  // Deleting it all again.
   machine
     .agent
     .check(&["rm", "-rf", "/mnt/shared/tree"], Duration::from_secs(600))
@@ -1047,9 +1062,9 @@ fn runs_a_build_sized_workload_on_a_share() {
     .expect("power off");
 }
 
-/// A layer of `files`, each a path and its contents, as a tarball owned by
-/// root and without the Mac's metadata, such as `com.apple.provenance`
-/// attributes, which FreeBSD can't restore.
+/// Returns a layer tarball holding `files`, given as paths and contents. The
+/// files are owned by root and carry none of the Mac's metadata, such as
+/// `com.apple.provenance` attributes, which FreeBSD can't restore.
 fn layer(work: &Path, name: &str, files: &[(&str, &str)]) -> Vec<u8> {
   let staging = work.join(name);
   let mut tops: Vec<&str> = Vec::new();
@@ -1098,7 +1113,7 @@ fn gzip(bytes: &[u8], work: &Path) -> Vec<u8> {
   output.stdout
 }
 
-/// `bytes` in the store, as a blob of `media_type`.
+/// Stores `bytes` as a blob of `media_type` and returns its descriptor.
 fn blob(content: &ContentStore, media_type: &str, bytes: &[u8]) -> Descriptor {
   Descriptor {
     media_type: media_type.into(),
@@ -1120,8 +1135,8 @@ fn pulls_unpacks_and_runs_oci_images() {
   let runtime_config = runtime.config(&platform).expect("its config");
   let (_, runtime_manifest) = runtime.manifest(&platform).expect("its manifest");
 
-  // Two layers on the runtime's, the second hiding a file of the first, every
-  // file of a directory, and a file of the runtime's.
+  // Two layers on top of the runtime's. The second whites out a file from the
+  // first, a whole directory (opaque), and a file from the runtime.
   let added = layer(
     &work,
     "added",
@@ -1186,7 +1201,7 @@ fn pulls_unpacks_and_runs_oci_images() {
     .wait_ready(Duration::from_secs(300))
     .expect("the agent starts");
 
-  // Each layer a snapshot, unpacked once whichever image it is in.
+  // Each layer becomes a snapshot, unpacked once however many images share it.
   let unpacker = Unpacker::new(&machine.agent, "zroot/cfbsd/layers");
   let base = unpacker
     .unpack(&runtime, &platform)
@@ -1201,7 +1216,7 @@ fn pulls_unpacks_and_runs_oci_images() {
     .expect("unpack the runtime image again");
   assert_eq!((again.snapshot.as_str(), again.unpacked), (base.snapshot.as_str(), 0));
 
-  // The image's own process: its shell, reading what it is sent.
+  // The image's configured process is a shell that reads commands from stdin.
   let containers = Containers::new(&machine.agent, "zroot/cfbsd/containers");
   let mut shell = containers
     .create(
@@ -1268,7 +1283,7 @@ fn pulls_unpacks_and_runs_oci_images() {
     ]
   );
 
-  // Copies in and out, by the guest's `/rescue` tools, not the image's.
+  // Copying in and out uses the guest's `/rescue` tools, not the image's.
   let copies = work.join("copies");
   let tree = copies.join("tree");
   std::fs::create_dir_all(tree.join("sub")).expect("make a tree to copy");
@@ -1315,7 +1330,7 @@ fn pulls_unpacks_and_runs_oci_images() {
   hidden
     .copy_out("/cfbsd/missing", &out.join("missing"), true)
     .expect_err("copy out what is missing");
-  // Neither devices nor FIFOs, which copying could block on, or never end.
+  // Copying refuses devices and FIFOs, which could block or never end.
   hidden
     .copy_out("/dev/null", &out.join("null"), true)
     .expect_err("copy out a device");

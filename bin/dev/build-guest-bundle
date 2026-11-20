@@ -1,21 +1,25 @@
 #!/usr/bin/env sh
 #
-# Builds the guest bundle the integration suites boot, from the working
-# tree, at tmp/guest-bundle.tar.xz: the agent, cross-built by
-# guest/build-agent, and the virtiofs modules, from tmp/modules if
-# guest/build-modules built them, else from the pinned release's bundle.
-# nextest runs it before the suites, after bin/dev/fetch-image, whose cache it
-# reads (.config/nextest.toml).
+# Builds the guest bundle that the integration suites boot, from the working
+# tree, at tmp/guest-bundle.tar.xz. The bundle holds the agent, cross-built by
+# guest/build-agent, and the virtiofs modules. The modules come from
+# tmp/modules if guest/build-modules built them there, and otherwise from the
+# pinned release's bundle.
 #
-# Needs clang and ld.lld, GNU tar and xz: on macOS, Homebrew's llvm, lld,
-# gnu-tar and xz. CROSS_BINDIR names clang's directory, if not the usual one.
+# nextest runs this script before the suites and after bin/dev/fetch-image,
+# because it reads that script's cache (see .config/nextest.toml).
+#
+# Requires clang, ld.lld, GNU tar and xz; on macOS, Homebrew's llvm, lld,
+# gnu-tar and xz. Set CROSS_BINDIR to clang's directory if it is not in the
+# usual place.
 
 set -eu
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 cache="$HOME/.cache/containerization-freebsd-tests"
-# Somewhere else, as on a mount whose read-only directories can't be removed.
+# AGENT_WORK moves the work directory, for example off a mount where
+# read-only directories can't be removed.
 work="${AGENT_WORK:-tmp/agent-work}"
 
 pinned() {
@@ -42,8 +46,8 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-# The sysroot's libraries come from the userland bin/dev/fetch-image cached:
-# the same base.txz guest/build-agent would download.
+# Seed the sysroot from the userland that bin/dev/fetch-image cached. It is
+# the same base.txz that guest/build-agent would otherwise download.
 if [ ! -e "$work/sysroot/.complete" ] && [ ! -e "$work/base.txz" ]; then
   mkdir -p "$work"
   cp "$cache/$(pinned USERLAND)" "$work/base.txz"

@@ -1,5 +1,6 @@
-//! Serves the host over the console port: `/dev/ttyV0.0`, or the path given.
-//! Returns when the port closes, for daemon(8) to start it again.
+//! Serves the host over the console port: `/dev/ttyV0.0`, or the path given
+//! as the first argument. Exits when the port closes, and daemon(8) restarts
+//! it.
 
 use std::fs::File;
 use std::io;

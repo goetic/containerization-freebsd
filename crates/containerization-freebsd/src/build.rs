@@ -1,6 +1,7 @@
-//! Cached builds in the guest. Each step runs as root in a jail on a clone
-//! of the snapshot before it, and becomes a snapshot named by the sha256 of
-//! that snapshot and the step: a step built before is not run again.
+//! Cached builds in the guest. Each step runs as root in a jail on a clone of
+//! the previous step's snapshot, and its result becomes a snapshot keyed by
+//! the sha256 of that snapshot's name and the step. A step that has already
+//! been built is not run again.
 
 use crate::agent::{Agent, Exec, Exit, Output};
 use crate::error::{Error, Result};
@@ -10,13 +11,14 @@ use crate::zfs::Zfs;
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
-/// The name of the snapshot each step's dataset ends as.
+/// The name of the snapshot taken of each step's dataset when the step
+/// finishes.
 const BUILT: &str = "built";
-/// Removes the resolver configuration from the root at `$1` if it is the
-/// guest's, as the jail copied it in: not the step's own.
+/// Removes the resolver configuration from the root at `$1` if it is the copy
+/// of the guest's that the jail put there, not one the step wrote.
 const UNRESOLVER: &str = r#"! cmp -s /etc/resolv.conf "$1/etc/resolv.conf" || rm "$1/etc/resolv.conf""#;
 
-/// A shell script run as root in the image, by `/bin/sh -c` in `/`.
+/// A shell script run as root in the image with `/bin/sh -c`, from `/`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Step {
   pub script: String,
@@ -24,7 +26,7 @@ pub struct Step {
 }
 
 impl Step {
-  /// With the guest's network: `Network::Inherit`.
+  /// Creates a step that uses the guest's network (`Network::Inherit`).
   pub fn new(script: impl Into<String>) -> Self {
     Self {
       script: script.into(),
@@ -33,12 +35,12 @@ impl Step {
   }
 }
 
-/// What a build made.
+/// The result of a build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Built {
   /// The last step's snapshot.
   pub snapshot: String,
-  /// How many steps ran, and how many were already built.
+  /// The number of steps that ran, and the number that were already built.
   pub ran: usize,
   pub cached: usize,
 }
@@ -50,8 +52,8 @@ pub struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-  /// Builds into datasets under `store`, such as `images/builds`, which it
-  /// creates, mounted, if need be.
+  /// Builds into datasets under `store`, such as `images/builds`. `build`
+  /// makes the store, mounted, if it does not exist.
   pub fn new(agent: &'a Agent, store: &str) -> Self {
     Self {
       agent,
@@ -60,9 +62,9 @@ impl<'a> Builder<'a> {
     }
   }
 
-  /// Builds `steps` on the snapshot `from`, running those not built before.
-  /// What they print goes to `output`. Builds into the same store must not
-  /// run at once.
+  /// Builds `steps` on the snapshot `from`, running only the steps not built
+  /// before. Their stdout and stderr go to `output`. Two builds into the same
+  /// store must not run concurrently.
   pub fn build(&self, from: &str, steps: &[Step], output: &mut dyn FnMut(&[u8])) -> Result<Built> {
     self.zfs.create_mounted(&self.store)?;
     let mut built = Built {
@@ -90,11 +92,11 @@ impl<'a> Builder<'a> {
     Ok(built)
   }
 
-  /// Runs `step` in a jail on a fresh clone of `from` at `dataset`, which
-  /// is gone again if the step fails.
+  /// Runs `step` in a jail on a fresh clone of `from` at `dataset`. If the
+  /// step fails, the clone is destroyed.
   fn run(&self, from: &str, dataset: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
-    // Left by a step that failed without cleaning up, such as when the
-    // guest stopped.
+    // A dataset here was left by a step that failed without cleaning up,
+    // such as when the guest stopped.
     if self.zfs.exists(dataset)? {
       self.zfs.destroy(dataset)?;
     }
@@ -127,12 +129,13 @@ impl<'a> Builder<'a> {
   }
 }
 
-/// The step's key: the sha256 of the snapshot it starts from, how it
-/// reaches the network, and its script. Not its addresses: on interfaces
-/// leased again, it is the same step.
+/// Returns the step's cache key: the sha256 of the name of the snapshot it
+/// starts from, its kind of network, and its script. Interface addresses are
+/// left out, so a step on re-leased interfaces keeps the same key.
 fn key(from: &str, step: &Step) -> String {
   let network = match step.network {
-    // As Debug printed them, so steps built before keep their keys.
+    // These match the variants' Debug names, which existing cached steps
+    // were keyed by. Changing them invalidates those caches.
     Network::None => "None",
     Network::Inherit => "Inherit",
     Network::Nat => "Nat",

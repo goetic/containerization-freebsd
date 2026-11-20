@@ -4,10 +4,11 @@
 # REQUIRE: FILESYSTEMS
 # BEFORE: cfbsd_agent
 #
-# Loads the guest bundle's patched virtiofs modules, our fusefs first. Not
-# from loader.conf: the loader loads modules in no set order, and virtiofs
-# first would pull in the stock fusefs from /boot/kernel, which the module
-# path searches first. virtiofs pulls in vtfs.
+# Loads the guest bundle's patched virtiofs modules, starting with its
+# fusefs. loader.conf can't do this: the loader loads modules in no fixed
+# order, and loading virtiofs first would pull in the stock fusefs from
+# /boot/kernel, which the module path searches first. Loading virtiofs pulls
+# in vtfs.
 
 . /etc/rc.subr
 

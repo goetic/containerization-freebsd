@@ -1,10 +1,11 @@
-//! Processes the host runs with Exec: on pipes, or in a pseudo-terminal; in
-//! the guest, or a jail.
+//! Processes the host runs with Exec, on pipes or in a pseudo-terminal, in the
+//! guest or in a jail.
 //!
-//! Each has a thread per output, one feeding its input, and one that waits
-//! for it. Exited closes the channel, so it waits for the output to end as
-//! well as the process: a process that leaves a child holding its output
-//! open runs on, as far as the host can tell, until that child exits too.
+//! Each process has a thread per output stream, one feeding its input, and
+//! one that reaps it. Exited closes the channel, so it is sent only once the
+//! output has ended and the process has exited.
+//! If a child inherits the process's stdout and keeps it open, the host sees
+//! the process as running until that child exits too.
 
 use crate::session::{Handle, Input, Outbox, READ};
 use crate::{sys, user};
@@ -22,8 +23,9 @@ use std::thread::{self, JoinHandle};
 /// A running process, which the session loop signals and resizes.
 pub(crate) struct Process {
   pid: libc::pid_t,
-  /// False once the process has exited, just before it is reaped: after
-  /// that, its pid could be another process's, which no signal must reach.
+  /// Set to false once the process has exited, just before it is reaped.
+  /// After reaping, the pid may be reused by another process, which must not
+  /// receive our signals.
   alive: Mutex<bool>,
   terminal: Option<File>,
 }
@@ -31,14 +33,14 @@ pub(crate) struct Process {
 impl Process {
   fn new(child: &Child, terminal: Option<File>) -> Self {
     Self {
-      // FreeBSD's pids stop at 99999.
+      // The cast cannot overflow: FreeBSD's pids stop at 99999.
       pid: child.id() as libc::pid_t,
       alive: Mutex::new(true),
       terminal,
     }
   }
 
-  /// Signal numbers are the guest's.
+  /// Sends `signal`, numbered as on the guest, to the process.
   pub(crate) fn signal(&self, signal: i32) -> io::Result<()> {
     self.send(self.pid, signal)
   }
@@ -61,7 +63,8 @@ impl Process {
     if *alive { sys::signal(target, signal) } else { Ok(()) }
   }
 
-  /// Waits for the process to exit, and stops signalling it.
+  /// Waits for the process to exit without reaping it, then disables
+  /// signalling it.
   fn exited(&self) {
     if let Err(error) = sys::wait_exited(self.pid) {
       eprintln!("agent: waiting for process {}: {error}", self.pid);
@@ -70,8 +73,9 @@ impl Process {
   }
 }
 
-/// Starts `exec`'s process, whose output goes to `outbox`. The environment
-/// adds to the agent's.
+/// Starts the process `exec` describes and sends its output to `outbox`.
+/// `exec`'s environment is added to the agent's. An error names the step
+/// that failed.
 pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
   let (program, args) = exec
     .argv
@@ -82,8 +86,9 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
     .args(args)
     .envs(exec.env.iter().map(|(name, value)| (name, value)));
   if exec.pty.is_some() {
-    // Its own session, with the terminal as its controlling terminal, as a
-    // login shell has; taken while it is still root.
+    // Give the process its own session with the terminal as its controlling
+    // terminal, as a login shell has. This hook is registered first so it
+    // runs while the process is still root.
     sys::take_terminal_on_exec(&mut command);
   }
   let mut entering = enter(&mut command, exec)?;
@@ -110,9 +115,10 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
   })
 }
 
-/// Has the process enter its jail and take on its user, limits and umask,
-/// then change directory: in its jail, to `/` if to nowhere else. Says
-/// which of those failed, if one did; with none, there is nothing to say.
+/// Sets up the process to enter its jail, set its limits and umask, drop
+/// privileges to its user, then change directory. In a jail, the directory
+/// defaults to `/`. The returned `Entering` reports which step failed; it is
+/// `None` when `exec` asks for none of these steps.
 fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>> {
   if exec.jail.is_none() && exec.user.is_none() && exec.umask.is_none() && exec.limits.is_empty() && exec.cwd.is_none()
   {
@@ -177,8 +183,8 @@ fn window(size: WindowSize) -> sys::WindowSize {
 }
 
 fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
-  // A process group of its own, so ending the channel ends what the process
-  // started too.
+  // A process group of its own, so ending the channel also kills the
+  // process's children.
   command
     .process_group(0)
     .stdin(Stdio::piped())
@@ -209,8 +215,8 @@ fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Re
     .stdout(child_end.try_clone()?)
     .stderr(child_end);
   let child = command.spawn();
-  // The parent's copies of the terminal's child end: until they close,
-  // reading the terminal never ends.
+  // The command holds the agent's descriptors for the pty's child end. Until
+  // they close, reading the controller end never returns EOF.
   drop(command);
   let child = child?;
   let process = Arc::new(Process::new(&child, Some(resizer)));
@@ -224,13 +230,13 @@ fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Re
   Ok(Handle::Process { input, process })
 }
 
-/// Writes the host's Data to `sink`. Its Eof closes `sink`, or with
-/// `closes` false is ignored.
+/// Writes the host's Data to `sink`. The host's Eof closes `sink` if `closes`
+/// is true, and is ignored otherwise.
 fn feed(mut sink: impl Write, inputs: &Receiver<Input>, closes: bool) {
   for input in inputs {
     match input {
       Input::Data(bytes) => {
-        // The process closed its input: the rest has nowhere to go.
+        // The process closed its input, so the rest is discarded.
         if sink.write_all(&bytes).is_err() {
           return;
         }
@@ -241,8 +247,8 @@ fn feed(mut sink: impl Write, inputs: &Receiver<Input>, closes: bool) {
   }
 }
 
-/// Sends what `source` reads as messages `wrap` makes, until it ends; then
-/// Eof, if `eof`.
+/// Reads `source` until it ends, sending each read as a message built by
+/// `wrap`, then sends Eof if `eof` is true.
 fn pump(
   mut source: impl Read + Send + 'static,
   outbox: Outbox,
@@ -261,7 +267,8 @@ fn pump(
           }
         }
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-        // How a terminal ends once no process holds its child end.
+        // Once no descriptor for the child end is open, reading the
+        // controller end fails instead of returning EOF.
         Err(_) => break,
       }
     }
@@ -272,6 +279,7 @@ fn pump(
 }
 
 /// Sends Exited once the output has ended and the process has exited.
+/// Signalling is disabled before `child.wait()` reaps the process.
 fn watch(mut child: Child, process: Arc<Process>, output: Vec<JoinHandle<()>>, outbox: Outbox) {
   thread::spawn(move || {
     for pump in output {

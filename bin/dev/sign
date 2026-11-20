@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 #
-# Signs a binary with `com.apple.security.virtualization`, which
-# Virtualization.framework requires and every rebuild drops.
+# Signs a binary with the `com.apple.security.virtualization` entitlement,
+# which Virtualization.framework requires. Every rebuild drops the signature.
 #
-# DEVELOPMENT_TEAM picks that team's identity. Without it, ad hoc: enough for
-# the entitlement, but a new code identity per build, so anything keyed to one
-# prompts again.
+# DEVELOPMENT_TEAM selects that team's identity. Without it, the binary is
+# signed ad hoc. That is enough for the entitlement, but each build gets a new
+# code identity, so anything keyed to the identity prompts again.
 
 set -e
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env sh
 #
 # Packages the guest bundle: the tree in guest/bundle, plus the virtiofs
-# modules and the agent that guest/build-modules and guest/build-agent build.
+# modules from guest/build-modules and the agent from guest/build-agent.
 #
 #   guest/build-bundle <modules-dir> <agent> <revision> <out-dir>
 #
 # Writes freebsd-15.1-arm64-guest-<revision>.tar.xz and its .sha256 to
-# <out-dir>. The tarball's paths are the guest's, so `tar -xf <it> -C /`
-# installs it. Its bytes depend only on its contents: names sorted, owners
-# root, times zero. Needs GNU tar.
+# <out-dir>. The tarball's paths are the guest's paths, so
+# `tar -xf <tarball> -C /` installs it. The output is reproducible: names are
+# sorted, owners are root and times are zero. Requires GNU tar.
 
 set -eu
 
@@ -32,8 +32,8 @@ done
 install -m 0555 "$agent" "$staging/usr/local/sbin/containerization-freebsd-agent"
 chmod 0555 "$staging"/usr/local/etc/rc.d/*
 
-# Files only: extracting a directory entry over /usr or /boot would reset its
-# mode and times. tar creates any missing parents.
+# List files only: extracting a directory entry over /usr or /boot would
+# reset that directory's mode and times. tar creates missing parents itself.
 (cd "$staging" && find boot usr -type f | LC_ALL=C sort) >"$staging.list"
 tar -C "$staging" --no-recursion --owner=0 --group=0 --numeric-owner --mtime=@0 -T "$staging.list" -cf - |
   xz -9 -T1 >"$out/$name.tar.xz"

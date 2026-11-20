@@ -5,12 +5,12 @@
 #
 #   guest/build-agent <work-dir> <out-dir>
 #
-# The sysroot and build go in <work-dir>, the agent in <out-dir>.
+# The sysroot and build go in <work-dir>, and the agent in <out-dir>.
 #
-# The target is Tier 3: Rust ships no std for it, so cargo builds std from the
-# toolchain's rust-src (-Zbuild-std). RUSTC_BOOTSTRAP allows that on the
-# pinned stable toolchain. It links with LLVM, against FreeBSD's own
-# libraries from the release's base.txz. CROSS_BINDIR names the directory
+# The target is Tier 3, so Rust ships no std for it. Cargo builds std from the
+# toolchain's rust-src (-Zbuild-std), which RUSTC_BOOTSTRAP allows on the
+# pinned stable toolchain. The agent links with LLVM against FreeBSD's own
+# libraries from the release's base.txz. Set CROSS_BINDIR to the directory
 # holding clang and ld.lld, as for guest/build-modules.
 
 set -eu
@@ -39,7 +39,8 @@ sha256() {
 }
 
 if [ ! -e "$sysroot/.complete" ]; then
-  # Reuse one already in <work-dir>, such as the userland's, if it matches.
+  # Reuse a base.txz already in <work-dir>, such as the cached userland, if
+  # its checksum matches.
   if [ ! -e "$work/base.txz" ] || [ "$(sha256 "$work/base.txz")" != "$base_sha256" ]; then
     curl -fsSL -o "$work/base.txz" "$base_url"
   fi
@@ -49,7 +50,8 @@ if [ ! -e "$sysroot/.complete" ]; then
     exit 1
   fi
 
-  # A sysroot left half made can hold read-only directories.
+  # A partly extracted sysroot can contain read-only directories, which
+  # rm -rf can't remove until they are writable.
   if [ -e "$sysroot" ]; then
     chmod -R u+w "$sysroot"
   fi
@@ -61,8 +63,9 @@ if [ ! -e "$sysroot/.complete" ]; then
   touch "$sysroot/.complete"
 fi
 
-# rustc picks the linker's argument style from its name: one ending in -clang
-# gets a C compiler's (-Wl,--as-needed); one named link gets ld's.
+# rustc picks the linker's argument style from its name. A name ending in
+# -clang gets C compiler arguments (-Wl,--as-needed); a name like ld gets
+# linker arguments.
 linker="$work/$target-clang"
 cat >"$linker" <<EOF
 #!/bin/sh
@@ -80,7 +83,7 @@ RUSTC_BOOTSTRAP=1 CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER="$linker" \
 
 cp "$work/target/$target/release/$agent" "$out/$agent"
 
-# file(1) names FreeBSD from the binary's ABI note, which only a FreeBSD
+# file(1) reports FreeBSD from the binary's ABI note, which only a FreeBSD
 # executable carries.
 description="$(file -b "$out/$agent")"
 case "$description" in

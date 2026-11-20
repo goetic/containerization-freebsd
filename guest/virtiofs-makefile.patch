@@ -1,6 +1,6 @@
-Applied after virtiofs-15.1.patch. Its module Makefile omits the generated
-vnode_if.h, so the build fails with `'vnode_if.h' file not found`; fusefs's
-Makefile lists it first in SRCS, and so does this.
+Applied after virtiofs-15.1.patch, whose virtiofs module Makefile omits the
+generated vnode_if.h. Without it, the build fails with `'vnode_if.h' file not
+found`. This patch lists it first in SRCS, as fusefs's Makefile does.
 
 diff --git a/sys/modules/virtiofs/Makefile b/sys/modules/virtiofs/Makefile
 --- a/sys/modules/virtiofs/Makefile

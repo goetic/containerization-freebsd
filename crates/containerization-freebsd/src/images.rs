@@ -1,6 +1,7 @@
-//! Images on the host, in an OCI image layout: `index.json` names each
-//! image by its reference, and `blobs/sha256` holds their content. Like
-//! Containerization's image store; where it lives is the caller's choice.
+//! The host's image store, kept as an OCI image layout: `index.json` names
+//! each image by its reference, and `blobs/sha256` holds the content. It
+//! mirrors Containerization's image store, and the caller chooses where it
+//! lives.
 
 use crate::error::{Error, Result};
 use crate::oci::{
@@ -19,8 +20,8 @@ pub struct ImageStore {
   content: ContentStore,
 }
 
-/// An index or manifest the store names by the reference it was pulled or
-/// tagged as.
+/// An index or manifest in the store, named by the reference it was pulled
+/// or tagged as.
 #[derive(Clone, Debug)]
 pub struct Image {
   pub reference: String,
@@ -29,7 +30,7 @@ pub struct Image {
 }
 
 impl ImageStore {
-  /// The store at `root`, made if need be.
+  /// Opens the store at `root`, creating it if needed.
   pub fn new(root: &Path) -> Result<Self> {
     let content = ContentStore::new(root)?;
     let layout = root.join("oci-layout");
@@ -47,9 +48,9 @@ impl ImageStore {
     &self.content
   }
 
-  /// Pulls `reference`'s image for `platform`: its index, if it has one,
-  /// and the platform's manifest, config and layers. Blobs the store holds
-  /// already aren't downloaded again.
+  /// Pulls `reference`'s image for `platform`: the index if there is one,
+  /// and that platform's manifest, config and layers. Blobs already in the
+  /// store are not downloaded again.
   pub fn pull(&self, reference: &str, platform: &Platform, credentials: Option<Credentials>) -> Result<Image> {
     let reference = Reference::parse(reference)?;
     let client = RegistryClient::new(credentials);
@@ -97,12 +98,14 @@ impl ImageStore {
     self.create(&reference.to_string(), top)
   }
 
-  /// Pushes the image named `reference` to the registry the name gives, as
-  /// Containerization's `push(reference:platform:)` does: the blobs the
-  /// registry lacks, then the manifests, an index's before the index. To
-  /// push it as another name, tag it first. With `platform`, an index is
-  /// pushed as a new index of that platform's manifests; without, whole,
-  /// which needs the manifests a pull doesn't fetch.
+  /// Pushes the image named `reference` to the registry in that name, as
+  /// Containerization's `push(reference:platform:)` does. Blobs the registry
+  /// lacks go first, then the manifests, and an index's manifests before the
+  /// index itself. To push under another name, tag the image first.
+  ///
+  /// With `platform`, an index is pushed as a new index of only that
+  /// platform's manifests. Without it, the whole index is pushed, which needs
+  /// every platform's manifest, and a pull fetches only one.
   pub fn push(&self, reference: &str, platform: Option<&Platform>, credentials: Option<Credentials>) -> Result<()> {
     let image = self.get(reference)?;
     let descriptor = self.for_platform(&image, platform)?;
@@ -113,9 +116,10 @@ impl ImageStore {
     client.push_manifest(&reference, reference.target(), &descriptor, &self.content)
   }
 
-  /// The platforms `reference`'s image is for, without pulling its layers,
-  /// as Containerization's `platforms(reference:)` says: from the store's
-  /// image of that name, or else the registry's.
+  /// The platforms `reference`'s image supports, as Containerization's
+  /// `platforms(reference:)` reports them. Uses the store's image of that
+  /// name if there is one, otherwise asks the registry without pulling
+  /// layers.
   pub fn platforms(&self, reference: &str, credentials: Option<Credentials>) -> Result<Vec<Platform>> {
     let reference = Reference::parse(reference)?;
     let name = reference.to_string();
@@ -132,9 +136,10 @@ impl ImageStore {
     self.platforms_of(&top, Some((&client, &reference)))
   }
 
-  /// The platforms the index or manifest `descriptor` is for: an index's,
-  /// but not an attestation's `unknown/unknown`; or a manifest's config's,
-  /// fetched from `remote` if need be.
+  /// The platforms of the index or manifest `descriptor`. For an index, these
+  /// are its entries' platforms, excluding the `unknown/unknown` that marks
+  /// attestations. For a manifest, it is its config's platform, with the
+  /// config fetched from `remote` if the store lacks it.
   fn platforms_of(
     &self,
     descriptor: &Descriptor,
@@ -166,9 +171,10 @@ impl ImageStore {
     Ok(vec![config.platform()])
   }
 
-  /// What of `image` to push or save for `platform`: an index of only its
-  /// manifests for `platform`, as a new index in the store unless that is
-  /// all of them. Without `platform`, the image itself.
+  /// The descriptor to push or save for `image` and `platform`. For an index,
+  /// this is a new index in the store holding only `platform`'s manifests,
+  /// unless they are all of them. Without `platform`, or for a manifest, it
+  /// is the image's own descriptor.
   fn for_platform(&self, image: &Image, platform: Option<&Platform>) -> Result<Descriptor> {
     let Some(platform) = platform else {
       return Ok(image.descriptor.clone());
@@ -218,8 +224,8 @@ impl ImageStore {
     })
   }
 
-  /// Pushes what `descriptor` lists: a manifest's config and layers, or an
-  /// index's manifests, by digest.
+  /// Pushes everything `descriptor` refers to: a manifest's config and
+  /// layers, or an index's manifests (by digest) and their contents.
   fn push_children(&self, client: &RegistryClient, reference: &Reference, descriptor: &Descriptor) -> Result<()> {
     let bytes = self.content.read(&descriptor.digest)?;
     if !descriptor.is_index() {
@@ -246,8 +252,8 @@ impl ImageStore {
     Ok(())
   }
 
-  /// Names `descriptor`, an index or manifest in the store, `reference`,
-  /// replacing any image of that name.
+  /// Names `descriptor`, an index or manifest in the store, as `reference`,
+  /// replacing any existing image of that name.
   pub fn create(&self, reference: &str, descriptor: Descriptor) -> Result<Image> {
     let reference = Reference::parse(reference)?.to_string();
     if !self.content.has(&descriptor.digest) {
@@ -294,14 +300,15 @@ impl ImageStore {
     )
   }
 
-  /// Names `existing`'s image `new` too.
+  /// Adds the name `new` to the image named `existing`.
   pub fn tag(&self, existing: &str, new: &str) -> Result<Image> {
     let image = self.get(existing)?;
 
     self.create(new, image.descriptor)
   }
 
-  /// Forgets `reference`, and deletes the blobs no image needs any more.
+  /// Removes the name `reference`, then deletes every blob that no remaining
+  /// image needs.
   pub fn delete(&self, reference: &str) -> Result<()> {
     let reference = Reference::parse(reference)?.to_string();
 
@@ -325,12 +332,13 @@ impl ImageStore {
   }
 
   /// Loads the images in the OCI image layout at `directory`, as
-  /// Containerization's `load(from:)` does. To load an archive of one, such
-  /// as FreeBSD's container images on download.freebsd.org, unpack it
-  /// first. Each image is named by its `org.opencontainers.image.ref.name`,
-  /// normalized as references are: `freebsd-static:15.1-RELEASE-aarch64`
-  /// is `docker.io/library/freebsd-static:15.1-RELEASE-aarch64`. Blobs the
-  /// store holds already are skipped.
+  /// Containerization's `load(from:)` does. An archived layout, such as
+  /// FreeBSD's container images on download.freebsd.org, must be unpacked
+  /// first. Each image is named by its `org.opencontainers.image.ref.name`
+  /// annotation, normalized like any reference, so
+  /// `freebsd-static:15.1-RELEASE-aarch64` becomes
+  /// `docker.io/library/freebsd-static:15.1-RELEASE-aarch64`. Blobs already
+  /// in the store are not copied.
   pub fn load(&self, directory: &Path) -> Result<Vec<Image>> {
     let path = directory.join("index.json");
     let bytes = std::fs::read(&path).map_err(Error::io(format!("reading {}", path.display())))?;
@@ -361,11 +369,11 @@ impl ImageStore {
       .collect()
   }
 
-  /// Saves the images named `references` as an OCI image layout at `out`,
-  /// with every blob they need, as Containerization's
-  /// `save(references:out:platform:)` does: with `platform`, an index as a
-  /// new index of that platform's manifests. `out` is made if need be, and
-  /// an `index.json` there replaced.
+  /// Saves the images named `references`, with every blob they need, as an
+  /// OCI image layout at `out`, as Containerization's
+  /// `save(references:out:platform:)` does. With `platform`, an index is
+  /// saved as a new index of only that platform's manifests. `out` is
+  /// created if needed, and any `index.json` there is replaced.
   pub fn save(&self, references: &[&str], out: &Path, platform: Option<&Platform>) -> Result<()> {
     let manifests = references
       .iter()
@@ -400,10 +408,10 @@ impl ImageStore {
     Ok(())
   }
 
-  /// Copies `descriptor`'s blob from the layout at `directory`, and those
-  /// it lists, unless the store holds them. A manifest an index lists may
-  /// be missing, as a pull leaves it; anything else missing, `missing`
-  /// finds.
+  /// Copies `descriptor`'s blob, and the blobs it refers to, from the layout
+  /// at `directory` into the store, skipping blobs the store already has. An
+  /// index's manifests may be absent, as after a pull; this skips them, and
+  /// later checks report any other absent blob.
   fn import(&self, directory: &Path, descriptor: &Descriptor) -> Result<()> {
     if !self.copy_in(directory, &descriptor.digest)? {
       return Ok(());
@@ -426,7 +434,7 @@ impl ImageStore {
   }
 
   /// Copies the blob `digest` from the layout at `directory` unless the
-  /// store holds it: whether the store holds it now.
+  /// store already has it. Returns whether the store has it afterwards.
   fn copy_in(&self, directory: &Path, digest: &str) -> Result<bool> {
     if self.content.has(digest) {
       return Ok(true);
@@ -440,8 +448,9 @@ impl ImageStore {
     }
   }
 
-  /// A blob the index's images need that the store lacks, if any. A
-  /// manifest for another platform may be missing, as a pull leaves it.
+  /// A blob that the index's images need and the store lacks, if any. A
+  /// missing manifest is not reported, since a pull fetches only one
+  /// platform's manifest.
   fn missing(&self, index: &Index) -> Result<Option<String>> {
     Ok(
       self
@@ -451,7 +460,9 @@ impl ImageStore {
     )
   }
 
-  /// Every blob the index's images need that the store holds.
+  /// Every blob the index's images need. Indexes and manifests the store
+  /// lacks are skipped, but configs and layers are included whether or not
+  /// the store has them.
   fn reachable(&self, index: &Index) -> Result<BTreeSet<String>> {
     let mut needed = BTreeSet::new();
     let mut pending: Vec<Descriptor> = index.manifests.clone();
@@ -491,8 +502,8 @@ impl ImageStore {
     }
   }
 
-  /// Changes `index.json` under a lock, so stores in other processes don't
-  /// lose each other's changes.
+  /// Applies `change` to `index.json` under a file lock, so that stores in
+  /// other processes do not overwrite each other's changes.
   fn update(&self, change: impl FnOnce(&mut Index) -> Result<()>) -> Result<()> {
     let lock_path = self.root.join("index.json.lock");
     let locking = || format!("locking {}", lock_path.display());
@@ -510,7 +521,7 @@ impl ImageStore {
 }
 
 impl Image {
-  /// The manifest for `platform`: its descriptor, and the manifest.
+  /// The manifest for `platform`, with its descriptor.
   pub fn manifest(&self, platform: &Platform) -> Result<(Descriptor, Manifest)> {
     let descriptor = if self.descriptor.is_index() {
       let index: Index = parse(
@@ -550,7 +561,7 @@ impl Image {
   }
 }
 
-/// The index's manifest for `platform`, if it has one.
+/// The first manifest in `index` that runs on `platform`, if any.
 fn choose(index: &Index, platform: &Platform) -> Option<Descriptor> {
   index
     .manifests
@@ -582,7 +593,7 @@ fn name(entry: &Descriptor) -> Option<&String> {
   entry.annotations.get(REF_NAME)
 }
 
-/// Where the layout at `root` keeps the blob `digest`.
+/// The path of the blob `digest` in the OCI image layout at `root`.
 fn layout_blob(root: &Path, digest: &str) -> Result<PathBuf> {
   let hex = sha256_hex(digest).ok_or_else(|| Error::Invalid(format!("{digest:?} is not a sha256 digest")))?;
 
@@ -613,7 +624,7 @@ mod tests {
     serde_json::to_vec(value).unwrap()
   }
 
-  /// An arm64 FreeBSD image of one layer: the layer, config and manifest.
+  /// The layer, config and manifest of a one-layer arm64 FreeBSD image.
   fn documents() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let layer = b"layer".to_vec();
     let config = json(&ImageConfig {
@@ -638,9 +649,10 @@ mod tests {
     (layer, config, manifest)
   }
 
-  /// A registry on loopback, serving `test/image:1` behind a bearer token as
-  /// ghcr.io does: an index whose arm64 FreeBSD image it holds, and whose
-  /// amd64 one it doesn't. Blobs redirect to storage, as registries' do.
+  /// A loopback registry that serves `test/image:1` behind a bearer token, as
+  /// ghcr.io does. The image is an index listing arm64 and amd64 FreeBSD
+  /// manifests, but the registry serves only the arm64 one. Blob requests
+  /// redirect to a storage path, as real registries' often do.
   fn registry() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -729,9 +741,10 @@ mod tests {
     address
   }
 
-  /// A registry on loopback that takes pushes and serves pulls of any
-  /// repository behind a bearer token: POST and PUT need a push token, GET
-  /// and HEAD either. Uploads go to a location of their own.
+  /// A loopback registry that accepts pushes and serves pulls for any
+  /// repository behind a bearer token. POST and PUT need a push token; GET
+  /// and HEAD accept a pull or push token. Blob uploads go to a separate
+  /// upload location.
   fn writable_registry() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -857,8 +870,8 @@ mod tests {
       .unwrap();
     let writable = writable_registry();
 
-    // The pull fetched only arm64's manifest of the index: pushed whole,
-    // it is refused; for arm64, it is a new index of that alone.
+    // The pull fetched only the index's arm64 manifest, so pushing the whole
+    // index fails. Pushing for arm64 pushes a new index of that manifest.
     let whole = format!("{writable}/test/index:1");
     store.tag(&image.reference, &whole).unwrap();
     let error = store.push(&whole, None, None).unwrap_err();
@@ -867,7 +880,8 @@ mod tests {
       .push(&whole, Some(&Platform::default()), None)
       .unwrap();
 
-    // One platform's manifest, and an index of only that, pushed as they are.
+    // A single manifest, and an index of only that manifest, are pushed
+    // unchanged.
     let (manifest, _) = image.manifest(&Platform::default()).unwrap();
     let single = format!("{writable}/test/single:1");
     store.create(&single, manifest.clone()).unwrap();
@@ -915,7 +929,7 @@ mod tests {
     let image = store.pull(&reference, &Platform::default(), None).unwrap();
     assert_eq!(store.platforms(&reference, None).unwrap(), both);
 
-    // A manifest's, from its config.
+    // A manifest's platform comes from its config.
     let (manifest, _) = image.manifest(&Platform::default()).unwrap();
     store.create("ghcr.io/test/single:1", manifest).unwrap();
     assert_eq!(
@@ -924,7 +938,8 @@ mod tests {
     );
   }
 
-  /// `bytes` in `store`, as a blob of `media_type`.
+  /// Stores `bytes` in `store` and returns a descriptor of `media_type` for
+  /// them.
   fn blob_of(store: &ImageStore, media_type: &str, bytes: &[u8]) -> Descriptor {
     store.content().ingest(bytes).unwrap();
     descriptor(media_type, bytes, None)
@@ -1024,7 +1039,8 @@ mod tests {
     loaded_digests.sort_unstable();
     assert_eq!(loaded_digests, digests);
 
-    // For one platform, an index of that platform's manifest alone.
+    // Saving for one platform writes a new index of only that platform's
+    // manifest.
     let arm64 = work.path().join("arm64");
     store
       .save(&[&reference], &arm64, Some(&Platform::default()))
@@ -1039,8 +1055,8 @@ mod tests {
     assert_eq!(saved.platforms(&reference, None).unwrap(), [Platform::default()]);
   }
 
-  /// An OCI image layout at `root` holding the blobs `files`, its index
-  /// naming `manifest`'s image `name`.
+  /// Writes an OCI image layout at `root` holding the blobs `files`, with an
+  /// index that names `manifest`'s image `name`.
   fn layout(root: &Path, name: &str, manifest: &[u8], files: &[&[u8]]) -> PathBuf {
     let mut entry = descriptor(media_type::MANIFEST, manifest, None);
     entry
@@ -1094,7 +1110,8 @@ mod tests {
     let error = store.load(&lacking).unwrap_err();
     assert!(error.to_string().contains(&sha256_digest(&layer)), "{error}");
 
-    // The store has the manifest and config now, but not the layer.
+    // The previous load left the manifest and config in the store, but not
+    // the layer.
     let forged = layout(&work.path().join("forged"), name, &manifest, &[]);
     std::fs::write(layout_blob(&forged, &sha256_digest(&layer)).unwrap(), "something else").unwrap();
     assert!(matches!(store.load(&forged).unwrap_err(), Error::Checksum { .. }));

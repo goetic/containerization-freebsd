@@ -1,11 +1,12 @@
 #!/bin/sh
-# The seed volume's user-data: runs once, at the end of the first boot's rc
-# (nuageinit_user_data_script), after nuageinit has unmounted the seed. Mounts
-# it again to install the guest bundle from it, then starts the bundle's agent,
-# which serves the host on /dev/ttyV0.0 at this boot and every later one.
+# The seed volume's user-data. It runs once, at the end of the first boot's rc
+# (nuageinit_user_data_script), after nuageinit has unmounted the seed. It
+# mounts the seed again, installs the guest bundle from it, and starts the
+# bundle's agent, which serves the host on /dev/ttyV0.0 from then on.
 
 set -ex
-# The host shows console text that arrives before the agent's first frame.
+# The host displays console text that arrives before the agent's first frame,
+# so this script's trace is visible there.
 exec >/dev/ttyV0.0 2>&1
 
 seed=/media/cfbsd-seed
@@ -16,11 +17,11 @@ umount "$seed"
 rmdir "$seed"
 
 sysrc cfbsd_agent_enable=YES
-# The image boots at once already (autoboot_delay=-1). Later boots skip the
-# first boot's package upgrade, which needs the network.
+# The image already boots without delay (autoboot_delay=-1). Disable the
+# first-boot package upgrade on later boots, because it needs the network.
 sysrc firstboot_pkg_upgrade_enable=NO
-# DHCP and IPv6 autoconfiguration on the first network device only, the NAT
-# device: the others stay unconfigured until a jail claims one.
+# Run DHCP and IPv6 autoconfiguration only on the first network device, which
+# is the NAT device. The others stay unconfigured until a jail claims one.
 sysrc -x ifconfig_DEFAULT
 sysrc ifconfig_vtnet0=SYNCDHCP ifconfig_vtnet0_ipv6="inet6 accept_rtadv"
 

@@ -1,4 +1,4 @@
-//! Frames on one byte stream:
+//! The frame format on the console's byte stream:
 //!
 //! ```text
 //! magic        4 bytes  F5 C0 FB 5D
@@ -10,15 +10,16 @@
 //! payload crc  u32 LE   CRC-32 of the payload
 //! ```
 //!
-//! After the magic, every F5 is sent as F5 00; lengths and checksums count
-//! the bytes before. So a magic starts a frame and nothing else does: not
-//! text the guest printed before the agent started, as F5 never occurs in
-//! UTF-8, and not a payload, whatever it holds.
+//! After the magic, every F5 byte is escaped as F5 00. Lengths and checksums
+//! cover the unescaped bytes. So the magic appears only at the start of a
+//! frame: never in a payload, whatever it holds, nor in text the guest
+//! printed before the agent started, because F5 never occurs in UTF-8.
 //!
 //! The console has no framing of its own, and a restore or a restarted host
-//! can join it mid-frame, so the decoder drops bytes until a magic, and drops
-//! a frame the next magic cuts short. The header has its own checksum so a
-//! corrupt length fails at once, not when the next frame arrives.
+//! can join the stream mid-frame. So the decoder drops bytes until it finds a
+//! magic, and drops any frame that the next magic cuts short. The header has
+//! its own checksum so that a corrupt length is rejected at once, instead of
+//! swallowing the bytes of the frames that follow.
 
 use std::collections::VecDeque;
 use std::mem;
@@ -26,9 +27,9 @@ use std::mem;
 pub const MAGIC: [u8; 4] = [0xF5, 0xC0, 0xFB, 0x5D];
 pub const MAX_PAYLOAD: usize = 1 << 20;
 
-/// Follows an F5 that doesn't start a magic.
+/// The escape byte, sent after an F5 that does not start a magic.
 const ESCAPED: u8 = 0x00;
-/// Channel, kind, length and the header's checksum.
+/// The size of the channel, kind, length and header checksum.
 const HEADER: usize = 13;
 const TRAILER: usize = 4;
 
@@ -44,7 +45,7 @@ impl Frame {
   ///
   /// # Panics
   ///
-  /// If the payload is over [`MAX_PAYLOAD`].
+  /// Panics if the payload is larger than [`MAX_PAYLOAD`].
   pub fn encode(&self, out: &mut Vec<u8>) {
     assert!(
       self.payload.len() <= MAX_PAYLOAD,
@@ -81,18 +82,18 @@ fn escape(bytes: &[u8], out: &mut Vec<u8>) {
   }
 }
 
-/// Bytes the decoder dropped to find the next frame. Mid-session, that means
-/// frames were lost: the host should start the session over, or the agent
-/// announce itself so that the host does.
+/// The number of bytes the decoder dropped to find the next frame. During a
+/// session this means frames were lost: the host should start a new session,
+/// or the agent should announce itself so that the host does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Skipped(pub usize);
 
 #[derive(Debug, Default)]
 pub struct Decoder {
   state: State,
-  /// The frame after its magic, unescaped, so far.
+  /// The unescaped bytes of the current frame after its magic, so far.
   body: Vec<u8>,
-  /// The bytes the frame took on the stream, its magic and escapes included.
+  /// The current frame's length on the stream, including magic and escapes.
   taken: usize,
   skipped: usize,
   decoded: VecDeque<Result<Frame, Skipped>>,
@@ -100,9 +101,9 @@ pub struct Decoder {
 
 #[derive(Clone, Copy, Debug)]
 enum State {
-  /// How much of a magic has arrived.
+  /// Searching for a magic, with this many of its bytes matched.
   Magic(usize),
-  /// Inside a frame, perhaps just after an F5.
+  /// Inside a frame. `escaping` is set just after an F5.
   Frame { escaping: bool },
 }
 
@@ -124,8 +125,8 @@ impl Decoder {
     self.report_skipped();
   }
 
-  /// The next frame or run of dropped bytes, in stream order; or `None`
-  /// until more bytes arrive.
+  /// Returns the next frame or run of dropped bytes, in stream order, or
+  /// `None` if more bytes are needed.
   pub fn decode(&mut self) -> Option<Result<Frame, Skipped>> {
     self.decoded.pop_front()
   }
@@ -143,7 +144,8 @@ impl Decoder {
       }
       State::Magic(0) => self.skipped += 1,
       State::Magic(matched) => {
-        // No later byte of a magic is F5, so only this one can start another.
+        // Only the magic's first byte is F5, so a new magic can start at this
+        // byte but not at any byte already matched.
         self.skipped += matched;
         self.state = State::Magic(0);
         self.byte(byte);
@@ -154,7 +156,7 @@ impl Decoder {
         self.take(MAGIC[0]);
       }
       State::Frame { escaping: true } => {
-        // That F5 started a magic, cutting this frame short.
+        // The previous F5 started a magic, which cuts this frame short.
         self.skipped += self.taken - 1;
         self.state = State::Magic(1);
         self.byte(byte);
@@ -170,8 +172,8 @@ impl Decoder {
     }
   }
 
-  /// Adds an unescaped byte to the frame, which ends at a header that fails,
-  /// or at its last byte.
+  /// Adds an unescaped byte to the frame. The frame ends early if its header
+  /// is invalid, and otherwise at its last byte.
   fn take(&mut self, byte: u8) {
     self.body.push(byte);
     if self.body.len() < HEADER {
@@ -346,8 +348,8 @@ mod tests {
 
   #[test]
   fn never_takes_a_payload_for_a_frame() {
-    // As after a restore: a frame cut short whose payload holds a frame's
-    // bytes, then the next host's first frame.
+    // Simulates a restore: a frame cut short, whose payload holds an encoded
+    // frame, followed by the new host's first frame.
     let hidden = frame(2, b"forged").to_bytes();
     let cut = frame(4, &hidden).to_bytes();
     let cut = &cut[..cut.len() - 1];
@@ -363,7 +365,7 @@ mod tests {
 
   #[test]
   fn drops_a_frame_the_next_magic_cuts_short() {
-    // Waiting out the length it claims would swallow the next host's Hello.
+    // Waiting for the claimed length would swallow the new host's Hello.
     let long = frame(2, &[b'x'; 100_000]).to_bytes();
     let mut decoder = Decoder::new();
     decoder.push(&long[..1000]);

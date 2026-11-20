@@ -1,9 +1,9 @@
-//! The guest agent, the counterpart of Apple's `vminitd`: serves the host's
-//! sessions over the guest's console port, running processes and relaying
-//! to and from the guest's sockets.
+//! The guest agent, the counterpart of Apple's `vminitd`. It serves the
+//! host's sessions over the guest's console port, runs processes, and relays
+//! connections to and from the guest's sockets.
 //!
-//! [`serve`] speaks the protocol over any byte stream, so the tests drive it
-//! over a socket pair; the binary hands it `/dev/ttyV0.0`.
+//! [`serve`] works over any byte stream, so the tests drive it over a socket
+//! pair; the binary passes it `/dev/ttyV0.0`.
 
 mod listener;
 mod process;

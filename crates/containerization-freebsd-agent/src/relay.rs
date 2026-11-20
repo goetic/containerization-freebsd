@@ -1,6 +1,6 @@
-//! Relays: to the guest's sockets, which the host opens with Connect; and
-//! from connections to the sockets the agent listens on, which the agent
-//! opens with Accepted.
+//! Relays between a channel and a connection. The host opens a relay to a
+//! guest socket with Connect; the agent opens one with Accepted for each
+//! connection to a socket it listens on.
 
 use crate::session::{Handle, Input, Outbox, READ};
 use crate::sys::{self, SocketAddress};
@@ -16,7 +16,7 @@ pub(crate) enum Connection {
   Unix(UnixStream),
 }
 
-/// Connects as `connect` says: from inside its jail, if it has one.
+/// Connects as `connect` describes, from inside its jail if it names one.
 pub(crate) fn connect(connect: &Connect, outbox: Outbox) -> io::Result<Handle> {
   let jail = sys::jail_id(connect.jail.as_deref())?;
   let connection = match (&connect.to, jail) {
@@ -48,13 +48,14 @@ pub(crate) fn start(connection: Connection, outbox: Outbox) -> io::Result<Handle
   Ok(Handle::Relay { input, connection })
 }
 
-/// Writes the host's Data to the connection, and at its Eof shuts the
-/// connection's write side.
+/// Writes the host's Data to the connection, and at its Eof half-closes the
+/// connection.
 fn forward(mut connection: Connection, inputs: &Receiver<Input>) {
   for input in inputs {
     match input {
       Input::Data(bytes) => {
-        // Reading fails too, and tells the host.
+        // The peer closed or reset the connection: the rest of the Data has
+        // nowhere to go.
         if connection.write_all(&bytes).is_err() {
           return;
         }
@@ -67,8 +68,8 @@ fn forward(mut connection: Connection, inputs: &Receiver<Input>) {
   }
 }
 
-/// Sends what the connection reads as Data, then Eof; or Error, if reading
-/// fails.
+/// Sends what the connection reads as Data, then Eof. Sends Error instead if
+/// reading fails.
 fn back(mut connection: Connection, outbox: &Outbox) {
   let mut buffer = vec![0; READ];
 

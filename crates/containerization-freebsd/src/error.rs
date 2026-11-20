@@ -15,17 +15,17 @@ pub enum Error {
     actual: String,
     expected: String,
   },
-  /// The guest did something other than what it was expected to.
+  /// The guest behaved unexpectedly.
   Guest(String),
-  /// An invalid request, such as an id no jail can take, or starting a
-  /// container twice.
+  /// The request is invalid, such as a jail id FreeBSD does not accept, or
+  /// starting a container twice.
   Invalid(String),
   Io {
     action: String,
     error: std::io::Error,
   },
-  /// The guest agent's session ended (as when the guest reboots) while what
-  /// the message names was waiting on it.
+  /// The guest agent's session ended, for example because the guest rebooted,
+  /// while the operation the message names was waiting on it.
   SessionEnded(String),
   Timeout(String),
   Virtualization {

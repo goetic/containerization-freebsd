@@ -1,12 +1,13 @@
-//! Reads the FreeBSD kernel's message buffer straight out of guest RAM, for a
-//! kernel that has no console Virtualization can show.
+//! Reads the FreeBSD kernel's message buffer directly from guest RAM, for
+//! debugging a kernel that has no console Virtualization can show.
 //!
 //! Guest memory is reachable only through a custom virtio device, which
-//! breaks save (`VZErrorDomain` 11): hence the `kernel-messages` feature.
+//! breaks save (`VZErrorDomain` 11), so this sits behind the
+//! `kernel-messages` feature.
 //!
-//! The library's only unsafe code: copying out of Virtualization's mapping
-//! of guest memory, which can't be made safe, as Apple doesn't promise the
-//! memory stays readable.
+//! This module holds the library's only unsafe code: copying from
+//! Virtualization's mapping of guest memory. The copy cannot be made safe,
+//! because Apple does not promise that the memory stays readable.
 
 #![allow(unsafe_code)]
 
@@ -18,13 +19,14 @@ use virtualization::{
   CustomVirtioDeviceDelegateProvider, Error,
 };
 
-/// The watchdog device: FreeBSD has no driver for it, so the guest never
-/// touches it.
+/// The virtio watchdog device ID. FreeBSD has no driver for it, so the guest
+/// never touches the device.
 const DEVICE_ID: u16 = 21;
 /// `MSG_MAGIC` in `sys/sys/msgbuf.h`.
 const MSG_MAGIC: u32 = 0x063062;
 const CHUNK: u64 = 64 << 20;
-/// Where to look for RAM: Virtualization doesn't say where it puts it.
+/// The range probed for RAM, since Virtualization does not say where it puts
+/// guest memory.
 const PROBE_LIMIT: u64 = 64 << 30;
 const PROBE_STEP: u64 = 16 << 20;
 
@@ -46,8 +48,8 @@ impl CustomVirtioDeviceConfigurationDelegate for Created {
   }
 }
 
-/// The device a machine is configured with, and the delegate Virtualization
-/// holds only weakly.
+/// The memory device for a machine's configuration. It keeps the delegate
+/// alive, because Virtualization holds it only weakly.
 pub struct Memory {
   created: Arc<Created>,
   queue: DispatchRetained<DispatchQueue>,
@@ -76,7 +78,8 @@ impl Memory {
     Ok(configuration)
   }
 
-  /// The kernel's messages so far, or why they couldn't be read.
+  /// Returns the kernel's messages so far, or the reason they could not be
+  /// read.
   pub fn kernel_messages(&self) -> Result<String, String> {
     let device = self
       .created
@@ -97,11 +100,11 @@ fn copy(device: &CustomVirtioDevice, address: u64, length: u64) -> Option<Vec<u8
   let mut bytes = vec![0u8; mapped];
 
   // SAFETY: not guaranteed. Virtualization maps `mapped` bytes at
-  // `mutable_bytes` while `mapping` lives, but Apple doesn't promise they stay
-  // readable: if the machine stops or reboots during the copy, it can fault.
-  // Only an off-by-default debugging aid reads them, from a running machine.
-  // The guest may write them meanwhile; a torn read only garbles text we
-  // print.
+  // `mutable_bytes` while `mapping` lives, but Apple does not promise they
+  // stay readable: if the machine stops or reboots during the copy, the copy
+  // can fault. Only an off-by-default debugging aid reads them, from a running
+  // machine. The guest may write the bytes during the copy; a torn read only
+  // garbles the printed text.
   unsafe {
     std::ptr::copy_nonoverlapping(mapping.mutable_bytes().cast::<u8>(), bytes.as_mut_ptr(), mapped);
   }
@@ -113,9 +116,9 @@ fn word(bytes: &[u8], at: usize) -> Option<u32> {
   Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
 }
 
-/// Finds RAM, then `struct msgbuf` by its magic: `msg_ptr` (8 bytes),
-/// `msg_magic`, `msg_size`, `msg_wseq`, with the buffer's `msg_size` bytes
-/// just before the struct (`msgbufinit`).
+/// Finds RAM, then finds `struct msgbuf` by its magic number. The struct's
+/// layout is `msg_ptr` (8 bytes), `msg_magic`, `msg_size`, `msg_wseq`, and
+/// `msgbufinit` places the buffer's `msg_size` bytes just before the struct.
 fn read(device: &CustomVirtioDevice) -> Result<String, String> {
   let mut ram = Vec::new();
   let mut address = 0;
@@ -165,8 +168,8 @@ fn read(device: &CustomVirtioDevice) -> Result<String, String> {
   }
 }
 
-/// The ring's contents in order: `msg_wseq` counts bytes written, modulo a
-/// multiple of the size.
+/// Returns the ring buffer's contents, oldest first. `msg_wseq` counts the
+/// bytes written, modulo a multiple of the size.
 fn text(buffer: &[u8], size: u32, sequence: u32, header: u64) -> String {
   let position = (sequence % size) as usize;
   let ordered: Vec<u8> = if sequence < size {

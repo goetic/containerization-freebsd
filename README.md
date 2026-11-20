@@ -1,12 +1,11 @@
 # containerization-freebsd
 
-FreeBSD virtual machines on macOS, in Rust via Apple's Virtualization framework.
-A counterpart to Apple's
-[Containerization] for FreeBSD
-guests, built on [virtualization].com/synchronal/virtualization).
+FreeBSD virtual machines on macOS, in Rust, through Apple's Virtualization
+framework. It is a counterpart to Apple's [Containerization] for FreeBSD
+guests, built on [virtualization].
 
-Guests boot the stock 15.1 kernel from FreeBSD's arm64 VM image, through UEFI,
-from APFS copy-on-write clones.
+Guests boot the stock 15.1 kernel from FreeBSD's arm64 VM image through UEFI.
+Each guest's disk is an APFS copy-on-write clone.
 
 ## Status
 
@@ -16,17 +15,17 @@ Pre-release.
 
 - A single-port virtio console, `/dev/ttyV0.0` in the guest, which the agent
   serves. A multiport console device stalls rc under Virtualization.
-- The guest bundle, installed from the seed volume on the first boot: the
-  agent, started by rc, and the patched virtiofs modules, loaded at boot.
-- No graphics, entropy or USB devices: FreeBSD hangs attaching vtgpu(4), and
+- The guest bundle, installed from the seed volume on the first boot. It holds
+  the agent, which rc starts, and the patched virtiofs modules.
+- No graphics, entropy or USB devices. FreeBSD hangs attaching vtgpu(4), and
   the others are suspected of stalling rc or aborting the VM.
-- `hw.vtnet.csum_disable=1` and `hw.vtnet.mq_disable=1`, written to
-  `/efi/freebsd/loader.env` on the disk's EFI partition: Apple's virtio-net
-  rejects the offloads vtnet(4) otherwise asks for.
-- `kern.racct.enable=1` there too, so the kernel accounts for what processes
-  use, as jails' limits and statistics need.
-- NAT networking only when asked for.
-- Host directories over virtio-fs, which FreeBSD 15.1 mounts only with the
+- `hw.vtnet.csum_disable=1` and `hw.vtnet.mq_disable=1` in
+  `/efi/freebsd/loader.env` on the disk's EFI partition, because Apple's
+  virtio-net rejects the offloads vtnet(4) asks for by default.
+- `kern.racct.enable=1` in the same file, so the kernel accounts for resource
+  use, which jails' limits and statistics need.
+- NAT networking, only when requested.
+- Host directories over virtio-fs. FreeBSD 15.1 can mount them only with the
   patched modules in `guest/`.
 
 ## Layout
@@ -44,15 +43,19 @@ Pre-release.
 
 The integration suite boots VMs, so its binary must carry
 `com.apple.security.virtualization`. `bin/dev/test-integration` builds, signs
-and runs it, so is slow. Before it, nextest's setup scripts download FreeBSD's
-VM image and the userland into `~/.cache/containerization-freebsd-tests`
-(`bin/dev/fetch-image`), and build the guest bundle from the working tree
-(`bin/dev/build-guest-bundle`), which needs Homebrew's `llvm`, `lld`,
-`gnu-tar` and `xz`. The suite never boots a released bundle, so the agent can
-change without one: tag `guest-15.1-r<N>` once it is stable, and pin that.
+and runs it, and is slow. Before the suite runs, nextest's setup scripts:
 
-Set `DEVELOPMENT_TEAM` in `.local/envrc` to sign with that team's identity;
-unset, `bin/dev/sign` signs ad hoc.
+- download FreeBSD's VM image, the userland and the pinned guest bundle into
+  `~/.cache/containerization-freebsd-tests` (`bin/dev/fetch-image`);
+- build the guest bundle from the working tree
+  (`bin/dev/build-guest-bundle`), which needs Homebrew's `llvm`, `lld`,
+  `gnu-tar` and `xz`.
+
+The suite never boots a released bundle, so the agent can change without a
+release. Once the agent is stable, tag `guest-15.1-r<N>` and pin that bundle.
+
+To sign with a team's identity, set `DEVELOPMENT_TEAM` in `.local/envrc`.
+Without it, `bin/dev/sign` signs ad hoc.
 
 ## License
 

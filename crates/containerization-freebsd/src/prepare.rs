@@ -1,5 +1,5 @@
-//! A guest's first boot from FreeBSD's VM image: what makes a base that
-//! later machines clone or restore.
+//! Runs a guest's first boot from FreeBSD's VM image. The result is the base
+//! disk that later machines clone or restore.
 
 use crate::error::{Error, Result};
 use crate::image;
@@ -11,24 +11,25 @@ use std::time::Duration;
 const FIRST_BOOT: &str = include_str!("../../../guest/first-boot.sh");
 /// The guest bundle's name on the seed volume, where `FIRST_BOOT` finds it.
 const BUNDLE: &str = "bundle.tar.xz";
-/// A first boot that upgrades reboots once, and the agent starts again.
+/// The most boots to wait through. A first boot that upgrades reboots once,
+/// and the agent then starts again.
 const BOOTS: usize = 3;
 
 /// What a guest's first boot brings up to date.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upgrade {
-  /// The image's own first boot: over NAT, it upgrades to the release's
-  /// latest patches, and reboots if that installed anything. Minutes.
+  /// The first boot has NAT, upgrades to the release's latest patches, and
+  /// reboots if that installed anything. This takes minutes.
   Latest,
-  /// The image as released: the first boot has no network, so nothing to
-  /// upgrade. Seconds.
+  /// The first boot has no network and keeps the image as released. This
+  /// takes seconds.
   None,
 }
 
 /// Clones `base` into `directory` as a disk of `size` bytes, boots it once
-/// with a seed volume that installs `bundle` (the guest bundle: the agent and
-/// the virtiofs modules), waits for the first boot to finish, and powers it
-/// off. The layout boots the prepared disk again; it has no seed or network.
+/// with a seed volume that installs `bundle` (the agent and the virtiofs
+/// modules), waits for the first boot to finish, and powers the machine off.
+/// The returned layout boots the prepared disk without a seed or network.
 pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundle: &Path) -> Result<Layout> {
   std::fs::create_dir_all(directory).map_err(Error::io(format!("making {}", directory.display())))?;
 
@@ -58,10 +59,10 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
   Ok(layout)
 }
 
-/// Waits for rc to delete /firstboot, which it does only when it finishes,
-/// after the seed's script starts the agent, and then reboots if the package
-/// upgrade installed anything. Powered off sooner, the next boot is a first
-/// boot again.
+/// Waits for rc to delete /firstboot. rc deletes it only after the first boot
+/// finishes: the seed's script has started the agent, and the system has
+/// rebooted if the upgrade installed anything. A machine powered off sooner
+/// runs a first boot again on its next boot.
 fn wait_first_boot(machine: &crate::Machine) -> Result<()> {
   let wait = ["sh", "-c", "while [ -e /firstboot ]; do sleep 1; done"];
 

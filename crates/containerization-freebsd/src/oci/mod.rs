@@ -1,5 +1,5 @@
-//! OCI images on the host: references, the image spec's documents, a
-//! registry client and a content store.
+//! OCI image support on the host: image references, the documents defined by
+//! the OCI image spec, a registry client and a content store.
 
 mod content;
 mod reference;
@@ -29,10 +29,11 @@ pub mod media_type {
   pub const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 }
 
-/// The annotation naming the reference an index entry was pulled or tagged as.
+/// The annotation that records the reference an index entry was pulled or
+/// tagged as.
 pub const REF_NAME: &str = "org.opencontainers.image.ref.name";
 
-/// A blob by its media type, digest and size.
+/// A reference to a blob, identified by its media type, digest and size.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
@@ -46,7 +47,8 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-  /// Whether it describes an index (or Docker manifest list), not a manifest.
+  /// Whether the blob is an index or a Docker manifest list, rather than a
+  /// manifest.
   pub fn is_index(&self) -> bool {
     matches!(
       self.media_type.as_str(),
@@ -64,7 +66,7 @@ pub struct Platform {
 }
 
 impl Default for Platform {
-  /// The guests': FreeBSD on arm64.
+  /// The guest platform: FreeBSD on arm64.
   fn default() -> Self {
     Self {
       architecture: "arm64".into(),
@@ -75,8 +77,8 @@ impl Default for Platform {
 }
 
 impl Platform {
-  /// Whether an image for `other` runs here: the same OS and architecture,
-  /// and the same variant if both name one.
+  /// Whether an image built for `other` runs on this platform. The OS and
+  /// architecture must match, and so must the variant if both name one.
   pub fn runs(&self, other: &Platform) -> bool {
     self.os == other.os
       && self.architecture == other.architecture
@@ -94,7 +96,7 @@ impl std::fmt::Display for Platform {
   }
 }
 
-/// An image index: a manifest for each platform.
+/// An image index, which lists a manifest for each platform.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Index {
@@ -114,7 +116,7 @@ impl Default for Index {
   }
 }
 
-/// An image for one platform: its config and its layers, lowest first.
+/// An image for one platform: its config and its layers, bottom layer first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -125,8 +127,8 @@ pub struct Manifest {
   pub layers: Vec<Descriptor>,
 }
 
-/// An image's configuration: what it runs, and the digests of its layers
-/// uncompressed.
+/// An image's configuration: the process it runs, and the digests of its
+/// uncompressed layers.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageConfig {
   #[serde(default)]
@@ -140,9 +142,10 @@ pub struct ImageConfig {
   pub rootfs: RootFs,
 }
 
-/// The defaults for a container of the image. The spec's keys are
-/// PascalCase, but Go tools read them in any case, and FreeBSD's own images
-/// write `cmd`.
+/// The defaults for a container run from the image. The spec's keys are
+/// PascalCase, but Go tools match keys case-insensitively and FreeBSD's own
+/// images write `cmd`, so the lowercase and camelCase spellings are accepted
+/// too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct RunConfig {
@@ -178,9 +181,9 @@ pub struct RootFs {
 }
 
 impl ImageConfig {
-  /// The process a container of the image runs unless told otherwise: its
-  /// entrypoint then command, its environment, its working directory, and
-  /// its user, `user` or `user:group`, each a name or a number.
+  /// The process a container runs by default: the entrypoint followed by the
+  /// command, the environment, the working directory, and the user. The user
+  /// is `user` or `user:group`, where each part is a name or a number.
   pub fn process(&self) -> Exec {
     let run = self.config.clone().unwrap_or_default();
     let user = run
@@ -225,9 +228,10 @@ impl ImageConfig {
     }
   }
 
-  /// The chain id of each layer: the first's diff id, then each the sha256
-  /// of the one before and its own diff id. A layer's chain id names it with
-  /// everything beneath it.
+  /// The chain id of each layer, as the OCI spec defines it. The first
+  /// layer's chain id is its diff id; each later one is the sha256 of the
+  /// previous chain id, a space, and the layer's diff id. A chain id thus
+  /// identifies a layer together with every layer beneath it.
   pub fn chain_ids(&self) -> Vec<String> {
     let mut chain: Vec<String> = Vec::with_capacity(self.rootfs.diff_ids.len());
 
@@ -242,12 +246,12 @@ impl ImageConfig {
   }
 }
 
-/// `sha256:<hex>` of `bytes`.
+/// The `sha256:<hex>` digest of `bytes`.
 pub fn sha256_digest(bytes: &[u8]) -> String {
   format!("sha256:{}", hex(&Sha256::digest(bytes)))
 }
 
-/// `sha256:<hex>` of the file at `path`, and its length.
+/// The `sha256:<hex>` digest of the file at `path`, and the file's length.
 pub(crate) fn sha256_file(path: &Path) -> Result<(String, u64)> {
   let reading = || format!("reading {}", path.display());
   let mut file = std::fs::File::open(path).map_err(Error::io(reading()))?;
@@ -270,7 +274,7 @@ fn hex(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The hex of a `sha256:<hex>` digest, if it is one.
+/// The hex part of `digest`, or `None` if it is not a valid sha256 digest.
 pub fn sha256_hex(digest: &str) -> Option<&str> {
   digest.strip_prefix("sha256:").filter(|hex| {
     hex.len() == 64
@@ -280,7 +284,8 @@ pub fn sha256_hex(digest: &str) -> Option<&str> {
   })
 }
 
-/// Parses an image document, saying what it was when it isn't one.
+/// Parses an image document. On failure, the error names the document as
+/// `what`.
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
   serde_json::from_slice(bytes).map_err(|error| Error::Invalid(format!("{what} is not valid: {error}")))
 }

@@ -1,4 +1,4 @@
-//! FreeBSD jails in the guest, through its agent.
+//! Manages FreeBSD jails in the guest through the guest agent.
 
 use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
 use crate::copy;
@@ -11,12 +11,14 @@ use std::path::Path;
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
-/// The bridge NAT jails sit on, and its address: the jails' gateway.
+/// The bridge that NAT jails attach to, and its address, which is the jails'
+/// gateway.
 const BRIDGE: &str = "cfbsd0";
 const GATEWAY: &str = "10.66.0.1";
 
-/// Sets up NAT for jails once per boot: the bridge, forwarding, and pf
-/// translating 10.66/16 to the address of the guest's default interface.
+/// Sets up NAT for jails once per boot: creates the bridge, turns on
+/// forwarding, and has pf translate 10.66/16 to the address of the guest's
+/// default interface.
 const NAT: &str = r#"set -e
 ifconfig cfbsd0 >/dev/null 2>&1 && exit 0
 external=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2 }')
@@ -33,11 +35,12 @@ printf 'set skip on lo0\nnat on %s inet from 10.66.0.0/16 to any -> (%s)\npass a
   pfctl -q -f -
 pfctl -s info | grep -q 'Status: Enabled' || pfctl -q -e"#;
 
-/// Ends the processes of the jail named `$1` as `jail -r` would, with
-/// SIGTERM and 10 seconds to exit, then drops the TCP connections they
-/// left, which would keep it dying through TIME_WAIT once removed. A VNET
-/// jail's, `$2` being `new`, are its own, so only its own tcpdrop, if any,
-/// reaches them; another's are the guest's, listed by netstat.
+/// Ends the processes of the jail named `$1` as `jail -r` would, with SIGTERM
+/// and 10 seconds to exit. It then drops the TCP connections they left, which
+/// would otherwise keep the removed jail dying through TIME_WAIT. A VNET jail
+/// (`$2` is `new`) has its own network stack, so only a tcpdrop run inside it,
+/// if it has one, reaches its connections. A non-VNET jail's connections are
+/// in the guest's stack, and netstat lists them.
 const DROP: &str = r#"jid=$(jls -j "$1" jid)
 pkill -j "$jid"
 tries=100
@@ -54,22 +57,21 @@ else
 fi
 true"#;
 
-/// Waits for the jail named `$1` to be gone: once removed, it is dying
-/// until what it left closes, such as a TCP connection in TIME_WAIT, and
-/// until then holds its root and its network.
+/// Waits for the jail named `$1` to disappear. A removed jail stays dying,
+/// holding its root and its network, until everything it left closes, such
+/// as a TCP connection in TIME_WAIT.
 const GONE: &str = r#"while jls -d -j "$1" >/dev/null 2>&1; do sleep 0.1; done"#;
-/// Past TIME_WAIT: twice FreeBSD's default MSL of 30 seconds.
+/// Longer than TIME_WAIT, which is twice FreeBSD's default MSL of 30 seconds.
 const DYING: Duration = Duration::from_secs(90);
 
 /// Copies the guest's resolver configuration into the jail rooted at `$1`,
-/// unless it has its own.
+/// unless the jail has its own.
 const RESOLVER: &str =
   r#"[ ! -e /etc/resolv.conf ] || [ -e "$1/etc/resolv.conf" ] || cp /etc/resolv.conf "$1/etc/resolv.conf""#;
 
-/// Prints `$2`, a path in the jail rooted at `$1`, as the guest's path to
-/// what the jail would find there, and makes the directories it lacks.
-/// Symbolic links resolve within the root, absolute ones from it, and `..`
-/// stops at it.
+/// Resolves `$2`, a path in the jail rooted at `$1`, prints the guest path it
+/// refers to, and makes any missing directories. Symbolic links resolve within
+/// the root: absolute links start at the root, and `..` stops there.
 const RESOLVE: &str = r#"set -e
 root=$1 rest=$2 resolved= links=0
 while [ -n "$rest" ]; do
@@ -101,14 +103,14 @@ fi
 mkdir -p "$root$resolved"
 printf '%s\n' "$root$resolved""#;
 
-/// Unmounts what is mounted under `$1` but datasets, the latest first.
-/// mount -p writes a space in a path as \040.
+/// Unmounts everything under `$1` except ZFS datasets, most recent first.
+/// `mount -p` writes a space in a path as \040.
 const UNMOUNT: &str = r#"set -e
 mount -p | awk -v under="$1/" 'index($2, under) == 1 && $3 != "zfs" { print $2 }' | tail -r |
   while read -r point; do umount "$(printf '%b' "$point")"; done"#;
 
 /// Moves the guest's network device with MAC address `$2` into the jail
-/// named `$1`, and prints its name.
+/// named `$1`, and prints the device's name.
 const CLAIM: &str = r#"set -e
 for device in $(ifconfig -l ether); do
   if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $2"; then
@@ -120,9 +122,10 @@ done
 echo "the guest has no network device with MAC address $2: is it in the layout's interfaces, and in no other jail?" >&2
 exit 1"#;
 
-/// Prints the lease the NAT's DHCP server gives the guest's network device
-/// with MAC address `$1`, as dhclient.leases(5), configuring nothing with
-/// it: dhclient's script does nothing, and dhclient is killed once bound.
+/// Prints, in dhclient.leases(5) format, the lease that the NAT's DHCP server
+/// gives the guest's network device with MAC address `$1`. The device is not
+/// configured with the lease: dhclient's script does nothing, and dhclient is
+/// killed once bound.
 const LEASE: &str = r#"set -e
 for device in $(ifconfig -l ether); do
   if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $1"; then
@@ -144,41 +147,43 @@ exit 1"#;
 /// How a jail reaches the network.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Network {
-  /// It has none.
+  /// The jail has no network.
   None,
-  /// It shares the guest's network stack and addresses.
+  /// The jail shares the guest's network stack and addresses.
   #[default]
   Inherit,
-  /// It has a stack and an address of its own (VNET), on a bridge in the
-  /// guest, and pf NATs it out through the guest's address. Needs the
+  /// The jail has its own stack (VNET) and address on a bridge in the guest,
+  /// and pf translates its traffic to the guest's address. This requires the
   /// machine's NAT (`Layout::nat`).
   Nat,
-  /// A stack of its own with these interfaces, as Containerization's
-  /// `interfaces`: the host reaches it at their addresses.
+  /// The jail has its own stack with these interfaces, like
+  /// Containerization's `interfaces`. The host reaches the jail at their
+  /// addresses.
   Interfaces(Vec<Interface>),
 }
 
-/// A jail's interface on Virtualization's NAT network, which the host is
-/// on, as Containerization's `NATInterface`: one of the machine's spare
-/// network devices (`Layout::interfaces`), which only that jail sees.
+/// A jail's interface on Virtualization's NAT network, which the host is also
+/// on, like Containerization's `NATInterface`. It is one of the machine's
+/// spare network devices (`Layout::interfaces`), and only that jail sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Interface {
   /// The device's MAC address.
   pub mac: [u8; 6],
-  /// Its IPv4 address and prefix length, such as `192.168.64.3/24`. The
-  /// NAT's DHCP server leases from the same network, so choose one it
-  /// hasn't leased, or take one it has: `Interface::leased`.
+  /// The IPv4 address and prefix length, such as `192.168.64.3/24`. The
+  /// NAT's DHCP server leases from the same network, so choose an address it
+  /// has not leased, or use one it leased with `Interface::leased`.
   pub address: String,
-  /// The default route's gateway, such as `192.168.64.1`; or none.
+  /// The default route's gateway, such as `192.168.64.1`, if any.
   pub gateway: Option<String>,
 }
 
 impl Interface {
-  /// One on the spare device with MAC address `mac`, at the address the
-  /// NAT's DHCP server leases it, which the server gives no other machine
-  /// while the lease lasts, and with the lease's router as its gateway.
-  /// Nothing renews the lease, but the server leases a MAC address the
-  /// same address again. Lease before a jail claims the device.
+  /// Returns an interface on the spare device with MAC address `mac`, using
+  /// the address the NAT's DHCP server leases to it and the lease's router as
+  /// the gateway. The server gives that address to no other machine while the
+  /// lease lasts. Nothing renews the lease, but the server leases the same
+  /// address to the same MAC address again. Call this before a jail claims
+  /// the device.
   pub fn leased(agent: &Agent, mac: [u8; 6]) -> Result<Self> {
     let colons = colons(mac);
     let ran = agent.check(&["sh", "-c", LEASE, "sh", &colons], LEASING)?;
@@ -189,7 +194,7 @@ impl Interface {
   }
 }
 
-/// dhclient's timeout in `LEASE`, and more.
+/// dhclient's 30-second timeout in `LEASE`, plus a margin.
 const LEASING: Duration = Duration::from_secs(45);
 
 /// `mac` as ifconfig prints it.
@@ -197,8 +202,8 @@ fn colons(mac: [u8; 6]) -> String {
   mac.map(|byte| format!("{byte:02x}")).join(":")
 }
 
-/// The address, with its prefix length, and the first router of the last
-/// lease in `leases`, a dhclient.leases(5) file.
+/// Returns the address, with its prefix length, and the first router of the
+/// last lease in `leases`, a dhclient.leases(5) file.
 fn lease(leases: &str) -> Option<(String, Option<String>)> {
   let (_, last) = leases.rsplit_once("lease {")?;
   let value = |key: &str| {
@@ -219,24 +224,25 @@ fn lease(leases: &str) -> Option<(String, Option<String>)> {
   Some((format!("{address}/{}", u32::from(mask).count_ones()), gateway))
 }
 
-/// A file system mounted into a jail, as Containerization's `Mount` is into
-/// a container.
+/// A file system mounted into a jail, like Containerization's `Mount` for a
+/// container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mount {
   /// mount(8)'s type: `nullfs`, `tmpfs` or another.
   pub kind: String,
   /// For nullfs, a directory in the guest.
   pub source: String,
-  /// A path in the jail. Symbolic links on the way resolve within the
-  /// jail, and the directories it lacks are made.
+  /// A path in the jail. Symbolic links along the path resolve within the
+  /// jail, and missing directories are made.
   pub destination: String,
   /// mount(8)'s `-o`, such as `ro`, or tmpfs's `size=64m`.
   pub options: Vec<String>,
 }
 
 impl Mount {
-  /// The guest's directory `source` at `destination`, through nullfs: such
-  /// as a host share `Machine::mount_share` mounted, or one under it.
+  /// Mounts the guest directory `source` at `destination` with nullfs.
+  /// `source` may be a host share mounted by `Machine::mount_share`, or a
+  /// directory under one.
   pub fn directory(source: &str, destination: &str) -> Self {
     Self {
       kind: "nullfs".into(),
@@ -268,11 +274,11 @@ pub struct Jail<'a> {
 }
 
 impl<'a> Jail<'a> {
-  /// Starts a persistent jail named `name`, rooted at `path` in the guest,
-  /// with that hostname unless `parameters` give one. `parameters` are
-  /// jail(8)'s, as `key=value` or a bare flag such as `mount.devfs`. A jail
-  /// with a network gets the guest's resolver configuration if it has none
-  /// of its own.
+  /// Starts a persistent jail named `name`, rooted at `path` in the guest.
+  /// The hostname is `name` unless `parameters` set one. `parameters` are
+  /// jail(8) parameters, as `key=value` or a bare flag such as `mount.devfs`.
+  /// A jail with a network gets the guest's resolver configuration if it has
+  /// none of its own.
   pub fn start(agent: &'a Agent, name: &str, path: &str, network: &Network, parameters: &[&str]) -> Result<Self> {
     let (name_parameter, path_parameter, hostname) = (
       format!("name={name}"),
@@ -324,7 +330,7 @@ impl<'a> Jail<'a> {
     }
   }
 
-  /// One already running, such as after a restore.
+  /// Refers to a jail that is already running, such as after a restore.
   pub fn running(agent: &'a Agent, name: &str) -> Self {
     Self {
       agent,
@@ -344,7 +350,7 @@ impl<'a> Jail<'a> {
   }
 
   /// Starts `exec`'s process in the jail, as `Agent::spawn` does in the
-  /// guest. Its working directory is a path in the jail, and its user is
+  /// guest. The working directory is a path in the jail, and the user is
   /// looked up in the jail's `/etc/passwd` and `/etc/group`.
   pub fn spawn(&self, exec: Exec) -> Result<Process> {
     self.agent.spawn(Exec {
@@ -353,8 +359,8 @@ impl<'a> Jail<'a> {
     })
   }
 
-  /// Connects to `port` on the jail's loopback: the guest's, unless the
-  /// jail has its own network.
+  /// Connects to `port` on the jail's loopback, which is the guest's unless
+  /// the jail has its own network.
   pub fn connect(&self, port: u16) -> Result<Relay> {
     self.agent.relay(Connect {
       to: Address::Port(port),
@@ -370,14 +376,14 @@ impl<'a> Jail<'a> {
     })
   }
 
-  /// As `Agent::relay_socket`, with the socket's guest path in the jail.
+  /// Like `Agent::relay_socket`, with the socket's guest path in the jail.
   pub fn relay_socket(&self, socket: &UnixSocket) -> Result<SocketRelay> {
     self.agent.relay_socket_in(socket, Some(&self.name))
   }
 
-  /// Mounts `mount` in the jail, until `stop`. Mount before anything runs
-  /// in it: a process there could otherwise swap a directory on the way
-  /// for a symbolic link as the mount is made.
+  /// Mounts `mount` in the jail until `stop`. Mount before anything runs in
+  /// the jail: otherwise a process there could replace a directory on the
+  /// path with a symbolic link while the mount is made.
   pub fn mount(&self, mount: &Mount) -> Result<()> {
     let root = self.root()?;
     let resolved = self
@@ -395,9 +401,9 @@ impl<'a> Jail<'a> {
     self.agent.check(&argv, QUICK).map(|_| ())
   }
 
-  /// Replaces the jail's limits, through rctl(8): its processes together
-  /// get `cpus` and `memory_in_bytes` of resident memory. Past its CPUs
-  /// they are slowed; past its memory, paged out. `stop` lifts the limits.
+  /// Replaces the jail's limits with rctl(8). The jail's processes together
+  /// get `cpus` CPUs and `memory_in_bytes` of resident memory. Beyond those
+  /// limits they are slowed or paged out. `stop` lifts the limits.
   pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Result<()> {
     let rules = quota::rules(&self.name, cpus, memory_in_bytes);
     let mut argv = vec!["sh", "-c", quota::LIMIT, "sh", self.name.as_str()];
@@ -406,24 +412,24 @@ impl<'a> Jail<'a> {
     self.agent.check(&argv, QUICK).map(|_| ())
   }
 
-  /// Copies `source`, a file or directory on the host, into the jail, as
-  /// Containerization's `copyIn` does: to `destination`, or into it if it
-  /// is a directory. A file gets `mode`. With `create_parents`, missing
-  /// directories on the way are made. Paths resolve as the jail sees them.
+  /// Copies `source`, a file or directory on the host, into the jail, like
+  /// Containerization's `copyIn`. The copy goes to `destination`, or into it
+  /// if it is a directory. A copied file gets `mode`. With `create_parents`,
+  /// missing parent directories are made. Paths resolve as the jail sees them.
   pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, create_parents: bool) -> Result<()> {
     copy::copy_in(self, source, destination, mode, create_parents)
   }
 
   /// Copies `source`, a file or directory in the jail, to `destination` on
-  /// the host, as Containerization's `copyOut` does: a file with mode
-  /// 0644, or a directory's contents into `destination`. With
+  /// the host, like Containerization's `copyOut`. A file is written with mode
+  /// 0644; a directory's contents are copied into `destination`. With
   /// `create_parents`, the destination's missing parents are made.
   pub fn copy_out(&self, source: &str, destination: &Path, create_parents: bool) -> Result<()> {
     copy::copy_out(self, source, destination, create_parents)
   }
 
-  /// What the jail's processes use together, as rctl(8) accounts for it,
-  /// and its network's counters.
+  /// Returns the jail's combined resource usage as rctl(8) accounts it, and
+  /// its network counters.
   pub fn statistics(&self) -> Result<Statistics> {
     let ran = self
       .agent
@@ -437,7 +443,7 @@ impl<'a> Jail<'a> {
     Ok(statistics)
   }
 
-  /// Its root's path in the guest.
+  /// The guest path of the jail's root.
   fn root(&self) -> Result<String> {
     let ran = self
       .agent
@@ -446,22 +452,22 @@ impl<'a> Jail<'a> {
     Ok(ran.stdout.trim_end_matches('\n').to_string())
   }
 
-  /// As `Agent::run`, in the jail.
+  /// Like `Agent::run`, in the jail.
   pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
     self.agent.run(&self.jexec(argv), timeout)
   }
 
-  /// As `Agent::check`, in the jail.
+  /// Like `Agent::check`, in the jail.
   pub fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
     self.agent.check(&self.jexec(argv), timeout)
   }
 
-  /// Stops the jail, killing its processes and dropping the TCP
-  /// connections they left, and waits for it to be gone, which a
-  /// connection it can't drop holds up for a minute. Then runs `clean_up`
-  /// and destroys its epair. Its interfaces' devices are back in the guest
-  /// by then. Once it is removed, a failed step doesn't skip the rest: the
-  /// first failure is returned.
+  /// Stops the jail: kills its processes, drops the TCP connections they
+  /// left, and waits for the jail to disappear. A connection that cannot be
+  /// dropped delays this by about a minute. Then it runs `clean_up` and
+  /// destroys the jail's epair. By then the devices of the jail's interfaces
+  /// are back in the guest. Once the jail is removed, a failed step does not
+  /// skip the rest, and the first failure is returned.
   pub fn stop(self) -> Result<()> {
     let ran = self
       .agent
@@ -472,7 +478,7 @@ impl<'a> Jail<'a> {
       .rsplit_once(' ')
       .ok_or_else(|| Error::Guest(format!("jls described jail {}: {:?}", self.name, ran.stdout)))?;
     let mut steps = Steps::default();
-    // Only a VNET jail's interfaces are its own: another sees the guest's.
+    // Only a VNET jail has interfaces of its own; other jails see the guest's.
     let epairs = if vnet == "new" {
       steps
         .take(self.rescue(&["ifconfig", "-g", "epair"]))
@@ -492,7 +498,8 @@ impl<'a> Jail<'a> {
         .agent
         .check(&["sh", "-c", DROP, "sh", &self.name, vnet], QUICK),
     );
-    // One still running is found again, to stop again.
+    // If removal fails, the jail is still running, so stop returns early and a
+    // later `find` can stop it again.
     if steps
       .take(self.agent.check(&["jail", "-r", &self.name], QUICK))
       .is_none()
@@ -506,8 +513,8 @@ impl<'a> Jail<'a> {
     );
     steps.take(clean_up(self.agent, &self.name, path));
 
-    // Destroying one end destroys both, and the outside end is the
-    // guest's even while the jail is dying.
+    // Destroying one end of an epair destroys both. The outside end belongs
+    // to the guest even while the jail is dying.
     for inside in epairs {
       if let Some(unit) = inside.strip_suffix('b') {
         steps.take(
@@ -520,8 +527,8 @@ impl<'a> Jail<'a> {
     steps.finish()
   }
 
-  /// Sets up a new NAT jail's end of `epair`, or its interfaces, and a
-  /// networked jail's resolver.
+  /// Configures a new jail's network: the inside end of `epair` for a NAT
+  /// jail, or its interfaces, and the resolver for any jail with a network.
   fn configure(&self, path: &str, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
       let (inside, address) = (format!("{}b", epair.name), format!("{}/16", epair.address));
@@ -550,8 +557,8 @@ impl<'a> Jail<'a> {
     Ok(())
   }
 
-  /// As `check`, running the guest's `/rescue` tool `argv` names, which
-  /// the jail needn't have.
+  /// Like `check`, but runs the guest's `/rescue` tool that `argv` names, so
+  /// the jail does not need to have the tool.
   fn rescue(&self, argv: &[&str]) -> Result<Ran> {
     let exec = Exec {
       argv: argv.iter().map(|arg| arg.to_string()).collect(),
@@ -570,12 +577,12 @@ impl<'a> Jail<'a> {
   }
 }
 
-/// Cleans up after the jail named `name`, rooted at `path`, once it is
-/// gone: lifts its limits, which rctl keeps by name for the next jail of
-/// that name, and unmounts what is mounted in it but datasets. Including
-/// devfs, which jail(8) mounts for `mount.devfs` but can't unmount: the
-/// parameter is jail(8)'s, not the kernel's, so a jail removed by name has
-/// no record of it.
+/// Cleans up after the removed jail named `name`, rooted at `path`. It lifts
+/// the jail's limits, which rctl otherwise keeps by name for the next jail of
+/// that name. It also unmounts everything in the root except ZFS datasets.
+/// That includes devfs: jail(8) mounts it for `mount.devfs` but cannot unmount
+/// it, because the parameter belongs to jail(8), not the kernel, so a jail
+/// removed by name has no record of it.
 pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   let mut steps = Steps::default();
 
@@ -584,7 +591,8 @@ pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   steps.finish()
 }
 
-/// The first failure among steps that each run even if earlier ones failed.
+/// Collects the first failure among steps that each run even if earlier ones
+/// failed.
 #[derive(Default)]
 struct Steps(Option<Error>);
 
@@ -602,9 +610,10 @@ impl Steps {
   }
 }
 
-/// A new epair, its `a` end on the bridge, and the address for its `b` end.
+/// A new epair whose `a` end is on the bridge, and the address for its `b`
+/// end.
 struct Epair {
-  /// Such as `epair3`, without the end's letter.
+  /// The name without the end's letter, such as `epair3`.
   name: String,
   address: String,
 }
@@ -624,8 +633,9 @@ fn epair(agent: &Agent) -> Result<Epair> {
   Ok(Epair { name, address })
 }
 
-/// The address for `epair<unit>`'s jail. FreeBSD gives no two live epairs
-/// the same unit, so no two NAT jails the same address; `GATEWAY` is .0.1.
+/// Returns the address for the jail on `epair<unit>`. FreeBSD never gives two
+/// live epairs the same unit, so no two NAT jails share an address. Addresses
+/// start after `GATEWAY`, which is 10.66.0.1.
 fn address(epair: &str) -> Option<String> {
   let index = epair.strip_prefix("epair")?.parse::<u32>().ok()? + 2;
 
@@ -664,8 +674,8 @@ mod tests {
     assert_eq!(lease("lease {\n  option subnet-mask 255.255.255.0;\n}\n"), None);
   }
 
-  /// What RESOLVE makes of `path` in `root`, through the host's sh: the
-  /// guest path it prints, or its error.
+  /// Runs RESOLVE on `path` in `root` with the host's sh, and returns the
+  /// path it prints or its error.
   fn resolve(root: &Path, path: &str) -> std::result::Result<String, String> {
     let output = Command::new("sh")
       .args(["-c", RESOLVE, "sh"])

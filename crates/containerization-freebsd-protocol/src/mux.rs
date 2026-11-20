@@ -1,8 +1,9 @@
-//! A session's channels, from one side: who may send what, and when.
+//! One side's view of a session's channels, and the rules for who may send
+//! what, and when.
 //!
-//! Channel 0 is control. The host opens even channels; odd ones are the
-//! guest's, so it opens channels for connections to its sockets without
-//! asking.
+//! Channel 0 is the control channel. The host opens even-numbered channels
+//! and the guest opens odd-numbered ones, so the guest can open a channel for
+//! each connection to a socket it listens on without asking the host first.
 
 use crate::frame::{Frame, MAX_PAYLOAD};
 use crate::message::{DecodeError, Message};
@@ -11,13 +12,13 @@ use std::{fmt, mem};
 
 pub const CONTROL: u32 = 0;
 
-/// The version this crate speaks, which the other side's must match.
+/// The protocol version this crate speaks. The other side must speak the same.
 pub const VERSION: u16 = 3;
 
-/// The most bytes the host may have written to the console that the agent
-/// hasn't yet said it Received. FreeBSD's virtio console drops what overflows
-/// the guest tty's input queue, which at 115200 baud, the fastest the console
-/// allows, holds 23,040 bytes.
+/// The flow-control window: the most bytes the host may write to the console
+/// before the agent reports them with Received. FreeBSD's virtio console
+/// drops bytes that overflow the guest tty's input queue. At 115200 baud, the
+/// fastest rate the console allows, that queue holds 23,040 bytes.
 pub const WINDOW: usize = 16 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +42,8 @@ impl Side {
     }
   }
 
-  /// The side's channel after `channel`: numbers wrap around, past control.
+  /// Returns this side's next channel number after `channel`. Numbers wrap
+  /// around and skip the control channel.
   fn after(self, channel: u32) -> u32 {
     channel.checked_add(2).unwrap_or(self.first_channel())
   }
@@ -70,11 +72,13 @@ pub struct VersionMismatch {
 pub enum Error {
   Decode(DecodeError),
   Version(VersionMismatch),
-  /// Only control messages pass until the Hellos start a session.
+  /// A non-control message arrived before the Hellos started a session.
   NoSession,
-  /// Often a message that crossed the channel's closing in flight.
+  /// A message for a channel that is not open. Often the message was in
+  /// flight when the channel closed.
   UnknownChannel(u32),
-  /// An opening message on a channel that is open already, or the other side's to open.
+  /// An opening message on a channel that is already open, or that only the
+  /// other side may open.
   BadChannel(u32),
   NotAllowed {
     channel: u32,
@@ -123,8 +127,9 @@ impl Channel {
     }
   }
 
-  /// Applies `message` from the opener, or from the runner, if the channel
-  /// allows it now: whether the channel is closed after it.
+  /// Applies `message` from the opener or the runner. Returns `None` if the
+  /// channel does not allow the message now, and otherwise whether the
+  /// message closed the channel.
   fn step(&mut self, from_opener: bool, message: &Message) -> Option<bool> {
     let runner = !from_opener;
     let process = matches!(self.kind, Kind::Exec { .. });
@@ -166,9 +171,9 @@ impl Channel {
 pub struct Mux {
   side: Side,
   session: bool,
-  /// The host's Hellos the guest hasn't answered.
+  /// On the host, the number of Hellos the guest has not answered yet.
   unanswered: u32,
-  /// Whether the guest owes the host's last Hello an answer.
+  /// On the guest, whether the host's last Hello still needs an answer.
   answer_due: bool,
   next: u32,
   channels: HashMap<u32, Channel>,
@@ -195,10 +200,12 @@ impl Mux {
     self.channels.contains_key(&channel)
   }
 
-  /// From the host, a Hello starts a session: the host forgets every channel,
-  /// and opens none until the guest answers. From the guest, it answers the
-  /// host's last, or if no answer is due, announces that the agent has no
-  /// session: it just started, or lost frames.
+  /// Returns a Hello for this side to send.
+  ///
+  /// On the host, the Hello starts a new session: the host forgets every
+  /// channel and can open none until the guest answers. On the guest, the
+  /// Hello answers the host's last Hello. If no answer is due, it announces
+  /// that the agent has no session because it just started or lost frames.
   pub fn hello(&mut self) -> Frame {
     let answer = match self.side {
       Side::Host => {
@@ -218,8 +225,8 @@ impl Mux {
     .frame(CONTROL)
   }
 
-  /// Opens a channel: with Exec, Connect or Listen from the host, or
-  /// Accepted from the guest.
+  /// Opens a channel with `message`, which must be Exec, Connect or Listen on
+  /// the host, or Accepted on the guest.
   pub fn open(&mut self, message: Message) -> Result<(u32, Frame), Error> {
     self.require_session()?;
     let channel = self.free_channel();
@@ -233,8 +240,9 @@ impl Mux {
     Ok((channel, frame))
   }
 
-  /// Ping, Pong, from the guest Received, or from the host SetTime on
-  /// [`CONTROL`]; or a message on an open channel.
+  /// Sends a message on an open channel, or on [`CONTROL`]. The control
+  /// channel accepts Ping and Pong from either side, Received from the guest,
+  /// and SetTime from the host.
   pub fn send(&mut self, channel: u32, message: Message) -> Result<Frame, Error> {
     if channel == CONTROL {
       return match message {
@@ -251,10 +259,12 @@ impl Mux {
     Ok(frame)
   }
 
-  /// The channel and message a frame from the other side carries, if they
-  /// may send it now. Answer a Hello that isn't an answer itself with
-  /// [`Mux::hello`]: it ended the session before it, and every channel is
-  /// forgotten.
+  /// Decodes a frame from the other side into its channel and message, and
+  /// checks that the other side may send that message now.
+  ///
+  /// A received Hello that is not itself an answer ends the session, and
+  /// every channel is forgotten. Respond to it with [`Mux::hello`], which on
+  /// the guest answers the host and on the host starts a new session.
   pub fn receive(&mut self, frame: Frame) -> Result<(u32, Message), Error> {
     let channel = frame.channel;
     let message = Message::from_frame(frame).map_err(Error::Decode)?;
@@ -289,13 +299,13 @@ impl Mux {
         self.end_session();
         self.answer_due = true;
       }
-      // The agent has no session; the host's next Hello starts one.
+      // The agent has no session. The host's next Hello starts one.
       (Side::Host, false) => {
         self.end_session();
         return Ok(());
       }
       (Side::Host, true) if self.unanswered > 0 => self.unanswered -= 1,
-      // Such as an answer to the Hello of the host before a restore.
+      // For example, an answer to a Hello that the host sent before a restore.
       _ => {
         return Err(Error::NotAllowed {
           channel: CONTROL,
@@ -321,7 +331,7 @@ impl Mux {
     if self.session { Ok(()) } else { Err(Error::NoSession) }
   }
 
-  /// This side's first channel from `next` that isn't open.
+  /// Returns this side's first channel, starting at `next`, that is not open.
   fn free_channel(&self) -> u32 {
     let mut channel = self.next;
     while self.is_open(channel) {

@@ -1,5 +1,5 @@
-//! Downloads and verifies FreeBSD's VM image, decompressed, the guest
-//! bundle, and the userland for jails into the suites' cache. Run through
+//! Downloads and verifies FreeBSD's VM image (decompressed), the pinned guest
+//! bundle, and the userland for jails into the suites' cache. Run it through
 //! `bin/dev/fetch-image`.
 
 use containerization_freebsd::image;

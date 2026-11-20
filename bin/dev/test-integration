@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 #
-# Runs the integration suites: builds their test binaries, signs them, runs them.
+# Runs the integration suites: builds their test binaries, signs them, and
+# runs them.
 #
-# The entitlement check is `SecTaskCreateFromSelf`, so it is the *test binary*
-# that must carry `com.apple.security.virtualization`. Cargo builds it
-# unsigned and signs nothing, hence this.
+# Virtualization checks the entitlement with `SecTaskCreateFromSelf`, so the
+# test binary itself must carry `com.apple.security.virtualization`. Cargo
+# builds it unsigned, so this script signs it.
 #
-# Further arguments reach nextest, so a single test can be run the way it
-# usually takes one:
+# Extra arguments are passed to nextest, for example to run a single test:
 #
 #   bin/dev/test-integration -E 'test(restores)'
 #
-# Only options that choose and run tests: one that changes the build
-# (`--release`, `--cargo-profile`, `--features`) makes nextest build unsigned
-# binaries, which Virtualization refuses.
+# Pass only options that select and run tests. An option that changes the
+# build (`--release`, `--cargo-profile`, `--features`) makes nextest rebuild
+# unsigned binaries, which Virtualization refuses.
 
 set -euo pipefail
 
@@ -32,8 +32,9 @@ if [ "${#targets[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# `--message-format=json` puts the manifest on stdout and the compiler's output on
-# stderr, so this prints paths and shows progress as usual.
+# `--message-format=json` writes build messages to stdout and the compiler's
+# output to stderr, so this collects the binaries' paths while progress shows
+# as usual.
 binaries="$(
   cargo test -p "$package" "${targets[@]}" --no-run --message-format=json |
     python3 -c 'import json, sys

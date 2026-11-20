@@ -1,8 +1,5 @@
-# The rustup-side twin of `.tool-versions`, for anyone building without asdf.
-# `rust-version` in Cargo.toml is a floor; this is the toolchain the crates are
-# developed and tested against.
 [toolchain]
 channel = "1.99.1"
-# rust-src: guest/build-agent builds FreeBSD's std from it.
+# guest/build-agent builds FreeBSD's std from rust-src.
 components = ["rust-src"]
 targets = ["aarch64-apple-darwin"]

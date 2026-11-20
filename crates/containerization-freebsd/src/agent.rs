@@ -1,15 +1,16 @@
-//! The host's end of the guest agent's protocol, over the console port.
+//! The host's end of the guest agent protocol, over the console port.
 //!
-//! The host sends a Hello only when it must: in answer to the agent
-//! announcing itself, after it lost frames, and once after a restore. Every
-//! Hello the agent reads ends its session and what that session ran, so one
-//! sent on a timer could arrive after the session it was meant to start,
-//! and end it.
+//! The host sends a Hello only when it must: when the agent announces itself,
+//! when the host loses frames, and once after a restore. Every Hello the
+//! agent reads ends its current session and everything that session ran. A
+//! Hello sent on a timer could therefore arrive after the session it was
+//! meant to start, and end that session.
 //!
 //! The guest drops console bytes it has no room for, so the host keeps at
-//! most `WINDOW` of them unreceived, writing frames in slices that fit. One
-//! thread reads the console and counts what the agent Received; another
-//! handles the rest, so a writer waiting for room never holds up the count.
+//! most `WINDOW` bytes in flight and writes frames in slices that fit. One
+//! thread reads the console and counts the agent's Received reports. Another
+//! thread handles everything else, so a writer blocked on a full window can't
+//! deadlock the reader whose Received counts reopen it.
 
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{
@@ -26,17 +27,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use containerization_freebsd_protocol::{Exec, Exit, Limit, Resource, User, WindowSize};
 
-/// How long the agent has to start a process or connect a relay, and to read
-/// the console when the host has a window's worth unreceived.
+/// How long the agent has to open or close a channel, and to read the console
+/// once the window is full.
 const OPENING: Duration = Duration::from_secs(60);
-/// Data goes in frames of at most this, so channels take turns on the console.
+/// The largest Data payload the host sends, so that channels take turns on
+/// the console.
 const CHUNK: usize = WINDOW / 2;
 
 pub struct Agent {
   shared: Arc<Shared>,
 }
 
-/// What a command printed, and how it ended.
+/// The output and exit status of a finished command.
 #[derive(Debug)]
 pub struct Ran {
   pub exit: Exit,
@@ -57,42 +59,42 @@ pub struct Process {
   exited: AtomicBool,
 }
 
-/// What a process sends back.
+/// Output from a process.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Output {
-  /// Its stdout; in a terminal, stderr too.
+  /// Stdout. On a terminal, this includes stderr.
   Stdout(Vec<u8>),
   Stderr(Vec<u8>),
-  /// The last of its output.
+  /// The process exited. Nothing follows this.
   Exited(Exit),
 }
 
-/// A connection to a socket in the guest: a TCP port on its loopback or a
-/// jail's, or a Unix socket. Dropping it closes the connection.
+/// A connection to a socket in the guest: a TCP port on the loopback of the
+/// guest or a jail, or a Unix socket. Dropping it closes the connection.
 pub struct Relay {
   stream: Stream,
   ended: AtomicBool,
 }
 
-/// A Unix socket the agent listens on, relaying each connection to a socket
-/// on the host. Dropping it closes the socket in the guest, leaving its
-/// file.
+/// A Unix socket the agent listens on. Each connection is relayed to a socket
+/// on the host. Dropping the listener closes the socket in the guest but
+/// leaves its file; `close` removes the file too.
 pub(crate) struct Listener {
   stream: Stream,
 }
 
-/// An open channel: its number, and the messages the agent sends on it.
+/// An open channel and the messages the agent sends on it.
 struct Stream {
   channel: u32,
   shared: Arc<Shared>,
   messages: Mutex<Receiver<Message>>,
-  /// The process or port, for errors.
+  /// A description of the process or socket, for error messages.
   what: String,
 }
 
 struct Shared {
   state: Mutex<State>,
-  /// Notified when a session starts, or the console closes.
+  /// Notified when a session starts or fails, or the console closes.
   changed: Condvar,
 }
 
@@ -100,20 +102,21 @@ struct State {
   mux: Mux,
   console: PipeWriter,
   credit: Arc<Credit>,
-  /// Where each open channel's messages go.
+  /// The sender for each open channel's messages.
   channels: HashMap<u32, mpsc::Sender<Message>>,
-  /// The host socket each open Listen channel's connections relay to.
+  /// For each open Listen channel, the host socket its connections relay to.
   listeners: HashMap<u32, PathBuf>,
   mismatch: Option<VersionMismatch>,
   closed: bool,
 }
 
-/// What a frame from the agent leaves for `handle` to do.
+/// The follow-up work, if any, that a frame from the agent leaves for
+/// `handle`.
 enum Heard {
   Nothing,
-  /// The session started, or can't: wake those waiting for it.
+  /// The session started or cannot start. Wake the threads waiting for it.
   Changed,
-  /// A connection to a Listen channel's socket, for `relay_accepted`.
+  /// A connection to a Listen channel's socket, to pass to `relay_accepted`.
   Accepted {
     channel: u32,
     host: PathBuf,
@@ -121,16 +124,16 @@ enum Heard {
   },
 }
 
-/// What the console reader hands the thread that handles it.
+/// What the console reader passes to the handler thread.
 enum Event {
-  /// Bytes as read, for the console text before a session.
+  /// Raw bytes as read, so that console text before a session can be shown.
   Read(Vec<u8>),
   Frame(Frame),
   Skipped,
 }
 
-/// The console bytes the host has written that the agent hasn't yet said it
-/// Received.
+/// Tracks the console bytes the host has written that the agent has not yet
+/// reported with Received.
 #[derive(Default)]
 struct Credit {
   window: Mutex<Window>,
@@ -166,21 +169,21 @@ impl Agent {
     Self { shared }
   }
 
-  /// Another handle on the same agent, for threads of the crate's own.
+  /// Returns another handle on the same agent, for the crate's own threads.
   pub(crate) fn share(&self) -> Self {
     Self {
       shared: self.shared.clone(),
     }
   }
 
-  /// Starts a session with an agent that is already running, as after a
-  /// restore, when it will not announce itself.
+  /// Starts a session with an agent that is already running and so will not
+  /// announce itself, as after a restore.
   pub(crate) fn rejoin(&self) -> Result<()> {
     self.shared.lock().hello()
   }
 
-  /// Waits for a session with the agent: for it to start and announce
-  /// itself, or to answer `rejoin`.
+  /// Waits for a session with the agent, which starts when the agent
+  /// announces itself or answers `rejoin`.
   pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     let mut state = self.shared.lock();
@@ -207,9 +210,10 @@ impl Agent {
     }
   }
 
-  /// Starts `exec`'s process in the guest, or its jail. The environment
-  /// adds to the agent's; with `pty`, it runs in a terminal of that size.
-  /// A user gets their home as `HOME`, unless the environment gives one.
+  /// Starts the process `exec` describes, in the guest or its jail. The
+  /// process inherits the agent's environment plus `exec.env`. With `pty`,
+  /// it runs on a terminal of that size. With a user, `HOME` is set to the
+  /// user's home directory unless `exec.env` sets it.
   pub fn spawn(&self, exec: Exec) -> Result<Process> {
     let what = format!("{:?}", exec.argv);
 
@@ -247,7 +251,7 @@ impl Agent {
     })
   }
 
-  /// Has the agent listen on the Unix socket `listen` describes, relaying
+  /// Makes the agent listen on the Unix socket `listen` describes, and relays
   /// each connection to the host's socket at `host`.
   pub(crate) fn listen(&self, listen: Listen, host: PathBuf) -> Result<Listener> {
     let what = listen.path.clone();
@@ -257,13 +261,13 @@ impl Agent {
     })
   }
 
-  /// Runs `argv` in the guest, with no input, and collects what it prints.
-  /// One still running after `timeout` is killed.
+  /// Runs `argv` in the guest with no input and collects its output. If the
+  /// command is still running after `timeout`, it is killed.
   pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
     self.run_exec(command(argv), timeout)
   }
 
-  /// As `run`, for `exec`'s process.
+  /// Like `run`, for the process `exec` describes.
   pub(crate) fn run_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
     let started = Instant::now();
     let argv = exec.argv.clone();
@@ -296,12 +300,12 @@ impl Agent {
     }
   }
 
-  /// As `run`, failing unless the command exits 0.
+  /// Like `run`, but fails unless the command exits with status 0.
   pub fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
     self.check_exec(command(argv), timeout)
   }
 
-  /// As `check`, for `exec`'s process.
+  /// Like `check`, for the process `exec` describes.
   pub(crate) fn check_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
     let argv = exec.argv.clone();
     let ran = self.run_exec(exec, timeout)?;
@@ -320,14 +324,15 @@ impl Agent {
     }
   }
 
-  /// Sets the guest's clock to the host's, if there is a session. Each new
-  /// session does, and a machine every 30 seconds while it runs.
+  /// Sets the guest's clock to the host's, if there is a session. The clock
+  /// is synced at the start of each session, and a machine also syncs it
+  /// every 30 seconds while it runs.
   pub fn sync_clock(&self) -> Result<()> {
     self.shared.lock().sync_clock()
   }
 
-  /// Starts `argv` in the guest without waiting for it, for a command that
-  /// may never report back, such as one that powers the guest off.
+  /// Starts `argv` in the guest without waiting for Opened, for commands
+  /// that may never report back, such as one that powers off the guest.
   pub fn launch(&self, argv: &[&str]) -> Result<()> {
     let mut state = self.shared.lock();
     let protocol = |error| Error::Guest(format!("{argv:?}: {error}"));
@@ -341,8 +346,8 @@ impl Agent {
     state.write(&eof)
   }
 
-  /// Opens a channel with `message`, and waits for the agent to start what
-  /// it asks for. A Listen channel's connections relay to `host`.
+  /// Opens a channel with `message` and waits for the agent to send Opened.
+  /// For a Listen channel, connections are relayed to `host`.
   fn open(&self, message: Message, what: String, host: Option<PathBuf>) -> Result<Stream> {
     let (sender, receiver) = mpsc::channel();
     let channel = {
@@ -389,35 +394,36 @@ fn command(argv: &[&str]) -> Exec {
 }
 
 impl Process {
-  /// Writes to its stdin.
+  /// Writes to the process's stdin.
   pub fn write(&self, bytes: &[u8]) -> Result<()> {
     self.stream.write(bytes)
   }
 
-  /// Ends its stdin. In a terminal, write ^D instead. Once it has exited,
-  /// does nothing.
+  /// Closes the process's stdin. On a terminal, write ^D instead. Does
+  /// nothing once the process has exited.
   pub fn close_input(&self) -> Result<()> {
     self.stream.send_while_open(Message::Eof).map(|_| ())
   }
 
-  /// Resizes its terminal.
+  /// Resizes the process's terminal.
   pub fn resize(&self, size: WindowSize) -> Result<()> {
     self.stream.send(Message::Resize(size))
   }
 
-  /// Sends it a signal, numbered as in the guest.
+  /// Sends the process a signal. Signal numbers are the guest's.
   pub fn signal(&self, signal: i32) -> Result<()> {
     self.stream.send(Message::Signal(signal))
   }
 
-  /// Its next output, waiting as long as that takes.
+  /// Returns the process's next output, waiting as long as it takes.
   pub fn recv(&self) -> Result<Output> {
     self
       .next(None)?
       .ok_or_else(|| Error::Guest(format!("{}: no output", self.stream.what)))
   }
 
-  /// Its next output, or `None` if none came within `timeout`.
+  /// Returns the process's next output, or `None` if none arrives within
+  /// `timeout`.
   pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<Output>> {
     self.next(Some(timeout))
   }
@@ -435,7 +441,7 @@ impl Process {
           self.exited.store(true, Ordering::Relaxed);
           return Ok(Some(Output::Exited(exit)));
         }
-        // The end of stdout, which Exited follows.
+        // Eof ends stdout. Exited follows it.
         Some(_) => {}
         None => return Ok(None),
       }
@@ -449,12 +455,12 @@ impl Relay {
     self.stream.write(bytes)
   }
 
-  /// Shuts the connection's write side.
+  /// Half-closes the connection.
   pub fn close_write(&self) -> Result<()> {
     self.stream.send(Message::Eof)
   }
 
-  /// What the connection sends next, or `None` at its end.
+  /// Returns the next bytes from the connection, or `None` once it has ended.
   pub fn read(&self) -> Result<Option<Vec<u8>>> {
     if self.ended.load(Ordering::Relaxed) {
       return Ok(None);
@@ -475,7 +481,8 @@ impl Relay {
 }
 
 impl Listener {
-  /// Stops it, and waits for the agent to close and remove its socket.
+  /// Stops the listener and waits for the agent to close and remove the
+  /// socket.
   pub(crate) fn close(self) -> Result<()> {
     if !self.stream.send_while_open(Message::Eof)? {
       return Ok(());
@@ -525,8 +532,9 @@ impl Stream {
     state.write(&frame)
   }
 
-  /// As `send`, while the channel is open: whether it was. A process's
-  /// closes once it exits, which can be before the host acts on Opened.
+  /// Like `send`, but only if the channel is still open. Returns whether it
+  /// was. A process's channel closes when the process exits, which can happen
+  /// before the host has acted on Opened.
   fn send_while_open(&self, message: Message) -> Result<bool> {
     let mut state = self.shared.lock();
     if !state.mux.is_open(self.channel) {
@@ -546,8 +554,9 @@ impl Stream {
       .try_for_each(|chunk| self.send(Message::Data(chunk.to_vec())))
   }
 
-  /// The next message, or `None` if none came within `timeout`. The
-  /// agent's Error, and the session's end, are errors.
+  /// Returns the next message, or `None` if none arrives within `timeout`.
+  /// An Error message from the agent, or the end of the session, is returned
+  /// as an error.
   fn recv(&self, timeout: Option<Duration>) -> Result<Option<Message>> {
     let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
     let message = match timeout {
@@ -584,7 +593,7 @@ impl Shared {
 }
 
 impl State {
-  /// Writes `frame` as the window makes room for it.
+  /// Writes `frame` in slices as the window makes room for them.
   fn write(&mut self, frame: &Frame) -> Result<()> {
     let bytes = frame.to_bytes();
     let mut rest = bytes.as_slice();
@@ -600,7 +609,7 @@ impl State {
     Ok(())
   }
 
-  /// Starts a session; ends any there was, and what it ran.
+  /// Starts a new session, ending any current session and everything it ran.
   fn hello(&mut self) -> Result<()> {
     self.channels.clear();
     self.listeners.clear();
@@ -641,18 +650,18 @@ impl State {
     let channel = frame.channel;
 
     match self.mux.receive(frame) {
-      // The agent has no session: it started, or lost frames.
+      // The agent has no session because it just started or lost frames.
       Ok((_, Message::Hello { answer: false, .. })) => {
         let _ = self.hello();
         Heard::Nothing
       }
-      // A session: the guest booted or was restored, and its clock may be
-      // behind.
+      // A session has started. The guest just booted or was restored, so its
+      // clock may be behind.
       Ok((_, Message::Hello { answer: true, .. })) => {
         let _ = self.sync_clock();
         Heard::Changed
       }
-      // The console reader counted it.
+      // The console reader thread has already counted it.
       Ok((_, Message::Received(_))) => Heard::Nothing,
       Ok((_, Message::Ping(number))) => {
         if let Ok(pong) = self.mux.send(channel, Message::Pong(number)) {
@@ -671,7 +680,7 @@ impl State {
             messages,
           }
         }
-        // It stopped as the agent accepted the connection.
+        // The listener closed while the agent was accepting the connection.
         None => {
           self.close(channel, "nothing listens there any more");
           Heard::Nothing
@@ -690,15 +699,15 @@ impl State {
         self.mismatch = Some(mismatch);
         Heard::Changed
       }
-      // Such as a message that crossed its channel's closing.
+      // For example, a message that was in flight when its channel closed.
       Err(_) => Heard::Nothing,
     }
   }
 }
 
 impl Credit {
-  /// Room for up to `wanted` more bytes, counted as written, as soon as there
-  /// is any.
+  /// Waits until the window has room, then reserves and returns up to
+  /// `wanted` bytes of it.
   fn take(&self, wanted: usize) -> Result<usize> {
     let window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
     let mut window = self
@@ -722,7 +731,7 @@ impl Credit {
     Ok(room)
   }
 
-  /// Counts what `frame`, from the agent, says of the console.
+  /// Updates the window from a frame the agent sent.
   fn hear(&self, frame: &Frame) {
     if frame.channel != CONTROL {
       return;
@@ -733,8 +742,8 @@ impl Credit {
       Ok(Message::Received(bytes)) => {
         window.unreceived = window.unreceived.saturating_sub(bytes as usize);
       }
-      // A new agent, or one starting over: what the old one never read is
-      // gone, or the agent has read past it.
+      // The agent is new or starting over. Bytes the old agent never read
+      // are lost, or the agent has already read past them.
       Ok(Message::Hello { .. }) => window.unreceived = 0,
       _ => return,
     }
@@ -751,9 +760,9 @@ impl Credit {
   }
 }
 
-/// Reads the console, counting what the agent Received, and hands the rest
-/// on. Never waits on the session's state, which a writer holds while it
-/// waits for room.
+/// Reads the console, counts the agent's Received reports, and passes
+/// everything to the handler thread. This thread must never lock the
+/// session's state, because a writer holds that lock while it waits for room.
 fn read(mut output: PipeReader, credit: &Credit, events: &mpsc::Sender<Event>) {
   let mut decoder = Decoder::new();
   let mut buffer = vec![0; 64 << 10];
@@ -776,15 +785,15 @@ fn read(mut output: PipeReader, credit: &Credit, events: &mpsc::Sender<Event>) {
   credit.close();
 }
 
-/// Handles what the console brings, until it closes.
+/// Handles events from the console reader until the console closes.
 fn handle(queue: &Receiver<Event>, shared: &Arc<Shared>) {
   let mut line = Vec::new();
 
   for event in queue {
     let mut state = shared.lock();
     let heard = match event {
-      // Before a session, console text is the guest explaining why there is
-      // none, such as first-boot.sh failing.
+      // Console text before a session usually explains why there is none,
+      // such as first-boot.sh failing.
       Event::Read(bytes) => {
         if !state.mux.in_session() {
           echo(&mut line, &bytes);
@@ -792,7 +801,7 @@ fn handle(queue: &Receiver<Event>, shared: &Arc<Shared>) {
         Heard::Nothing
       }
       Event::Frame(frame) => state.receive(frame),
-      // Frames were lost mid-session: start over.
+      // Frames were lost during a session, so start a new one.
       Event::Skipped if state.mux.in_session() => {
         let _ = state.hello();
         Heard::Nothing
@@ -825,7 +834,7 @@ fn handle(queue: &Receiver<Event>, shared: &Arc<Shared>) {
   shared.changed.notify_all();
 }
 
-/// Copies the text among `bytes` to stderr, a line at a time.
+/// Copies the printable text in `bytes` to stderr, one line at a time.
 fn echo(line: &mut Vec<u8>, bytes: &[u8]) {
   for &byte in bytes {
     match byte {
@@ -847,10 +856,10 @@ pub(crate) mod tests {
 
   const PATIENCE: Duration = Duration::from_secs(10);
   const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
-  /// FreeBSD and macOS number it alike.
+  /// FreeBSD and macOS use the same number for SIGTERM.
   const SIGTERM: i32 = 15;
 
-  /// The real agent, serving over pipes as it would the console; and the
+  /// Runs the real agent over pipes in place of the console, and returns the
   /// ends the host reads and writes.
   fn serve() -> (PipeReader, PipeWriter) {
     let (output, agent_output) = std::io::pipe().unwrap();
@@ -866,7 +875,7 @@ pub(crate) mod tests {
     agent
   }
 
-  /// Its stdout until it holds `text`.
+  /// Reads the process's stdout until it contains `text`.
   fn read_until(process: &Process, text: &str) -> String {
     let mut output = String::new();
 
@@ -879,7 +888,8 @@ pub(crate) mod tests {
     output
   }
 
-  /// Its stdout until it exits, and how.
+  /// Reads the process's stdout until it exits, and returns the output and
+  /// exit status.
   fn finish(process: &Process) -> (String, Exit) {
     let mut output = String::new();
 
@@ -909,7 +919,7 @@ pub(crate) mod tests {
   #[test]
   fn rejoins_an_agent_that_does_not_announce_itself() {
     let (mut output, input) = serve();
-    // As after a restore: the agent announced itself to an earlier host.
+    // Simulates a restore: the agent announced itself to an earlier host.
     let announcement = Message::Hello {
       version: VERSION,
       answer: false,

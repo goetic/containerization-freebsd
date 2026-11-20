@@ -1,11 +1,12 @@
 # containerization-freebsd-sys
 
-The system calls `containerization-freebsd-agent` makes that std has no safe
-API for: pseudo-terminals, raw mode, signals, waiting for an exit without
-reaping it, the clock, jails, what a process takes on before it starts, and
-sockets opened from inside a jail. Each is a safe function over the agent's
-only unsafe code; the agent forbids its own.
+Safe wrappers for the system calls that `containerization-freebsd-agent` needs
+and std does not provide: pseudo-terminals, raw mode, signals, waiting for an
+exit without reaping it, the clock, jails, pre-exec hooks, and sockets opened
+from inside a jail. This crate holds all of the agent's unsafe code; the agent
+itself forbids unsafe code.
 
-It takes plain values, not the protocol's types, and builds on macOS too,
-where the agent's tests run: there, finding a jail fails, and nothing enters
-one. Not published: only the agent uses it.
+The functions take plain values, not the protocol's types. The crate also
+builds on macOS, where the agent's tests run; there, looking up a jail fails,
+so nothing ever enters one. It is not published, because only the agent uses
+it.

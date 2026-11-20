@@ -1,11 +1,12 @@
-//! Whom a process runs as: its User looked up in its root's `/etc/passwd`
-//! and `/etc/group`, as runc and Containerization's `vminitd` do.
+//! Resolves the user a process runs as by looking up its User in the root's
+//! `/etc/passwd` and `/etc/group`, as runc and Containerization's `vminitd`
+//! do.
 
 use containerization_freebsd_protocol::User;
 use std::io;
 use std::path::Path;
 
-/// A user's ids, and their home directory.
+/// A user's ids and home directory.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Ids {
   pub(crate) uid: u32,
@@ -28,8 +29,9 @@ struct Group<'a> {
   members: Vec<&'a str>,
 }
 
-/// Looks `user` up in the files under `root`, a directory in the guest. A
-/// missing file lists no one; one that leads out of `root` is refused.
+/// Looks up `user` in the files under `root`, a directory in the guest. A
+/// missing file counts as empty; a file whose path leads out of `root` is
+/// refused.
 pub(crate) fn look_up(user: &User, root: &Path) -> io::Result<Ids> {
   let passwd = read(root, "etc/passwd")?;
   let group = read(root, "etc/group")?;
@@ -37,9 +39,11 @@ pub(crate) fn look_up(user: &User, root: &Path) -> io::Result<Ids> {
   resolve(user, &passwd, &group).map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))
 }
 
-/// As runc does: a name must be listed; a uid needn't be, and one that
-/// isn't has gid 0 and home `/`. The groups that list a user are theirs,
-/// unless `group` names another in place of their own.
+/// Resolves `user` as runc does. A name must be listed in passwd; a numeric
+/// uid need not be, and an unlisted uid gets gid 0 and home `/`. The
+/// supplementary groups are those that list the user as a member, unless
+/// `user.group` is set: then it replaces the primary group and no listed
+/// groups are added. `user.groups` are always added.
 fn resolve(user: &User, passwd: &str, group: &str) -> Result<Ids, String> {
   let uid = user.name.parse::<u32>().ok();
   let account = accounts(passwd).find(|account| match uid {
@@ -82,7 +86,7 @@ fn resolve(user: &User, passwd: &str, group: &str) -> Result<Ids, String> {
   })
 }
 
-/// A gid, or the gid of the group of that name.
+/// Parses `group` as a gid, or else looks up the gid of the group so named.
 fn gid_of(group: &str, listed: &[Group]) -> Result<u32, String> {
   if let Ok(gid) = group.parse() {
     return Ok(gid);
@@ -94,7 +98,8 @@ fn gid_of(group: &str, listed: &[Group]) -> Result<u32, String> {
     .ok_or_else(|| format!("no group {group:?} in /etc/group"))
 }
 
-/// passwd(5)'s lines, past comments, NIS entries and lines it can't read.
+/// The entries of a passwd(5) file, skipping comments, NIS entries and
+/// malformed lines.
 fn accounts(passwd: &str) -> impl Iterator<Item = Account<'_>> {
   entries(passwd).filter_map(|fields| match fields[..] {
     [name, _, uid, gid, _, home, _] => Some(Account {
@@ -107,7 +112,7 @@ fn accounts(passwd: &str) -> impl Iterator<Item = Account<'_>> {
   })
 }
 
-/// group(5)'s lines, as `accounts` reads passwd(5)'s.
+/// The entries of a group(5) file, skipped as in `accounts`.
 fn groups(group: &str) -> impl Iterator<Item = Group<'_>> {
   entries(group).filter_map(|fields| match fields[..] {
     [name, _, gid, members] => Some(Group {
@@ -129,7 +134,8 @@ fn entries(text: &str) -> impl Iterator<Item = Vec<&str>> {
     .map(|line| line.split(':').collect())
 }
 
-/// The text of `path` under `root`, or nothing if there is no such file.
+/// Reads `path` under `root`, returning an empty string if the file does not
+/// exist.
 fn read(root: &Path, path: &str) -> io::Result<String> {
   let root = root.canonicalize()?;
   let file = match root.join(path).canonicalize() {

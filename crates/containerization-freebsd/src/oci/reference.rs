@@ -6,17 +6,17 @@ use std::str::FromStr;
 const DOCKER_HUB: &str = "docker.io";
 const LEGACY_DOCKER_HUB: &str = "index.docker.io";
 
-/// An image's name, and the tag or digest that picks a version of it, as
-/// Docker normalizes them: `alpine`, `docker.io/alpine` and
-/// `index.docker.io/alpine` are all `docker.io/library/alpine:latest`.
+/// An image name plus the tag or digest that selects a version, normalized as
+/// Docker does: `alpine`, `docker.io/alpine` and `index.docker.io/alpine` all
+/// become `docker.io/library/alpine:latest`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Reference {
   /// The registry, such as `ghcr.io` or `localhost:5000`.
   pub domain: String,
-  /// Such as `freebsd/freebsd-runtime`.
+  /// The repository, such as `freebsd/freebsd-runtime`.
   pub repository: String,
   pub tag: Option<String>,
-  /// Such as `sha256:…`; only sha256 is supported.
+  /// A digest such as `sha256:…`. Only sha256 is supported.
   pub digest: Option<String>,
 }
 
@@ -82,7 +82,8 @@ impl Reference {
     })
   }
 
-  /// What the registry is asked for: the digest if there is one, else the tag.
+  /// The version to request from the registry: the digest if there is one,
+  /// otherwise the tag.
   pub fn target(&self) -> &str {
     self
       .digest
@@ -91,7 +92,8 @@ impl Reference {
       .unwrap_or("latest")
   }
 
-  /// The host the registry's API answers at.
+  /// The host that serves the registry's API. For Docker Hub this differs
+  /// from the domain.
   pub(crate) fn registry(&self) -> &str {
     if self.domain == DOCKER_HUB {
       "registry-1.docker.io"
@@ -100,7 +102,8 @@ impl Reference {
     }
   }
 
-  /// Whether the registry is this machine's, reached over plain HTTP.
+  /// Whether the registry runs on this machine, so it is reached over plain
+  /// HTTP.
   pub(crate) fn local(&self) -> bool {
     let host = self
       .domain
@@ -112,8 +115,9 @@ impl Reference {
   }
 }
 
-/// A part of a name: lowercase letters and digits, separated by one `.` or
-/// `_`, two `_`, or any number of `-`.
+/// Whether `part` is a valid path component of a repository name: lowercase
+/// letters and digits, separated by one `.`, one or two `_`, or any number of
+/// `-`.
 fn component(part: &str) -> bool {
   let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
   let bytes = part.as_bytes();
