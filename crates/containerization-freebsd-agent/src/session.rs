@@ -301,53 +301,49 @@ impl<W: Write> Agent<W> {
   fn exec(&mut self, channel: u32, exec: &Exec) -> io::Result<()> {
     let outbox = self.outbox(channel);
     let id = outbox.id;
-    let started = process::spawn(exec, outbox);
+    // Its errors say what failed; the host names the command.
+    let started = process::spawn(exec, outbox).map_err(|error| error.to_string());
 
-    self.opened(channel, id, started, || {
-      let program = exec.argv.first().map_or("", String::as_str);
-      format!("running {program:?}")
-    })
+    self.opened(channel, id, started)
   }
 
   fn connect(&mut self, channel: u32, connect: &Connect) -> io::Result<()> {
     let outbox = self.outbox(channel);
     let id = outbox.id;
-    let started = relay::connect(connect, outbox);
-
-    self.opened(channel, id, started, || {
+    let started = relay::connect(connect, outbox).map_err(|error| {
       let to = match &connect.to {
         Address::Port(port) => format!("port {port}"),
         Address::Unix(path) => format!("{path:?}"),
       };
-      format!("connecting to {to}{}", in_jail(connect.jail.as_deref()))
-    })
+      format!("connecting to {to}{}: {error}", in_jail(connect.jail.as_deref()))
+    });
+
+    self.opened(channel, id, started)
   }
 
   fn listen(&mut self, channel: u32, listen: &Listen) -> io::Result<()> {
     let outbox = self.outbox(channel);
     let id = outbox.id;
-    let started = listener::listen(listen, outbox);
+    let started = listener::listen(listen, outbox).map_err(|error| {
+      format!(
+        "listening on {:?}{}: {error}",
+        listen.path,
+        in_jail(listen.jail.as_deref())
+      )
+    });
 
-    self.opened(channel, id, started, || {
-      format!("listening on {:?}{}", listen.path, in_jail(listen.jail.as_deref()))
-    })
+    self.opened(channel, id, started)
   }
 
   /// Holds what the host's opening of `channel` started, and says it
-  /// opened; or says what failed, as `doing` describes it.
-  fn opened(
-    &mut self,
-    channel: u32,
-    id: u64,
-    started: io::Result<Handle>,
-    doing: impl FnOnce() -> String,
-  ) -> io::Result<()> {
+  /// opened; or says what failed.
+  fn opened(&mut self, channel: u32, id: u64, started: Result<Handle, String>) -> io::Result<()> {
     match started {
       Ok(handle) => {
         self.channels.insert(channel, Open { id, handle });
         self.send(channel, Message::Opened)
       }
-      Err(error) => self.send(channel, Message::Error(format!("{}: {error}", doing()))),
+      Err(reason) => self.send(channel, Message::Error(reason)),
     }
   }
 

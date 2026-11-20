@@ -363,10 +363,57 @@ fn refuses_a_command_that_does_not_exist() {
 
   assert_eq!(from, channel);
   assert!(
-    matches!(&message, Message::Error(reason) if reason.contains("/nonexistent/command")),
+    matches!(&message, Message::Error(reason) if reason.contains("running \"/nonexistent/command\"")),
     "{message:?}"
   );
   assert!(!host.mux.is_open(channel));
+}
+
+#[test]
+fn says_a_missing_working_directory_failed_not_the_command() {
+  let mut host = Host::start();
+
+  let channel = host.open(Message::Exec(Exec {
+    cwd: Some("/nonexistent/directory".into()),
+    ..command(&["true"])
+  }));
+  let (from, message) = host.next();
+
+  assert_eq!(from, channel);
+  assert!(
+    matches!(&message, Message::Error(reason) if reason.starts_with("changing to \"/nonexistent/directory\": ")),
+    "{message:?}"
+  );
+}
+
+#[test]
+fn says_a_user_it_cannot_become_failed_not_the_command() {
+  // Only root may become another user.
+  if is_root() {
+    return;
+  }
+  let mut host = Host::start();
+
+  let channel = host.open(Message::Exec(Exec {
+    user: Some(User {
+      name: "0".into(),
+      ..User::default()
+    }),
+    ..command(&["true"])
+  }));
+  let (from, message) = host.next();
+
+  assert_eq!(from, channel);
+  assert!(
+    matches!(&message, Message::Error(reason) if reason.starts_with("becoming \"0\": ")),
+    "{message:?}"
+  );
+}
+
+/// Whether the tests run as root, by `id -u`.
+fn is_root() -> bool {
+  let output = std::process::Command::new("id").arg("-u").output().unwrap();
+  output.stdout == b"0\n"
 }
 
 #[test]

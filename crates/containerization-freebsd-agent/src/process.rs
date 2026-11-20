@@ -86,26 +86,37 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
     // login shell has; taken while it is still root.
     sys::take_terminal_on_exec(&mut command);
   }
-  enter(&mut command, exec)?;
+  let mut entering = enter(&mut command, exec)?;
   if exec.rescue {
     sys::rescue_on_exec(&mut command, &exec.argv)?;
   }
 
-  match exec.pty {
+  let started = match exec.pty {
     Some(size) => in_terminal(command, size, outbox),
     None => on_pipes(command, outbox),
-  }
+  };
+  started.map_err(|error| {
+    let doing = match entering.as_mut().and_then(sys::Entering::failed) {
+      Some(sys::Step::Jail) => format!("entering jail {:?}", exec.jail.as_deref().unwrap_or_default()),
+      Some(sys::Step::Limits) => "setting its resource limits".to_string(),
+      Some(sys::Step::User) => format!(
+        "becoming {:?}",
+        exec.user.as_ref().map_or("", |user| user.name.as_str())
+      ),
+      Some(sys::Step::Directory) => format!("changing to {:?}", exec.cwd.as_deref().unwrap_or("/")),
+      None => format!("running {program:?}"),
+    };
+    io::Error::new(error.kind(), format!("{doing}: {error}"))
+  })
 }
 
 /// Has the process enter its jail and take on its user, limits and umask,
-/// then change directory: in its jail, to `/` if to nowhere else. With none
-/// of those, std changes its directory.
-fn enter(command: &mut Command, exec: &Exec) -> io::Result<()> {
-  if exec.jail.is_none() && exec.user.is_none() && exec.umask.is_none() && exec.limits.is_empty() {
-    if let Some(cwd) = &exec.cwd {
-      command.current_dir(cwd);
-    }
-    return Ok(());
+/// then change directory: in its jail, to `/` if to nowhere else. Says
+/// which of those failed, if one did; with none, there is nothing to say.
+fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>> {
+  if exec.jail.is_none() && exec.user.is_none() && exec.umask.is_none() && exec.limits.is_empty() && exec.cwd.is_none()
+  {
+    return Ok(None);
   }
 
   let (jail, root) = match &exec.jail {
@@ -154,8 +165,8 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<()> {
       }),
       cwd,
     },
-  );
-  Ok(())
+  )
+  .map(Some)
 }
 
 fn window(size: WindowSize) -> sys::WindowSize {

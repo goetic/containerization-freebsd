@@ -10,7 +10,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io;
+use std::io::{self, PipeReader, Read};
 use std::mem::{self, MaybeUninit};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -219,13 +219,57 @@ pub struct Entry {
   pub cwd: Option<CString>,
 }
 
+/// The part of an `Entry` a process failed to take on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+  Jail = 1,
+  Limits,
+  User,
+  Directory,
+}
+
+/// Where a process taking on an `Entry` says which step failed: spawning it
+/// fails with only an errno, the same whether a step or exec failed.
+pub struct Entering(PipeReader);
+
+impl Entering {
+  /// The step the process failed at, once spawning it has failed; none if
+  /// it took on all of its entry, and running its program failed.
+  pub fn failed(&mut self) -> Option<Step> {
+    let mut byte = 0u8;
+    match self.0.read(std::slice::from_mut(&mut byte)) {
+      Ok(1) => [Step::Jail, Step::Limits, Step::User, Step::Directory]
+        .into_iter()
+        .find(|step| *step as u8 == byte),
+      _ => None,
+    }
+  }
+}
+
+/// Has the child report that it failed at `step` over `report`, allocating
+/// nothing, and passes on its `error`.
+fn failed_at(report: BorrowedFd, step: Step) -> impl Fn(io::Error) -> io::Error {
+  move |error| {
+    let byte = step as u8;
+    // SAFETY: write reads the one byte. The pipe has room for it, and the
+    // error is the child's either way.
+    unsafe { libc::write(report.as_raw_fd(), (&raw const byte).cast(), 1) };
+    error
+  }
+}
+
 /// Has the command's process take on `entry` between fork and exec, in
 /// this order: its jail, its limits and umask, its user, and its working
 /// directory, which it reaches as that user, as std would.
 // rlim_t is signed on FreeBSD, and mode_t is u16 on FreeBSD and macOS but
 // u32 on Linux.
 #[allow(clippy::unnecessary_cast)]
-pub fn enter_on_exec(command: &mut Command, entry: Entry) {
+pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering> {
+  let (reader, writer) = io::pipe()?;
+  // Read once spawning has failed, while the command still holds the write
+  // end: so as not to wait for it to close.
+  // SAFETY: fcntl changes only the descriptor's flags.
+  check(unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) })?;
   let rlim = |value: u64| value.min(libc::RLIM_INFINITY as u64) as libc::rlim_t;
   let limits: Vec<(libc::c_int, libc::rlimit)> = entry
     .limits
@@ -246,27 +290,30 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) {
   // nothing.
   unsafe {
     command.pre_exec(move || {
+      let report = writer.as_fd();
       if let Some(jid) = jail {
-        attach(jid)?;
+        attach(jid).map_err(failed_at(report, Step::Jail))?;
       }
       for (resource, limit) in &limits {
-        check(libc::setrlimit(*resource as _, limit))?;
+        check(libc::setrlimit(*resource as _, limit)).map_err(failed_at(report, Step::Limits))?;
       }
       if let Some(umask) = umask {
         libc::umask(umask);
       }
       if let Some(ids) = &ids {
         // Supplementary groups only, on FreeBSD 15 as elsewhere.
-        check(libc::setgroups(ids.groups.len() as _, ids.groups.as_ptr()))?;
-        check(libc::setgid(ids.gid))?;
-        check(libc::setuid(ids.uid))?;
+        check(libc::setgroups(ids.groups.len() as _, ids.groups.as_ptr()))
+          .and_then(|_| check(libc::setgid(ids.gid)))
+          .and_then(|_| check(libc::setuid(ids.uid)))
+          .map_err(failed_at(report, Step::User))?;
       }
       if let Some(cwd) = &cwd {
-        check(libc::chdir(cwd.as_ptr()))?;
+        check(libc::chdir(cwd.as_ptr())).map_err(failed_at(report, Step::Directory))?;
       }
       Ok(())
     });
   }
+  Ok(Entering(reader))
 }
 
 /// The guest's `/rescue` tool a process runs in place of its program, with
