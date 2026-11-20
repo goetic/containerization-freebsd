@@ -1315,6 +1315,22 @@ fn pulls_unpacks_and_runs_oci_images() {
   hidden
     .copy_out("/cfbsd/missing", &out.join("missing"), true)
     .expect_err("copy out what is missing");
+  // Neither devices nor FIFOs, which copying could block on, or never end.
+  hidden
+    .copy_out("/dev/null", &out.join("null"), true)
+    .expect_err("copy out a device");
+  hidden
+    .copy_in(&copies.join("big"), "/dev/null", 0o644, true)
+    .expect_err("copy over a device");
+  let fifo = copies.join("fifo");
+  let made = std::process::Command::new("mkfifo")
+    .arg(&fifo)
+    .status()
+    .expect("run mkfifo");
+  assert!(made.success(), "make a FIFO on the host");
+  hidden
+    .copy_in(&fifo, "/cfbsd/fifo", 0o644, true)
+    .expect_err("copy in a FIFO");
   hidden.delete().expect("delete the container");
 
   machine

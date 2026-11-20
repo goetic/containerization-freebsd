@@ -22,13 +22,22 @@ const PORTABLE: [&str; 3] = ["--no-acls", "--no-fflags", "--no-xattrs"];
 enum Kind {
   Missing,
   Directory,
+  /// A regular file.
+  File,
+  /// A FIFO, a device or a socket, which reading or writing could block on,
+  /// or never end.
   Other,
 }
 
 pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, create_parents: bool) -> Result<()> {
-  let directory = fs::metadata(source)
-    .map_err(Error::io(format!("reading {}", source.display())))?
-    .is_dir();
+  let metadata = fs::metadata(source).map_err(Error::io(format!("reading {}", source.display())))?;
+  if !metadata.is_dir() && !metadata.is_file() {
+    return Err(Error::Invalid(format!(
+      "{} is not a regular file or directory",
+      source.display()
+    )));
+  }
+  let directory = metadata.is_dir();
   let target = target(source, directory, destination, kind(jail, destination)?)?;
   if create_parents && let Some(parent) = parent(&target) {
     check(jail, &["mkdir", "-p", "--", parent])?;
@@ -37,7 +46,12 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
   if !directory {
     let mut file = File::open(source).map_err(Error::io(format!("reading {}", source.display())))?;
     let argv = ["dd", &format!("of={target}"), "bs=64k", "status=none"];
-    feed(rescue(jail, &argv)?, &argv, &mut file, &source.display().to_string())?;
+    // Made unreadable to the jail's users until it has its mode.
+    let dd = jail.spawn(Exec {
+      umask: Some(0o077),
+      ..rescue_exec(&argv)
+    })?;
+    feed(dd, &argv, &mut file, &source.display().to_string())?;
     // chmod(1) parses no options past the mode, so a `--` there would name a file.
     return check(jail, &["chmod", &format!("{mode:o}"), &target]);
   }
@@ -65,18 +79,27 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
 }
 
 pub(crate) fn copy_out(jail: &Jail, source: &str, destination: &Path, create_parents: bool) -> Result<()> {
-  let found = kind(jail, source)?;
-  if found == Kind::Missing {
-    return Err(Error::Invalid(format!(
-      "{source} does not exist in jail {}",
-      jail.name()
-    )));
-  }
+  let directory = match kind(jail, source)? {
+    Kind::Missing => {
+      return Err(Error::Invalid(format!(
+        "{source} does not exist in jail {}",
+        jail.name()
+      )));
+    }
+    Kind::Other => {
+      return Err(Error::Invalid(format!(
+        "{source} in jail {} is not a regular file or directory",
+        jail.name()
+      )));
+    }
+    Kind::File => false,
+    Kind::Directory => true,
+  };
   if create_parents && let Some(parent) = destination.parent() {
     fs::create_dir_all(parent).map_err(Error::io(format!("creating {}", parent.display())))?;
   }
 
-  if found == Kind::Other {
+  if !directory {
     let mut file = OpenOptions::new()
       .write(true)
       .create(true)
@@ -129,11 +152,14 @@ fn target(source: &Path, directory: bool, destination: &str, found: Kind) -> Res
         .ok_or_else(|| Error::Invalid(format!("{} has no name to copy it by", source.display())))?;
       Ok(format!("{}/{name}", destination.trim_end_matches('/')))
     }
-    Kind::Other if directory => Err(Error::Invalid(format!(
+    Kind::File if directory => Err(Error::Invalid(format!(
       "cannot copy the directory {} over the file {destination}",
       source.display()
     ))),
-    Kind::Other => Ok(destination.to_string()),
+    Kind::File => Ok(destination.to_string()),
+    Kind::Other => Err(Error::Invalid(format!(
+      "the destination {destination} is not a regular file or directory"
+    ))),
   }
 }
 
@@ -155,6 +181,8 @@ fn kind(jail: &Jail, path: &str) -> Result<Kind> {
 
   Ok(if test("-d")? {
     Kind::Directory
+  } else if test("-f")? {
+    Kind::File
   } else if test("-e")? {
     Kind::Other
   } else {
@@ -164,11 +192,16 @@ fn kind(jail: &Jail, path: &str) -> Result<Kind> {
 
 /// Starts the `/rescue` tool `argv` names in the jail.
 fn rescue(jail: &Jail, argv: &[&str]) -> Result<Process> {
-  jail.spawn(Exec {
+  jail.spawn(rescue_exec(argv))
+}
+
+/// Runs the `/rescue` tool `argv` names.
+fn rescue_exec(argv: &[&str]) -> Exec {
+  Exec {
     argv: argv.iter().map(|arg| arg.to_string()).collect(),
     rescue: true,
     ..Exec::default()
-  })
+  }
 }
 
 fn check(jail: &Jail, argv: &[&str]) -> Result<()> {
@@ -220,9 +253,18 @@ fn wait(process: &Process, sink: &mut impl Write) -> Result<(Exit, String)> {
 }
 
 /// The host's tar, its stderr read as it runs so a full pipe can't stall it.
+/// Dropping it before it finishes kills it.
 struct HostTar {
   child: Child,
-  stderr: JoinHandle<String>,
+  stderr: Option<JoinHandle<String>>,
+}
+
+impl Drop for HostTar {
+  fn drop(&mut self) {
+    // Nothing, once finished: the child is reaped, so isn't signalled.
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+  }
 }
 
 impl HostTar {
@@ -240,12 +282,19 @@ impl HostTar {
       text
     });
 
-    Ok(Self { child, stderr })
+    Ok(Self {
+      child,
+      stderr: Some(stderr),
+    })
   }
 
   fn finish(mut self) -> Result<()> {
     let status = self.child.wait().map_err(Error::io("waiting for tar"))?;
-    let stderr = self.stderr.join().unwrap_or_default();
+    let stderr = self
+      .stderr
+      .take()
+      .and_then(|stderr| stderr.join().ok())
+      .unwrap_or_default();
 
     if status.success() {
       Ok(())
@@ -273,7 +322,7 @@ mod tests {
       Ok("/srv/b.txt".into())
     );
     assert_eq!(
-      target_of("/h/a.txt", false, "/srv/b.txt", Kind::Other),
+      target_of("/h/a.txt", false, "/srv/b.txt", Kind::File),
       Ok("/srv/b.txt".into())
     );
     assert_eq!(
@@ -295,10 +344,30 @@ mod tests {
       Err("the destination directory /srv/ does not exist".into())
     );
     assert_eq!(
-      target_of("/h/d", true, "/srv/f", Kind::Other),
+      target_of("/h/d", true, "/srv/f", Kind::File),
       Err("cannot copy the directory /h/d over the file /srv/f".into())
     );
+    assert_eq!(
+      target_of("/h/a.txt", false, "/srv/fifo", Kind::Other),
+      Err("the destination /srv/fifo is not a regular file or directory".into())
+    );
     assert!(target_of("/", false, "/srv", Kind::Directory).is_err());
+  }
+
+  #[test]
+  fn reaps_a_tar_it_drops_unfinished() {
+    let tar = HostTar::start(Command::new("sleep").arg("30")).unwrap();
+    let pid = tar.child.id().to_string();
+
+    drop(tar);
+
+    // As a zombie, it would still take signals.
+    let signalled = Command::new("kill")
+      .args(["-0", &pid])
+      .stderr(Stdio::null())
+      .status()
+      .unwrap();
+    assert!(!signalled.success(), "{pid} is still there");
   }
 
   #[test]

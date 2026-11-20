@@ -93,6 +93,11 @@
   failed, such as waiting for it to be gone. Deleting a container whose
   jail is gone now lifts the limits and unmounts the mounts the jail left,
   which kept its dataset from being destroyed.
+- Fixes copying a FIFO or a device hanging, or never ending: copying now
+  takes only regular files and directories. A file copied in is no longer
+  readable to the jail's users before it has its mode, and a copy that
+  fails before the jail's end starts no longer leaves the host's tar
+  unreaped.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited
