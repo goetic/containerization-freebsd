@@ -98,6 +98,10 @@
   readable to the jail's users before it has its mode, and a copy that
   fails before the jail's end starts no longer leaves the host's tar
   unreaped.
+- Fixes a build step on interfaces missing the cache whenever its
+  addresses changed: a step's key now names how it reaches the network,
+  not the addresses. The host computes it, sparing the guest a command
+  each step.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited

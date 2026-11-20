@@ -5,6 +5,7 @@
 use crate::agent::{Agent, Exec, Exit, Output};
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
+use crate::oci::sha256_digest;
 use crate::zfs::Zfs;
 use std::time::Duration;
 
@@ -71,7 +72,7 @@ impl<'a> Builder<'a> {
     };
 
     for (index, step) in steps.iter().enumerate() {
-      let key = self.key(&built.snapshot, step)?;
+      let key = key(&built.snapshot, step);
       let dataset = format!("{}/{key}", self.store);
       let snapshot = format!("{dataset}@{BUILT}");
 
@@ -87,17 +88,6 @@ impl<'a> Builder<'a> {
       built.snapshot = snapshot;
     }
     Ok(built)
-  }
-
-  /// The step's key: the sha256 of the snapshot it starts from, its network
-  /// and its script.
-  fn key(&self, from: &str, step: &Step) -> Result<String> {
-    let identity = format!("{from}\n{:?}\n{}", step.network, step.script);
-    let ran = self
-      .agent
-      .check(&["sha256", "-q", "-s", &identity], QUICK)?;
-
-    Ok(ran.stdout.trim().to_string())
   }
 
   /// Runs `step` in a jail on a fresh clone of `from` at `dataset`, which
@@ -137,6 +127,22 @@ impl<'a> Builder<'a> {
   }
 }
 
+/// The step's key: the sha256 of the snapshot it starts from, how it
+/// reaches the network, and its script. Not its addresses: on interfaces
+/// leased again, it is the same step.
+fn key(from: &str, step: &Step) -> String {
+  let network = match step.network {
+    // As Debug printed them, so steps built before keep their keys.
+    Network::None => "None",
+    Network::Inherit => "Inherit",
+    Network::Nat => "Nat",
+    Network::Interfaces(_) => "Interfaces",
+  };
+  let digest = sha256_digest(format!("{from}\n{network}\n{}", step.script).as_bytes());
+
+  digest.trim_start_matches("sha256:").to_string()
+}
+
 fn run_script(jail: &Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> Result<Exit> {
   let process = jail.spawn(Exec {
     argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
@@ -150,5 +156,48 @@ fn run_script(jail: &Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> Resul
       Output::Stdout(bytes) | Output::Stderr(bytes) => output(&bytes),
       Output::Exited(exit) => return Ok(exit),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::jail::Interface;
+
+  const FROM: &str = "images/userland@base";
+
+  fn on(network: Network) -> Step {
+    Step {
+      network,
+      ..Step::new("echo one")
+    }
+  }
+
+  fn leased(address: &str) -> Network {
+    Network::Interfaces(vec![Interface {
+      mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+      address: address.into(),
+      gateway: Some("192.168.64.1".into()),
+    }])
+  }
+
+  #[test]
+  fn keeps_the_keys_of_steps_built_before() {
+    assert_eq!(
+      key(FROM, &on(Network::Inherit)),
+      "e7187d7e27746dc0bfd6ae4488cabaaf08312ce97e55317bdcfac2e7254604f9"
+    );
+    assert_eq!(
+      key(FROM, &on(Network::None)),
+      "f1a9bc418a10888b6829f466d3f2501fe3dd9fb97b32269d6b9357bd9f761801"
+    );
+  }
+
+  #[test]
+  fn keys_a_step_on_interfaces_by_its_network_not_its_addresses() {
+    let first = key(FROM, &on(leased("192.168.64.3/24")));
+
+    assert_eq!(key(FROM, &on(leased("192.168.64.140/24"))), first);
+    assert_ne!(key(FROM, &on(Network::Nat)), first);
   }
 }
