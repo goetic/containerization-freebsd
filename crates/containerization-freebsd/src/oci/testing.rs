@@ -1,0 +1,312 @@
+//! A loopback OCI registry for tests. It accepts pushes and serves pulls for
+//! any repository behind bearer tokens, as ghcr.io does. Each token covers
+//! one repository: GET and HEAD accept a pull or push token; POST and PUT
+//! need push. Blob requests redirect to a storage path outside the API, as
+//! real registries often do.
+
+use super::sha256_digest;
+use std::collections::HashMap;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use url::Url;
+
+#[derive(Default)]
+pub(crate) struct FakeRegistry {
+  /// Manifests and indexes, with their media types, by `repository/target`.
+  manifests: HashMap<String, (String, Vec<u8>)>,
+  /// Blobs by digest, shared by every repository.
+  blobs: HashMap<String, Vec<u8>>,
+  uploads: u32,
+}
+
+impl FakeRegistry {
+  /// Adds the manifest or index `bytes` to `repository`, under `target` and
+  /// under its digest, as a push would.
+  pub(crate) fn manifest(mut self, repository: &str, target: &str, media_type: &str, bytes: &[u8]) -> Self {
+    self.put_manifest(repository, target, media_type, bytes.to_vec());
+    self
+  }
+
+  pub(crate) fn blob(mut self, bytes: &[u8]) -> Self {
+    self.blobs.insert(sha256_digest(bytes), bytes.to_vec());
+    self
+  }
+
+  /// Serves the registry on a thread and returns its address.
+  pub(crate) fn serve(mut self) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let host = address.clone();
+
+    std::thread::spawn(move || {
+      for mut stream in listener.incoming().flatten() {
+        let Ok(request) = Request::read(&stream, &host) else {
+          continue;
+        };
+        let response = self.respond(&request, &host);
+        let _ = response.write(&mut stream, request.method == "HEAD");
+      }
+    });
+    address
+  }
+
+  fn respond(&mut self, request: &Request, host: &str) -> Response {
+    let route = Route::parse(request.url.path());
+    if let Some(repository) = route.repository()
+      && !request.allowed(repository)
+    {
+      return Response::status("401 Unauthorized").header(
+        "WWW-Authenticate",
+        format!("Bearer realm=\"http://{host}/token\",service=\"test\""),
+      );
+    }
+
+    match (request.method.as_str(), route) {
+      ("GET", Route::Token) => token(request),
+      ("GET" | "HEAD", Route::Storage { digest }) => found(
+        self
+          .blobs
+          .get(&digest)
+          .map(|blob| ("application/octet-stream", blob)),
+      ),
+      ("GET" | "HEAD", Route::Manifest { repository, target }) => found(
+        self
+          .manifests
+          .get(&format!("{repository}/{target}"))
+          .map(|(kind, bytes)| (kind.as_str(), bytes)),
+      ),
+      ("PUT", Route::Manifest { repository, target }) => {
+        let kind = request
+          .headers
+          .get("content-type")
+          .cloned()
+          .unwrap_or_default();
+        self.put_manifest(&repository, &target, &kind, request.body.clone());
+        Response::status("201 Created")
+      }
+      ("POST", Route::Uploads { repository }) => {
+        self.uploads += 1;
+        Response::status("202 Accepted").header("Location", format!("/v2/{repository}/blobs/uploads/{}", self.uploads))
+      }
+      ("PUT", Route::Upload { .. }) => match request.query("digest") {
+        Some(digest) if digest == sha256_digest(&request.body) => {
+          self.blobs.insert(digest, request.body.clone());
+          Response::status("201 Created")
+        }
+        _ => Response::status("400 Bad Request"),
+      },
+      ("GET" | "HEAD", Route::Blob { digest, .. }) => {
+        Response::status("307 Temporary Redirect").header("Location", format!("/storage/{digest}"))
+      }
+      _ => Response::status("404 Not Found"),
+    }
+  }
+
+  fn put_manifest(&mut self, repository: &str, target: &str, media_type: &str, bytes: Vec<u8>) {
+    let entry = (media_type.to_string(), bytes);
+    self
+      .manifests
+      .insert(format!("{repository}/{}", sha256_digest(&entry.1)), entry.clone());
+    self
+      .manifests
+      .insert(format!("{repository}/{target}"), entry);
+  }
+}
+
+/// Grants a token for scope `repository:<name>:<actions>`, naming the
+/// repository and whether it may push.
+fn token(request: &Request) -> Response {
+  let scope = request.query("scope").unwrap_or_default();
+  let Some((repository, actions)) = scope
+    .strip_prefix("repository:")
+    .and_then(|scope| scope.rsplit_once(':'))
+  else {
+    return Response::status("400 Bad Request");
+  };
+  let action = if actions.split(',').any(|action| action == "push") {
+    "push"
+  } else {
+    "pull"
+  };
+
+  Response::ok(format!(r#"{{"token":"{action}:{repository}"}}"#).into_bytes())
+}
+
+fn found(found: Option<(&str, &Vec<u8>)>) -> Response {
+  match found {
+    Some((kind, bytes)) => Response::ok(bytes.clone()).header("Content-Type", kind.to_string()),
+    None => Response::status("404 Not Found"),
+  }
+}
+
+/// What a request's path names.
+enum Route {
+  Token,
+  Storage {
+    digest: String,
+  },
+  Manifest {
+    repository: String,
+    target: String,
+  },
+  /// Where a blob upload starts.
+  Uploads {
+    repository: String,
+  },
+  Upload {
+    repository: String,
+  },
+  Blob {
+    repository: String,
+    digest: String,
+  },
+  Unknown,
+}
+
+impl Route {
+  fn parse(path: &str) -> Self {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    match segments.as_slice() {
+      ["token"] => Self::Token,
+      ["storage", digest] => Self::Storage {
+        digest: digest.to_string(),
+      },
+      ["v2", repository @ .., "manifests", target] => Self::Manifest {
+        repository: repository.join("/"),
+        target: target.to_string(),
+      },
+      ["v2", repository @ .., "blobs", "uploads", ""] => Self::Uploads {
+        repository: repository.join("/"),
+      },
+      ["v2", repository @ .., "blobs", "uploads", _] => Self::Upload {
+        repository: repository.join("/"),
+      },
+      ["v2", repository @ .., "blobs", digest] => Self::Blob {
+        repository: repository.join("/"),
+        digest: digest.to_string(),
+      },
+      _ => Self::Unknown,
+    }
+  }
+
+  /// The repository whose token the route needs, if it needs one.
+  fn repository(&self) -> Option<&str> {
+    match self {
+      Self::Manifest { repository, .. }
+      | Self::Uploads { repository }
+      | Self::Upload { repository }
+      | Self::Blob { repository, .. } => Some(repository),
+      Self::Token | Self::Storage { .. } | Self::Unknown => None,
+    }
+  }
+}
+
+struct Request {
+  method: String,
+  url: Url,
+  /// Headers by lowercase name.
+  headers: HashMap<String, String>,
+  body: Vec<u8>,
+}
+
+impl Request {
+  fn read(stream: &TcpStream, host: &str) -> io::Result<Self> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let url = Url::parse(&format!("http://{host}{}", parts.next().unwrap_or_default())).map_err(io::Error::other)?;
+
+    let mut headers = HashMap::new();
+    loop {
+      line.clear();
+      reader.read_line(&mut line)?;
+      let Some((name, value)) = line.trim_end().split_once(':') else {
+        break;
+      };
+      headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+    }
+    let length = headers
+      .get("content-length")
+      .and_then(|length| length.parse().ok())
+      .unwrap_or(0);
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+
+    Ok(Self {
+      method,
+      url,
+      headers,
+      body,
+    })
+  }
+
+  fn query(&self, name: &str) -> Option<String> {
+    self
+      .url
+      .query_pairs()
+      .find(|(key, _)| key == name)
+      .map(|(_, value)| value.into_owned())
+  }
+
+  /// Whether the request's token grants it access to `repository`.
+  fn allowed(&self, repository: &str) -> bool {
+    let Some((action, granted)) = self
+      .headers
+      .get("authorization")
+      .and_then(|value| value.strip_prefix("Bearer "))
+      .and_then(|token| token.split_once(':'))
+    else {
+      return false;
+    };
+
+    granted == repository && (action == "push" || !matches!(self.method.as_str(), "POST" | "PUT"))
+  }
+}
+
+struct Response {
+  status: &'static str,
+  headers: Vec<(&'static str, String)>,
+  body: Vec<u8>,
+}
+
+impl Response {
+  fn status(status: &'static str) -> Self {
+    Self {
+      status,
+      headers: Vec::new(),
+      body: Vec::new(),
+    }
+  }
+
+  fn ok(body: Vec<u8>) -> Self {
+    Self {
+      body,
+      ..Self::status("200 OK")
+    }
+  }
+
+  fn header(mut self, name: &'static str, value: String) -> Self {
+    self.headers.push((name, value));
+    self
+  }
+
+  /// Writes the response, omitting the body if `head`.
+  fn write(&self, stream: &mut TcpStream, head: bool) -> io::Result<()> {
+    write!(stream, "HTTP/1.1 {}\r\n", self.status)?;
+    for (name, value) in &self.headers {
+      write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(
+      stream,
+      "Content-Length: {}\r\nConnection: close\r\n\r\n",
+      self.body.len()
+    )?;
+    if !head {
+      stream.write_all(&self.body)?;
+    }
+    Ok(())
+  }
+}

@@ -4,6 +4,8 @@
 mod content;
 mod reference;
 mod registry;
+#[cfg(test)]
+pub(crate) mod testing;
 
 pub use content::ContentStore;
 pub use reference::Reference;

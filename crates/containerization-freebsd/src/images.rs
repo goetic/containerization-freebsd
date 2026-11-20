@@ -603,12 +603,8 @@ fn layout_blob(root: &Path, digest: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::oci::testing::FakeRegistry;
   use crate::oci::{RootFs, RunConfig, media_type, sha256_digest};
-  use std::collections::HashMap;
-  use std::io::{BufRead, BufReader, Read, Write};
-  use std::net::TcpListener;
-
-  const TOKEN: &str = "secret";
 
   fn descriptor(media_type: &str, bytes: &[u8], platform: Option<Platform>) -> Descriptor {
     Descriptor {
@@ -649,14 +645,9 @@ mod tests {
     (layer, config, manifest)
   }
 
-  /// A loopback registry that serves `test/image:1` behind a bearer token, as
-  /// ghcr.io does. The image is an index listing arm64 and amd64 FreeBSD
-  /// manifests, but the registry serves only the arm64 one. Blob requests
-  /// redirect to a storage path, as real registries' often do.
+  /// A loopback registry serving `test/image:1`: an index listing arm64 and
+  /// amd64 FreeBSD manifests, of which it has only arm64.
   fn registry() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-
     let (layer, config, manifest) = documents();
     let amd64 = Platform {
       architecture: "amd64".into(),
@@ -670,195 +661,12 @@ mod tests {
       ..Index::default()
     });
 
-    let mut documents: HashMap<String, (&str, Vec<u8>)> = HashMap::new();
-    documents.insert("1".into(), (media_type::INDEX, index.clone()));
-    documents.insert(sha256_digest(&index), (media_type::INDEX, index));
-    documents.insert(sha256_digest(&manifest), (media_type::MANIFEST, manifest));
-    let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
-    blobs.insert(sha256_digest(&config), config);
-    blobs.insert(sha256_digest(&layer), layer);
-
-    let realm = format!("http://{address}/token");
-    std::thread::spawn(move || {
-      for stream in listener.incoming() {
-        let mut stream = stream.unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut request = String::new();
-        reader.read_line(&mut request).unwrap();
-        let path = request
-          .split_whitespace()
-          .nth(1)
-          .unwrap_or_default()
-          .to_string();
-        let mut authorized = false;
-        loop {
-          let mut line = String::new();
-          reader.read_line(&mut line).unwrap();
-          if line.trim().is_empty() {
-            break;
-          }
-          authorized |= line.to_ascii_lowercase() == format!("authorization: bearer {TOKEN}\r\n");
-        }
-
-        let challenge = format!("WWW-Authenticate: Bearer realm=\"{realm}\",service=\"test\"\r\n");
-        let (status, headers, body) =
-          if path.starts_with("/token?") && path.contains("scope=repository%3Atest%2Fimage%3Apull") {
-            (
-              "200 OK",
-              String::new(),
-              format!(r#"{{"token":"{TOKEN}"}}"#).into_bytes(),
-            )
-          } else if let Some(digest) = path.strip_prefix("/storage/") {
-            match blobs.get(digest) {
-              Some(blob) => ("200 OK", String::new(), blob.clone()),
-              None => ("404 Not Found", String::new(), Vec::new()),
-            }
-          } else if !authorized {
-            ("401 Unauthorized", challenge, Vec::new())
-          } else if let Some(target) = path.strip_prefix("/v2/test/image/manifests/") {
-            match documents.get(target) {
-              Some((kind, bytes)) => ("200 OK", format!("Content-Type: {kind}\r\n"), bytes.clone()),
-              None => ("404 Not Found", String::new(), Vec::new()),
-            }
-          } else if let Some(digest) = path.strip_prefix("/v2/test/image/blobs/") {
-            (
-              "307 Temporary Redirect",
-              format!("Location: /storage/{digest}\r\n"),
-              Vec::new(),
-            )
-          } else {
-            ("404 Not Found", String::new(), Vec::new())
-          };
-
-        let _ = write!(
-          stream,
-          "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
-          body.len()
-        );
-        let _ = stream.write_all(&body);
-      }
-    });
-    address
-  }
-
-  /// A loopback registry that accepts pushes and serves pulls for any
-  /// repository behind a bearer token. POST and PUT need a push token; GET
-  /// and HEAD accept a pull or push token. Blob uploads go to a separate
-  /// upload location.
-  fn writable_registry() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let realm = format!("http://{address}/token");
-    let host = address.clone();
-
-    std::thread::spawn(move || {
-      let mut manifests: HashMap<String, (String, Vec<u8>)> = HashMap::new();
-      let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
-      let mut uploads = 0;
-
-      for stream in listener.incoming() {
-        let mut stream = stream.unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        let mut parts = line.split_whitespace();
-        let (method, path) = (
-          parts.next().unwrap_or_default().to_string(),
-          parts.next().unwrap_or_default().to_string(),
-        );
-        let mut headers = HashMap::new();
-        loop {
-          let mut line = String::new();
-          reader.read_line(&mut line).unwrap();
-          match line.trim_end().split_once(':') {
-            Some((name, value)) => headers.insert(name.to_ascii_lowercase(), value.trim().to_string()),
-            None => break,
-          };
-        }
-        let length = headers
-          .get("content-length")
-          .and_then(|length| length.parse().ok())
-          .unwrap_or(0);
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).unwrap();
-
-        let token = headers
-          .get("authorization")
-          .and_then(|value| value.strip_prefix("Bearer "));
-        let allowed = match method.as_str() {
-          "POST" | "PUT" => token == Some("push"),
-          _ => matches!(token, Some("push" | "pull")),
-        };
-        let url = url::Url::parse(&format!("http://{host}{path}")).unwrap();
-        let query = |name: &str| {
-          url
-            .query_pairs()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.into_owned())
-        };
-        let found = |found: Option<(String, Vec<u8>)>| match found {
-          Some((kind, bytes)) => ("200 OK", format!("Content-Type: {kind}\r\n"), bytes),
-          None => ("404 Not Found", String::new(), Vec::new()),
-        };
-
-        let (status, extra, response) = if url.path() == "/token" {
-          let granted = if query("scope").is_some_and(|scope| scope.contains("push")) {
-            "push"
-          } else {
-            "pull"
-          };
-          (
-            "200 OK",
-            String::new(),
-            format!(r#"{{"token":"{granted}"}}"#).into_bytes(),
-          )
-        } else if !allowed {
-          (
-            "401 Unauthorized",
-            format!("WWW-Authenticate: Bearer realm=\"{realm}\",service=\"test\"\r\n"),
-            Vec::new(),
-          )
-        } else if url.path().starts_with("/upload/") {
-          let digest = query("digest").unwrap_or_default();
-          if sha256_digest(&body) == digest {
-            blobs.insert(digest, body);
-            ("201 Created", String::new(), Vec::new())
-          } else {
-            ("400 Bad Request", String::new(), Vec::new())
-          }
-        } else if let Some((repository, target)) = url.path().rsplit_once("/manifests/") {
-          if method == "PUT" {
-            let kind = headers.get("content-type").cloned().unwrap_or_default();
-            manifests.insert(format!("{repository}/{target}"), (kind.clone(), body.clone()));
-            manifests.insert(format!("{repository}/{}", sha256_digest(&body)), (kind, body));
-            ("201 Created", String::new(), Vec::new())
-          } else {
-            found(manifests.get(&format!("{repository}/{target}")).cloned())
-          }
-        } else if url.path().ends_with("/blobs/uploads/") {
-          uploads += 1;
-          ("202 Accepted", format!("Location: /upload/{uploads}\r\n"), Vec::new())
-        } else if let Some((_, digest)) = url.path().rsplit_once("/blobs/") {
-          found(
-            blobs
-              .get(digest)
-              .map(|blob| ("application/octet-stream".to_string(), blob.clone())),
-          )
-        } else {
-          ("404 Not Found", String::new(), Vec::new())
-        };
-
-        let _ = write!(
-          stream,
-          "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
-          response.len()
-        );
-        if method != "HEAD" {
-          let _ = stream.write_all(&response);
-        }
-      }
-    });
-    address
+    FakeRegistry::default()
+      .manifest("test/image", "1", media_type::INDEX, &index)
+      .manifest("test/image", &sha256_digest(&manifest), media_type::MANIFEST, &manifest)
+      .blob(&config)
+      .blob(&layer)
+      .serve()
   }
 
   #[test]
@@ -868,7 +676,7 @@ mod tests {
     let image = store
       .pull(&format!("{}/test/image:1", registry()), &Platform::default(), None)
       .unwrap();
-    let writable = writable_registry();
+    let writable = FakeRegistry::default().serve();
 
     // The pull fetched only the index's arm64 manifest, so pushing the whole
     // index fails. Pushing for arm64 pushes a new index of that manifest.
