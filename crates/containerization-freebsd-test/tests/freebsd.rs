@@ -51,6 +51,7 @@ fn finish(process: &Process) -> (String, Exit) {
 
 /// Retries `attempt` for up to a minute and returns its first `Some` value.
 /// Use it to wait for a server that was just started.
+#[track_caller]
 fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
   let started = Instant::now();
 
