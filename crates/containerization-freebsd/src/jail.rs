@@ -458,9 +458,10 @@ impl<'a> Jail<'a> {
 
   /// Stops the jail, killing its processes and dropping the TCP
   /// connections they left, and waits for it to be gone, which a
-  /// connection it can't drop holds up for a minute. Then lifts
-  /// its limits, unmounts what is mounted in it but datasets, and destroys
-  /// its epair. Its interfaces' devices are back in the guest by then.
+  /// connection it can't drop holds up for a minute. Then runs `clean_up`
+  /// and destroys its epair. Its interfaces' devices are back in the guest
+  /// by then. Once it is removed, a failed step doesn't skip the rest: the
+  /// first failure is returned.
   pub fn stop(self) -> Result<()> {
     let ran = self
       .agent
@@ -470,43 +471,53 @@ impl<'a> Jail<'a> {
       .trim()
       .rsplit_once(' ')
       .ok_or_else(|| Error::Guest(format!("jls described jail {}: {:?}", self.name, ran.stdout)))?;
+    let mut steps = Steps::default();
     // Only a VNET jail's interfaces are its own: another sees the guest's.
     let epairs = if vnet == "new" {
-      self
-        .rescue(&["ifconfig", "-g", "epair"])?
-        .lines()
-        .iter()
-        .map(|inside| inside.trim().to_string())
-        .collect()
+      steps
+        .take(self.rescue(&["ifconfig", "-g", "epair"]))
+        .map_or_else(Vec::new, |ran| {
+          ran
+            .lines()
+            .iter()
+            .map(|inside| inside.trim().to_string())
+            .collect()
+        })
     } else {
       Vec::new()
     };
 
-    self
-      .agent
-      .check(&["sh", "-c", DROP, "sh", &self.name, vnet], QUICK)?;
-    self.agent.check(&["jail", "-r", &self.name], QUICK)?;
-    self
-      .agent
-      .check(&["sh", "-c", GONE, "sh", &self.name], DYING)?;
-    // rctl keeps a jail's rules by name, for the next jail of that name.
-    self
-      .agent
-      .check(&["sh", "-c", quota::LIMIT, "sh", &self.name], QUICK)?;
-
-    // Including devfs, which jail(8) mounts for `mount.devfs` but can't
-    // unmount: the parameter is jail(8)'s, not the kernel's, so a jail
-    // removed by name has no record of it.
-    self
-      .agent
-      .check(&["sh", "-c", UNMOUNT, "sh", path], QUICK)?;
-
-    // Back in the guest once the jail is gone; destroying one end
-    // destroys both.
-    for inside in epairs {
-      self.agent.check(&["ifconfig", &inside, "destroy"], QUICK)?;
+    steps.take(
+      self
+        .agent
+        .check(&["sh", "-c", DROP, "sh", &self.name, vnet], QUICK),
+    );
+    // One still running is found again, to stop again.
+    if steps
+      .take(self.agent.check(&["jail", "-r", &self.name], QUICK))
+      .is_none()
+    {
+      return steps.finish();
     }
-    Ok(())
+    steps.take(
+      self
+        .agent
+        .check(&["sh", "-c", GONE, "sh", &self.name], DYING),
+    );
+    steps.take(clean_up(self.agent, &self.name, path));
+
+    // Destroying one end destroys both, and the outside end is the
+    // guest's even while the jail is dying.
+    for inside in epairs {
+      if let Some(unit) = inside.strip_suffix('b') {
+        steps.take(
+          self
+            .agent
+            .check(&["ifconfig", &format!("{unit}a"), "destroy"], QUICK),
+        );
+      }
+    }
+    steps.finish()
   }
 
   /// Sets up a new NAT jail's end of `epair`, or its interfaces, and a
@@ -556,6 +567,38 @@ impl<'a> Jail<'a> {
     let mut all = vec!["jexec", self.name.as_str()];
     all.extend_from_slice(argv);
     all
+  }
+}
+
+/// Cleans up after the jail named `name`, rooted at `path`, once it is
+/// gone: lifts its limits, which rctl keeps by name for the next jail of
+/// that name, and unmounts what is mounted in it but datasets. Including
+/// devfs, which jail(8) mounts for `mount.devfs` but can't unmount: the
+/// parameter is jail(8)'s, not the kernel's, so a jail removed by name has
+/// no record of it.
+pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
+  let mut steps = Steps::default();
+
+  steps.take(agent.check(&["sh", "-c", quota::LIMIT, "sh", name], QUICK));
+  steps.take(agent.check(&["sh", "-c", UNMOUNT, "sh", path], QUICK));
+  steps.finish()
+}
+
+/// The first failure among steps that each run even if earlier ones failed.
+#[derive(Default)]
+struct Steps(Option<Error>);
+
+impl Steps {
+  fn take<T>(&mut self, result: Result<T>) -> Option<T> {
+    result
+      .map_err(|error| {
+        self.0.get_or_insert(error);
+      })
+      .ok()
+  }
+
+  fn finish(self) -> Result<()> {
+    self.0.map_or(Ok(()), Err)
   }
 }
 
@@ -672,6 +715,17 @@ mod tests {
         .contains("the jail's root")
     );
     assert!(resolve(root, "/file/under").is_err());
+  }
+
+  #[test]
+  fn takes_every_step_and_keeps_the_first_failure() {
+    let mut steps = Steps::default();
+
+    assert_eq!(steps.take(Ok(1)), Some(1));
+    assert_eq!(steps.take::<()>(Err(Error::Invalid("first".into()))), None);
+    assert_eq!(steps.take(Ok(2)), Some(2));
+    steps.take::<()>(Err(Error::Invalid("second".into())));
+    assert!(matches!(steps.finish(), Err(Error::Invalid(why)) if why == "first"));
   }
 
   #[test]

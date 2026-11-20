@@ -5,7 +5,7 @@
 
 use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
 use crate::error::{Error, Result};
-use crate::jail::{Jail, Mount, Network};
+use crate::jail::{self, Jail, Mount, Network};
 use crate::quota::{self, Statistics};
 use crate::socket::{SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
@@ -385,8 +385,15 @@ fn stop(agent: &Agent, id: &str) -> Result<()> {
 }
 
 fn delete(agent: &Agent, id: &str, dataset: &str) -> Result<()> {
-  stop(agent, id)?;
-  Zfs::new(agent).destroy(dataset)
+  let zfs = Zfs::new(agent);
+
+  match Jail::find(agent, id)? {
+    Some(jail) => jail.stop()?,
+    // Its jail may be gone without its limits and mounts, as when it was
+    // removed outside, or a stop failed while it was dying.
+    None => jail::clean_up(agent, id, &zfs.mountpoint(dataset)?)?,
+  }
+  zfs.destroy(dataset)
 }
 
 #[cfg(test)]

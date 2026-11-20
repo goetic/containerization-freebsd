@@ -880,6 +880,33 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   containers
     .delete("left")
     .expect("delete the container by id");
+  // One whose jail is gone, but not its limits and mounts: removed outside,
+  // or by a stop that failed partway. Deleted all the same, with them.
+  drop(
+    containers
+      .create(
+        "removed",
+        "images/userland@base",
+        Configuration {
+          memory_in_bytes: Some(64 << 20),
+          mounts: vec![Mount::tmpfs("/scratch")],
+          ..Configuration::default()
+        },
+      )
+      .expect("create a container to remove"),
+  );
+  machine
+    .agent
+    .check(&["jail", "-r", "removed"], SECONDS)
+    .expect("remove its jail outside");
+  containers
+    .delete("removed")
+    .expect("delete the container whose jail is gone");
+  let ran = machine
+    .agent
+    .check(&["rctl", "jail:removed:"], SECONDS)
+    .expect("list its rules");
+  assert_eq!(ran.stdout, "", "its rules outlived it");
   assert!(containers.list().expect("list containers").is_empty());
   assert!(
     Jail::find(&machine.agent, "left")

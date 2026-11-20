@@ -89,6 +89,10 @@
 - Fixes `docker.io/alpine` and `index.docker.io/alpine` naming a
   repository without `library/`, so they named a different image than
   `alpine`, which Docker Hub doesn't serve.
+- Fixes stopping a jail skipping the rest of its cleanup after a step
+  failed, such as waiting for it to be gone. Deleting a container whose
+  jail is gone now lifts the limits and unmounts the mounts the jail left,
+  which kept its dataset from being destroyed.
 - Fixes a relay losing the host's last Data when the host's end finished
   second; stopping a jail returning before the jail is gone, while its TCP
   connections still hold it; and running a command failing when it exited
