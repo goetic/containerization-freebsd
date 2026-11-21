@@ -73,6 +73,12 @@ impl Agent {
     self.shared.lock().hello()
   }
 
+  /// How many sessions with the agent have started. Each boot and restore
+  /// starts one, as does the host losing frames.
+  pub fn sessions(&self) -> u64 {
+    self.shared.lock().sessions
+  }
+
   /// Waits for a session with the agent, which starts when the agent
   /// announces itself or answers `rejoin`.
   pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
@@ -347,6 +353,17 @@ pub(crate) mod tests {
     agent.rejoin().unwrap();
 
     agent.wait_ready(PATIENCE).expect("a session");
+  }
+
+  #[test]
+  fn counts_the_sessions_that_start() {
+    let agent = started();
+    assert_eq!(agent.sessions(), 1);
+
+    agent.rejoin().unwrap();
+    agent.wait_ready(PATIENCE).expect("a session");
+
+    assert_eq!(agent.sessions(), 2);
   }
 
   #[test]

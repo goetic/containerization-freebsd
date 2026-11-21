@@ -28,6 +28,8 @@ pub(super) struct State {
   pub(super) listeners: HashMap<u32, PathBuf>,
   pub(super) mismatch: Option<VersionMismatch>,
   pub(super) closed: bool,
+  /// How many sessions have started.
+  pub(super) sessions: u64,
 }
 
 /// The follow-up work, if any, that a frame from the agent leaves for
@@ -67,6 +69,7 @@ impl Shared {
         listeners: HashMap::new(),
         mismatch: None,
         closed: false,
+        sessions: 0,
       }),
       changed: Condvar::new(),
     });
@@ -149,6 +152,7 @@ impl State {
       // A session has started. The guest just booted or was restored, so its
       // clock may be behind.
       Ok((_, Message::Hello { answer: true, .. })) => {
+        self.sessions += 1;
         let _ = self.sync_clock();
         Heard::Changed
       }
