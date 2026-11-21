@@ -6,8 +6,8 @@
 
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
-  Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Interface, Jail,
-  Limit, Machine, Mount, Network, Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User,
+  Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
+  Jail, Limit, Machine, Mount, Network, Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User,
   WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
@@ -1205,13 +1205,44 @@ fn pulls_unpacks_and_runs_oci_images() {
   let runtime = store
     .pull("ghcr.io/freebsd/freebsd-runtime:15.1", &platform, None)
     .expect("pull FreeBSD's runtime image");
-  let runtime_config = runtime.config(&platform).expect("its config");
-  let (_, runtime_manifest) = runtime.manifest(&platform).expect("its manifest");
+  let whiteouts = layers_an_image_on_the_runtime(&work, &store, &runtime, &platform);
 
-  // Two layers on top of the runtime's. The second whites out a file from the
-  // first, a whole directory (opaque), and a file from the runtime.
+  let layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
+    .expect("prepare the base");
+  let machine = layout.machine("images").expect("make the machine");
+  machine.start().expect("start");
+  machine
+    .wait_ready(Duration::from_secs(300))
+    .expect("the agent starts");
+
+  let (base, layered) = unpacks_each_layer_once(&machine, &runtime, &whiteouts, &platform);
+  let containers = Containers::new(&machine.agent, "zroot/cfbsd/containers");
+  runs_the_images_process(&containers, &runtime, &platform, &base);
+  let hidden = containers
+    .create(
+      "whiteouts",
+      &layered,
+      Configuration {
+        network: Network::None,
+        ..Configuration::default()
+      },
+    )
+    .expect("create a container of the layered image");
+  applies_whiteouts(&hidden);
+  copies_in_and_out(&hidden, &work);
+  hidden.delete().expect("delete the container");
+
+  machine
+    .shut_down(Duration::from_secs(120))
+    .expect("power off");
+}
+
+/// Makes an image of two layers on top of the runtime's and names it
+/// `localhost/cfbsd/whiteouts:1`. The second layer whites out a file from the
+/// first, a whole directory (opaque), and a file from the runtime.
+fn layers_an_image_on_the_runtime(work: &Path, store: &ImageStore, runtime: &Image, platform: &Platform) -> Image {
   let added = layer(
-    &work,
+    work,
     "added",
     &[
       ("cfbsd/kept", "kept\n"),
@@ -1220,7 +1251,7 @@ fn pulls_unpacks_and_runs_oci_images() {
     ],
   );
   let hiding = layer(
-    &work,
+    work,
     "hiding",
     &[
       ("cfbsd/.wh.gone", ""),
@@ -1231,12 +1262,12 @@ fn pulls_unpacks_and_runs_oci_images() {
     ],
   );
   let content = store.content();
-  let mut config = runtime_config.clone();
+  let mut config = runtime.config(platform).expect("its config");
   config
     .rootfs
     .diff_ids
     .extend([sha256_digest(&added), sha256_digest(&hiding)]);
-  let mut manifest = runtime_manifest.clone();
+  let (_, mut manifest) = runtime.manifest(platform).expect("its manifest");
   manifest.config = blob(
     content,
     media_type::CONFIG,
@@ -1247,7 +1278,7 @@ fn pulls_unpacks_and_runs_oci_images() {
     .push(blob(content, media_type::LAYER, &added));
   manifest
     .layers
-    .push(blob(content, media_type::LAYER_GZIP, &gzip(&hiding, &work)));
+    .push(blob(content, media_type::LAYER_GZIP, &gzip(&hiding, work)));
   let manifest = blob(
     content,
     media_type::MANIFEST,
@@ -1265,38 +1296,43 @@ fn pulls_unpacks_and_runs_oci_images() {
   for name in ["ghcr.io/freebsd/freebsd-runtime:15.1", "localhost/cfbsd/whiteouts:1"] {
     assert!(names.iter().any(|listed| listed == name), "{name} in {names:?}");
   }
+  whiteouts
+}
 
-  let layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
-    .expect("prepare the base");
-  let machine = layout.machine("images").expect("make the machine");
-  machine.start().expect("start");
-  machine
-    .wait_ready(Duration::from_secs(300))
-    .expect("the agent starts");
-
-  // Each layer becomes a snapshot, unpacked once however many images share it.
+/// Unpacks the runtime image and `layered`, an image on it, and returns their
+/// snapshots. Each layer becomes a snapshot, unpacked once however many
+/// images share it.
+fn unpacks_each_layer_once(
+  machine: &Machine,
+  runtime: &Image,
+  layered: &Image,
+  platform: &Platform,
+) -> (String, String) {
   let unpacker = Unpacker::new(&machine.agent, "zroot/cfbsd/layers");
   let base = unpacker
-    .unpack(&runtime, &platform)
+    .unpack(runtime, platform)
     .expect("unpack the runtime image");
   assert_eq!((base.unpacked, base.cached), (1, 0));
   let layered = unpacker
-    .unpack(&whiteouts, &platform)
+    .unpack(layered, platform)
     .expect("unpack the image on it");
   assert_eq!((layered.unpacked, layered.cached), (2, 1));
   let again = unpacker
-    .unpack(&runtime, &platform)
+    .unpack(runtime, platform)
     .expect("unpack the runtime image again");
   assert_eq!((again.snapshot.as_str(), again.unpacked), (base.snapshot.as_str(), 0));
+  (base.snapshot, layered.snapshot)
+}
 
-  // The image's configured process is a shell that reads commands from stdin.
-  let containers = Containers::new(&machine.agent, "zroot/cfbsd/containers");
+/// Runs a container of the runtime image, at `snapshot`, with the image's
+/// configured process: a shell that reads commands from stdin.
+fn runs_the_images_process(containers: &Containers, runtime: &Image, platform: &Platform, snapshot: &str) {
   let mut shell = containers
     .create(
       "runtime",
-      &base.snapshot,
+      snapshot,
       Configuration {
-        process: runtime_config.process(),
+        process: runtime.config(platform).expect("its config").process(),
         network: Network::None,
         ..Configuration::default()
       },
@@ -1323,17 +1359,12 @@ fn pulls_unpacks_and_runs_oci_images() {
   );
   assert_eq!(exit, Exit::Code(3));
   shell.delete().expect("delete the container");
+}
 
-  let hidden = containers
-    .create(
-      "whiteouts",
-      &layered.snapshot,
-      Configuration {
-        network: Network::None,
-        ..Configuration::default()
-      },
-    )
-    .expect("create a container of the layered image");
+/// Checks `hidden`, a container of the layered image: the whiteouts hide a
+/// file from the first layer, the opaque directory's old file and a file from
+/// the runtime, while a name that only contains `.wh.` stays.
+fn applies_whiteouts(hidden: &Container) {
   let ran = hidden
     .check(
       &sh("cat /cfbsd/kept /cfbsd/x.wh.y; ls -A /cfbsd/opaque /cfbsd; test ! -e /bin/freebsd-version && echo hidden"),
@@ -1355,8 +1386,11 @@ fn pulls_unpacks_and_runs_oci_images() {
       "hidden"
     ]
   );
+}
 
-  // Copying in and out uses the guest's `/rescue` tools, not the image's.
+/// Copies files and directories in and out of `hidden`. Copying uses the
+/// guest's `/rescue` tools, not the image's.
+fn copies_in_and_out(hidden: &Container, work: &Path) {
   let copies = work.join("copies");
   let tree = copies.join("tree");
   std::fs::create_dir_all(tree.join("sub")).expect("make a tree to copy");
@@ -1419,9 +1453,4 @@ fn pulls_unpacks_and_runs_oci_images() {
   hidden
     .copy_in(&fifo, "/cfbsd/fifo", 0o644, true)
     .expect_err("copy in a FIFO");
-  hidden.delete().expect("delete the container");
-
-  machine
-    .shut_down(Duration::from_secs(120))
-    .expect("power off");
 }
