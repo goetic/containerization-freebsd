@@ -8,6 +8,7 @@ use crate::agent::{Agent, Exec, Exit, Output, Process};
 use crate::error::{Error, Result};
 use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type, sha256_hex};
+use crate::scripts;
 use crate::zfs::Zfs;
 use std::io::Read;
 use std::time::Duration;
@@ -17,53 +18,6 @@ const QUICK: Duration = Duration::from_secs(60);
 const UNPACKING: Duration = Duration::from_secs(600);
 /// The snapshot name each layer's dataset gets once the layer is applied.
 const UNPACKED: &str = "unpacked";
-
-/// Decompresses stdin with the method `$1` and writes it to the file `$2`.
-const DECOMPRESS: &str = r#"set -e
-case "$1" in
-  gzip) gzip -dc ;;
-  zstd) zstd -dcq ;;
-  none) cat ;;
-esac > "$2""#;
-
-/// Applies the layer tarball `$2`, whose sha256 must be `$3`, to the root
-/// `$1`. Whiteouts delete files from the layers beneath, so they are applied
-/// before the layer's own files are extracted. A whiteout that resolves
-/// outside the root is an error.
-const APPLY: &str = r#"set -e
-root=$(realpath -- "$1")
-layer=$2
-actual=$(sha256 -q -- "$layer")
-if [ "$actual" != "$3" ]; then
-  echo "its sha256 is $actual, not the config's $3" >&2
-  exit 1
-fi
-tar -tf "$layer" | grep -E '(^|/)\.wh\.[^/]+$' | while IFS= read -r entry; do
-  case "$entry" in
-    */*) directory=${entry%/*} ;;
-    *) directory=. ;;
-  esac
-  name=${entry##*/}
-  parent=$(realpath -q -- "$root/$directory") || continue
-  case "$parent/" in
-    "$root"/*) ;;
-    *) echo "whiteout $entry is outside the root" >&2; exit 1 ;;
-  esac
-  if [ "$name" = .wh..wh..opq ]; then
-    find "$parent" -mindepth 1 -maxdepth 1 -exec chflags -R -P 0 {} + 2>/dev/null || :
-    find "$parent" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-  else
-    hidden=${name#.wh.}
-    case "$hidden" in
-      '' | . | ..) echo "whiteout $entry hides nothing" >&2; exit 1 ;;
-    esac
-    if [ -e "$parent/$hidden" ] || [ -L "$parent/$hidden" ]; then
-      chflags -R -P 0 "$parent/$hidden" 2>/dev/null || :
-      rm -rf -- "$parent/$hidden"
-    fi
-  fi
-done
-tar -xpf "$layer" -C "$root" --numeric-owner --exclude '.wh.*'"#;
 
 pub struct Unpacker<'a> {
   agent: &'a Agent,
@@ -177,7 +131,7 @@ impl<'a> Unpacker<'a> {
       let root = self.zfs.mountpoint(dataset)?;
       self
         .agent
-        .check(&["sh", "-c", APPLY, "sh", &root, staging, diff_id], UNPACKING)
+        .check(&scripts::APPLY.argv(&[&root, staging, diff_id]), UNPACKING)
         .map(|_| ())
     });
     let _ = self.agent.run(&["rm", "-f", staging], QUICK);
@@ -195,14 +149,11 @@ impl<'a> Unpacker<'a> {
     let reading = || format!("reading {}", path.display());
     let mut blob = std::fs::File::open(&path).map_err(Error::io(reading()))?;
     let process = self.agent.spawn(Exec {
-      argv: vec![
-        "sh".into(),
-        "-c".into(),
-        DECOMPRESS.into(),
-        "sh".into(),
-        compression.into(),
-        staging.into(),
-      ],
+      argv: scripts::DECOMPRESS
+        .argv(&[compression, staging])
+        .into_iter()
+        .map(String::from)
+        .collect(),
       ..Exec::default()
     })?;
 
@@ -230,7 +181,8 @@ impl<'a> Unpacker<'a> {
   }
 }
 
-/// The compression of a layer of `media_type`, as `DECOMPRESS` names it.
+/// The compression of a layer of `media_type`, as `scripts::DECOMPRESS` names
+/// it.
 fn compression(media_type: &str) -> Result<&'static str> {
   match media_type {
     media_type::LAYER | "application/vnd.docker.image.rootfs.diff.tar" => Ok("none"),

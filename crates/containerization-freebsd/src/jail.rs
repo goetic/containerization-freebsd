@@ -4,6 +4,7 @@ use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
 use crate::copy;
 use crate::error::{Error, Result};
 use crate::quota::{self, Statistics};
+use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
 use containerization_freebsd_protocol::{Address, Connect};
 use std::net::Ipv4Addr;
@@ -15,134 +16,9 @@ const QUICK: Duration = Duration::from_secs(60);
 /// gateway.
 const BRIDGE: &str = "cfbsd0";
 const GATEWAY: &str = "10.66.0.1";
-
-/// Sets up NAT for jails once per boot: creates the bridge, turns on
-/// forwarding, and has pf translate 10.66/16 to the address of the guest's
-/// default interface.
-const NAT: &str = r#"set -e
-ifconfig cfbsd0 >/dev/null 2>&1 && exit 0
-external=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2 }')
-if [ -z "$external" ]; then
-  echo "the guest has no default route: NAT jails need the machine's NAT" >&2
-  exit 1
-fi
-kldload -n if_bridge if_epair pf
-bridge=$(ifconfig bridge create)
-ifconfig "$bridge" name cfbsd0 >/dev/null
-ifconfig cfbsd0 inet 10.66.0.1/16 up
-sysctl -q net.inet.ip.forwarding=1
-printf 'set skip on lo0\nnat on %s inet from 10.66.0.0/16 to any -> (%s)\npass all\n' "$external" "$external" |
-  pfctl -q -f -
-pfctl -s info | grep -q 'Status: Enabled' || pfctl -q -e"#;
-
-/// Ends the processes of the jail named `$1` as `jail -r` would, with SIGTERM
-/// and 10 seconds to exit. It then drops the TCP connections they left, which
-/// would otherwise keep the removed jail dying through TIME_WAIT. A VNET jail
-/// (`$2` is `new`) has its own network stack, so only a tcpdrop run inside it,
-/// if it has one, reaches its connections. A non-VNET jail's connections are
-/// in the guest's stack, and netstat lists them.
-const DROP: &str = r#"jid=$(jls -j "$1" jid)
-pkill -j "$jid"
-tries=100
-while pgrep -j "$jid" >/dev/null && [ "$tries" -gt 0 ]; do sleep 0.1; tries=$((tries - 1)); done
-if [ "$2" = new ]; then
-  jexec "$jid" tcpdrop -a >/dev/null 2>&1
-else
-  netstat -j "$jid" -n -p tcp -a | awk 'NR > 2 && $6 != "LISTEN" {
-    local = $4; local_port = $4; foreign = $5; foreign_port = $5
-    sub(/\.[^.]*$/, "", local); sub(/.*\./, "", local_port)
-    sub(/\.[^.]*$/, "", foreign); sub(/.*\./, "", foreign_port)
-    print local, local_port, foreign, foreign_port
-  }' | while read -r l lp f fp; do tcpdrop "$l" "$lp" "$f" "$fp" >/dev/null 2>&1; done
-fi
-true"#;
-
-/// Waits for the jail named `$1` to disappear. A removed jail stays dying,
-/// holding its root and its network, until everything it left closes, such
-/// as a TCP connection in TIME_WAIT.
-const GONE: &str = r#"while jls -d -j "$1" >/dev/null 2>&1; do sleep 0.1; done"#;
-/// Longer than TIME_WAIT, which is twice FreeBSD's default MSL of 30 seconds.
+/// How long `scripts::GONE` may wait. Longer than TIME_WAIT, which is twice
+/// FreeBSD's default MSL of 30 seconds.
 const DYING: Duration = Duration::from_secs(90);
-
-/// Copies the guest's resolver configuration into the jail rooted at `$1`,
-/// unless the jail has its own.
-const RESOLVER: &str =
-  r#"[ ! -e /etc/resolv.conf ] || [ -e "$1/etc/resolv.conf" ] || cp /etc/resolv.conf "$1/etc/resolv.conf""#;
-
-/// Resolves `$2`, a path in the jail rooted at `$1`, prints the guest path it
-/// refers to, and makes any missing directories. Symbolic links resolve within
-/// the root: absolute links start at the root, and `..` stops there.
-const RESOLVE: &str = r#"set -e
-root=$1 rest=$2 resolved= links=0
-while [ -n "$rest" ]; do
-  part=${rest%%/*}
-  case $rest in */*) rest=${rest#*/} ;; *) rest= ;; esac
-  case $part in
-  '' | .) ;;
-  ..) resolved=${resolved%/*} ;;
-  *)
-    if [ -L "$root$resolved/$part" ]; then
-      links=$((links + 1))
-      if [ "$links" -gt 32 ]; then
-        echo "$2: too many symbolic links" >&2
-        exit 1
-      fi
-      target=$(readlink "$root$resolved/$part")
-      case $target in /*) resolved= ;; esac
-      rest=$target/$rest
-    else
-      resolved=$resolved/$part
-    fi
-    ;;
-  esac
-done
-if [ -z "$resolved" ]; then
-  echo "$2: that is the jail's root" >&2
-  exit 1
-fi
-mkdir -p "$root$resolved"
-printf '%s\n' "$root$resolved""#;
-
-/// Unmounts everything under `$1` except ZFS datasets, most recent first.
-/// `mount -p` writes a space in a path as \040.
-const UNMOUNT: &str = r#"set -e
-mount -p | awk -v under="$1/" 'index($2, under) == 1 && $3 != "zfs" { print $2 }' | tail -r |
-  while read -r point; do umount "$(printf '%b' "$point")"; done"#;
-
-/// Moves the guest's network device with MAC address `$2` into the jail
-/// named `$1`, and prints the device's name.
-const CLAIM: &str = r#"set -e
-for device in $(ifconfig -l ether); do
-  if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $2"; then
-    ifconfig "$device" vnet "$1"
-    echo "$device"
-    exit 0
-  fi
-done
-echo "the guest has no network device with MAC address $2: is it in the layout's interfaces, and in no other jail?" >&2
-exit 1"#;
-
-/// Prints, in dhclient.leases(5) format, the lease that the NAT's DHCP server
-/// gives the guest's network device with MAC address `$1`. The device is not
-/// configured with the lease: dhclient's script does nothing, and dhclient is
-/// killed once bound.
-const LEASE: &str = r#"set -e
-for device in $(ifconfig -l ether); do
-  if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $1"; then
-    work=$(mktemp -d)
-    trap 'pkill -f "^dhclient: $device( |\$)" || :
-      while pgrep -qf "^dhclient: $device( |\$)"; do sleep 0.1; done
-      ifconfig "$device" down
-      rm -rf "$work"' EXIT
-    printf 'timeout 30;\nscript "/usr/bin/true";\n' >"$work/conf"
-    ifconfig "$device" up
-    dhclient -c "$work/conf" -l "$work/leases" "$device" >/dev/null 2>&1
-    cat "$work/leases" 2>/dev/null || :
-    exit 0
-  fi
-done
-echo "the guest has no network device with MAC address $1: is it in the layout's interfaces, and in no jail?" >&2
-exit 1"#;
 
 /// How a jail reaches the network.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -186,7 +62,7 @@ impl Interface {
   /// the device.
   pub fn leased(agent: &Agent, mac: [u8; 6]) -> Result<Self> {
     let colons = colons(mac);
-    let ran = agent.check(&["sh", "-c", LEASE, "sh", &colons], LEASING)?;
+    let ran = agent.check(&scripts::LEASE.argv(&[&colons]), LEASING)?;
     let (address, gateway) =
       lease(&ran.stdout).ok_or_else(|| Error::Guest(format!("the NAT's DHCP server leased {colons} no address")))?;
 
@@ -194,7 +70,7 @@ impl Interface {
   }
 }
 
-/// dhclient's 30-second timeout in `LEASE`, plus a margin.
+/// dhclient's 30-second timeout in `scripts::LEASE`, plus a margin.
 const LEASING: Duration = Duration::from_secs(45);
 
 /// `mac` as ifconfig prints it.
@@ -388,7 +264,7 @@ impl<'a> Jail<'a> {
     let root = self.root()?;
     let resolved = self
       .agent
-      .check(&["sh", "-c", RESOLVE, "sh", &root, &mount.destination], QUICK)?
+      .check(&scripts::RESOLVE.argv(&[&root, &mount.destination]), QUICK)?
       .stdout;
     let point = resolved.strip_suffix('\n').unwrap_or(&resolved);
     let options = mount.options.join(",");
@@ -406,10 +282,13 @@ impl<'a> Jail<'a> {
   /// limits they are slowed or paged out. `stop` lifts the limits.
   pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Result<()> {
     let rules = quota::rules(&self.name, cpus, memory_in_bytes);
-    let mut argv = vec!["sh", "-c", quota::LIMIT, "sh", self.name.as_str()];
-    argv.extend(rules.iter().map(String::as_str));
+    let mut args = vec![self.name.as_str()];
+    args.extend(rules.iter().map(String::as_str));
 
-    self.agent.check(&argv, QUICK).map(|_| ())
+    self
+      .agent
+      .check(&scripts::LIMIT.argv(&args), QUICK)
+      .map(|_| ())
   }
 
   /// Copies `source`, a file or directory on the host, into the jail, like
@@ -437,7 +316,7 @@ impl<'a> Jail<'a> {
     let mut statistics = quota::statistics(&ran.stdout)?;
     let ran = self
       .agent
-      .check(&["sh", "-c", quota::INTERFACES, "sh", &self.name], QUICK)?;
+      .check(&scripts::INTERFACES.argv(&[&self.name]), QUICK)?;
     statistics.networks = quota::networks(&ran.stdout)?;
 
     Ok(statistics)
@@ -496,7 +375,7 @@ impl<'a> Jail<'a> {
     steps.take(
       self
         .agent
-        .check(&["sh", "-c", DROP, "sh", &self.name, vnet], QUICK),
+        .check(&scripts::DROP.argv(&[&self.name, vnet]), QUICK),
     );
     // If removal fails, the jail is still running, so stop returns early and a
     // later `find` can stop it again.
@@ -506,11 +385,7 @@ impl<'a> Jail<'a> {
     {
       return steps.finish();
     }
-    steps.take(
-      self
-        .agent
-        .check(&["sh", "-c", GONE, "sh", &self.name], DYING),
-    );
+    steps.take(self.agent.check(&scripts::GONE.argv(&[&self.name]), DYING));
     steps.take(clean_up(self.agent, &self.name, path));
 
     // Destroying one end of an epair destroys both. The outside end belongs
@@ -541,7 +416,7 @@ impl<'a> Jail<'a> {
       for interface in interfaces {
         let claimed = self
           .agent
-          .check(&["sh", "-c", CLAIM, "sh", &self.name, &colons(interface.mac)], QUICK)?;
+          .check(&scripts::CLAIM.argv(&[&self.name, &colons(interface.mac)]), QUICK)?;
         let device = claimed.stdout.trim();
         self.rescue(&["ifconfig", device, "inet", &interface.address, "up"])?;
         if let Some(gateway) = &interface.gateway {
@@ -550,9 +425,7 @@ impl<'a> Jail<'a> {
       }
     }
     if *network != Network::None {
-      self
-        .agent
-        .check(&["sh", "-c", RESOLVER, "sh", path], QUICK)?;
+      self.agent.check(&scripts::RESOLVER.argv(&[path]), QUICK)?;
     }
     Ok(())
   }
@@ -586,8 +459,8 @@ impl<'a> Jail<'a> {
 pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   let mut steps = Steps::default();
 
-  steps.take(agent.check(&["sh", "-c", quota::LIMIT, "sh", name], QUICK));
-  steps.take(agent.check(&["sh", "-c", UNMOUNT, "sh", path], QUICK));
+  steps.take(agent.check(&scripts::LIMIT.argv(&[name]), QUICK));
+  steps.take(agent.check(&scripts::UNMOUNT.argv(&[path]), QUICK));
   steps.finish()
 }
 
@@ -619,7 +492,7 @@ struct Epair {
 }
 
 fn epair(agent: &Agent) -> Result<Epair> {
-  agent.check(&["sh", "-c", NAT], QUICK)?;
+  agent.check(&scripts::NAT.argv(&[]), QUICK)?;
   let created = agent.check(&["ifconfig", "epair", "create"], QUICK)?;
   let outside = created.stdout.trim().to_string();
   let name = outside
@@ -674,15 +547,11 @@ mod tests {
     assert_eq!(lease("lease {\n  option subnet-mask 255.255.255.0;\n}\n"), None);
   }
 
-  /// Runs RESOLVE on `path` in `root` with the host's sh, and returns the
-  /// path it prints or its error.
+  /// Runs `scripts::RESOLVE` on `path` in `root` with the host's sh, and
+  /// returns the path it prints or its error.
   fn resolve(root: &Path, path: &str) -> std::result::Result<String, String> {
-    let output = Command::new("sh")
-      .args(["-c", RESOLVE, "sh"])
-      .arg(root)
-      .arg(path)
-      .output()
-      .unwrap();
+    let argv = scripts::RESOLVE.argv(&[root.to_str().unwrap(), path]);
+    let output = Command::new(argv[0]).args(&argv[1..]).output().unwrap();
 
     if output.status.success() {
       Ok(String::from_utf8(output.stdout).unwrap())

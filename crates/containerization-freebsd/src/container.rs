@@ -8,6 +8,7 @@ use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
 use crate::quota::{self, Statistics};
+use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
 use crate::zfs::{Zfs, unmounted};
 use std::mem;
@@ -181,7 +182,7 @@ impl<'a> Container<'a> {
     let mut statistics = self.jail.statistics()?;
     let ran = self
       .agent
-      .check(&["sh", "-c", quota::DATASET_IO, "sh", &self.dataset], QUICK)?;
+      .check(&scripts::DATASET_IO.argv(&[&self.dataset]), QUICK)?;
     statistics.block_io = vec![quota::dataset_io(&self.dataset, &ran.stdout)?];
 
     Ok(statistics)

@@ -7,6 +7,7 @@ use crate::agent::{Agent, Exec, Exit, Output};
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
 use crate::oci::sha256_digest;
+use crate::scripts;
 use crate::zfs::Zfs;
 use std::time::Duration;
 
@@ -14,9 +15,6 @@ const QUICK: Duration = Duration::from_secs(60);
 /// The name of the snapshot taken of each step's dataset when the step
 /// finishes.
 const BUILT: &str = "built";
-/// Removes the resolver configuration from the root at `$1` if it is the copy
-/// of the guest's that the jail put there, not one the step wrote.
-const UNRESOLVER: &str = r#"! cmp -s /etc/resolv.conf "$1/etc/resolv.conf" || rm "$1/etc/resolv.conf""#;
 
 /// A shell script run as root in the image with `/bin/sh -c`, from `/`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -119,7 +117,7 @@ impl<'a> Builder<'a> {
     if step.network != Network::None {
       self
         .agent
-        .check(&["sh", "-c", UNRESOLVER, "sh", &root], QUICK)?;
+        .check(&scripts::UNRESOLVER.argv(&[&root]), QUICK)?;
     }
 
     match exit? {

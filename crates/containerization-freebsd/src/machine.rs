@@ -6,6 +6,7 @@ use crate::clock::ClockSync;
 use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]
 use crate::memory::Memory;
+use crate::scripts;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -27,12 +28,6 @@ use virtualization::{
 /// tunables stop vtnet requesting them. The third turns on the kernel's
 /// resource accounting, which jail limits and statistics need.
 pub const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\nkern.racct.enable=1\n";
-
-/// Waits for the guest's default route, and for that interface's link.
-const ROUTED: &str = r#"until interface=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2 }') &&
-  [ -n "$interface" ] && ifconfig "$interface" | grep -q 'status: active'; do
-  sleep 0.1
-done"#;
 
 /// A host directory the guest mounts with `Machine::mount_share`.
 ///
@@ -399,12 +394,9 @@ impl Machine {
   /// `/dev/vtbd1`. The device is found by searching because the image turns
   /// off the `/dev/diskid` labels that would otherwise name it.
   pub fn disk_device(&self, identifier: &str) -> Result<String> {
-    let script = r#"for disk in $(sysctl -n kern.disks); do
-  [ "$(diskinfo -s "$disk" 2>/dev/null)" = "$1" ] && echo "/dev/$disk"
-done; true"#;
     let ran = self
       .agent
-      .check(&["sh", "-c", script, "sh", identifier], Duration::from_secs(60))?;
+      .check(&scripts::DISK_DEVICE.argv(&[identifier]), Duration::from_secs(60))?;
 
     match ran.lines().as_slice() {
       [device] => Ok(device.to_string()),
@@ -417,11 +409,9 @@ done; true"#;
 
   /// Mounts the share tagged `tag` at `path` in the guest.
   pub fn mount_share(&self, tag: &str, path: &str) -> Result<()> {
-    let script = r#"mkdir -p "$2" && mount -t virtiofs "$1" "$2""#;
-
     self
       .agent
-      .check(&["sh", "-c", script, "sh", tag, path], Duration::from_secs(60))
+      .check(&scripts::MOUNT_SHARE.argv(&[tag, path]), Duration::from_secs(60))
       .map(|_| ())
   }
 
@@ -455,10 +445,9 @@ done; true"#;
 
     self.agent.wait_ready(timeout)?;
     if self.nat {
-      let routed = ["sh", "-c", ROUTED];
       match self
         .agent
-        .check(&routed, timeout.saturating_sub(started.elapsed()))
+        .check(&scripts::ROUTED.argv(&[]), timeout.saturating_sub(started.elapsed()))
       {
         Err(Error::Timeout(_)) => {
           return Err(Error::Timeout(format!(

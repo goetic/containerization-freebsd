@@ -20,6 +20,7 @@ mod memory;
 pub mod oci;
 pub mod prepare;
 pub mod quota;
+mod scripts;
 pub mod socket;
 pub mod unpack;
 pub mod zfs;

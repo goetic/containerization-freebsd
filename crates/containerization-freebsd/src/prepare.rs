@@ -4,6 +4,7 @@
 use crate::error::{Error, Result};
 use crate::image;
 use crate::machine::{LOADER_ENV, Layout};
+use crate::scripts;
 use std::path::Path;
 use std::time::Duration;
 
@@ -64,7 +65,7 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
 /// rebooted if the upgrade installed anything. A machine powered off sooner
 /// runs a first boot again on its next boot.
 fn wait_first_boot(machine: &crate::Machine) -> Result<()> {
-  let wait = ["sh", "-c", "while [ -e /firstboot ]; do sleep 1; done"];
+  let wait = scripts::FIRST_BOOT.argv(&[]);
 
   for _ in 0..BOOTS {
     machine.wait_ready(Duration::from_secs(600))?;

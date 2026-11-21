@@ -60,30 +60,6 @@ pub struct DatasetIo {
   pub write_operations: u64,
 }
 
-/// Prints the interfaces of the jail named `$1`, with their counters, if
-/// it has a network of its own.
-pub(crate) const INTERFACES: &str = r#"[ "$(jls -j "$1" vnet)" != new ] || exec netstat -j "$1" -i -b -d -n -W"#;
-
-/// Prints the reads, bytes read, writes and bytes written of the dataset
-/// `$1`, from its ZFS kstats.
-pub(crate) const DATASET_IO: &str = r#"set -e
-objset=kstat.zfs.${1%%/*}.dataset.objset-$(printf 0x%x "$(zfs get -Hp -o value objsetid "$1")")
-sysctl -n "$objset.reads" "$objset.nread" "$objset.writes" "$objset.nwritten""#;
-
-/// Replaces the rctl rules of the jail named `$1` with the remaining
-/// arguments. Without kernel resource accounting, it fails if any rules are
-/// given and otherwise does nothing.
-pub(crate) const LIMIT: &str = r#"set -e
-jail=$1
-shift
-if [ "$(sysctl -n kern.racct.enable 2>/dev/null)" = 1 ]; then
-  [ -z "$(rctl "jail:$jail:")" ] || rctl -r "jail:$jail:"
-elif [ $# -gt 0 ]; then
-  echo "limits need kern.racct.enable=1 at boot: prepare the base again" >&2
-  exit 1
-fi
-[ $# -eq 0 ] || rctl -a "$@""#;
-
 /// Returns the rctl(8) rules that limit the jail named `jail` to `cpus` CPUs
 /// and `memory_in_bytes` of resident memory.
 pub(crate) fn rules(jail: &str, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
@@ -127,8 +103,8 @@ pub(crate) fn statistics(usage: &str) -> Result<Statistics> {
   })
 }
 
-/// Parses the output of `INTERFACES`: netstat's link rows, with columns
-/// found by their header names.
+/// Parses the output of `scripts::INTERFACES`: netstat's link rows, with
+/// columns found by their header names.
 pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
   let unreadable = || Error::Guest(format!("netstat printed {table:?}"));
   let mut lines = table.lines();
@@ -172,7 +148,7 @@ pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
     .collect()
 }
 
-/// Parses the dataset's counters from the output of `DATASET_IO`.
+/// Parses the dataset's counters from the output of `scripts::DATASET_IO`.
 pub(crate) fn dataset_io(dataset: &str, counters: &str) -> Result<DatasetIo> {
   let values = counters
     .lines()
