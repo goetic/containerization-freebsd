@@ -6,8 +6,9 @@
 
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
-  Builder, Configuration, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Interface, Jail, Limit,
-  Mount, Network, Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, image,
+  Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, ImageStore, Interface, Jail,
+  Limit, Machine, Mount, Network, Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User,
+  WindowSize, Zfs, image,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -296,10 +297,64 @@ fn prepares_boots_and_restores() {
     .expect("power off");
 }
 
+/// The MAC address of the guest's spare NAT device, which a container claims
+/// as its own interface.
+const SPARE: [u8; 6] = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01];
+
+/// A script that succeeds if the spare device has no IPv4 address.
+const UNCONFIGURED: &str = "for device in $(ifconfig -l ether); do \
+       if ifconfig \"$device\" ether | grep -q 'ether 02:00:5e:10:00:01'; then \
+         ! ifconfig \"$device\" inet | grep -q 'inet '; exit; \
+       fi; \
+     done; exit 1";
+
+/// Connects to the host the image came from, resolved through the guest's
+/// resolver.
+const INTERNET: [&str; 7] = ["nc", "-4", "-z", "-w", "10", "download.freebsd.org", "443"];
+
 #[test]
 fn runs_a_jail_on_a_clone_of_the_userland() {
   let work = work("runs_a_jail_on_a_clone_of_the_userland");
-  let mut layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
+  let machine = boot_for_jails(&work);
+  pool_the_userland(&machine);
+  let gateway = machine
+    .agent
+    .check(&sh("route -n get default | awk '/gateway:/ { print $2 }'"), SECONDS)
+    .expect("find the guest's gateway")
+    .stdout
+    .trim()
+    .to_string();
+
+  let zfs = Zfs::new(&machine.agent);
+  zfs
+    .clone("images/userland@base", "images/jails/first")
+    .expect("clone the userland");
+  let root = zfs
+    .mountpoint("images/jails/first")
+    .expect("find the clone");
+  runs_commands_in_a_jail(&machine, &root);
+  reaches_the_network_in_each_mode(&machine, &root, &gateway);
+  zfs
+    .destroy("images/jails/first")
+    .expect("destroy the clone");
+  assert!(!zfs.exists("images/jails/first").expect("list datasets"));
+
+  caches_build_steps(&machine);
+  let containers = Containers::new(&machine.agent, "images/containers");
+  runs_a_container(&machine, &containers);
+  limits_a_container(&machine, &containers);
+  gives_a_container_an_interface(&machine, &containers, &gateway);
+  deletes_containers_left_behind(&machine, &containers);
+
+  machine
+    .shut_down(Duration::from_secs(120))
+    .expect("power off");
+}
+
+/// Boots a guest for jails: with NAT, a spare NAT device, an empty images
+/// disk, and the userland's share mounted at `/mnt/userland`.
+fn boot_for_jails(work: &Path) -> Machine {
+  let mut layout = containerization_freebsd::prepare(&base_disk(), work, DISK_SIZE, Upgrade::None, &bundle())
     .expect("prepare the base");
 
   let images = Disk {
@@ -310,8 +365,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   image::create_disk(&images.path, 8 << 30).expect("make the images disk");
   layout.disks.push(images);
   layout.nat = true;
-  let spare = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01];
-  layout.interfaces.push(spare);
+  layout.interfaces.push(SPARE);
   let userland = userland();
   layout.shares.push(Share {
     tag: "userland".into(),
@@ -350,18 +404,16 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       SECONDS,
     )
     .expect("vtnet0 is the NAT device, taking router advertisements");
-  let unconfigured = sh(
-    "for device in $(ifconfig -l ether); do \
-       if ifconfig \"$device\" ether | grep -q 'ether 02:00:5e:10:00:01'; then \
-         ! ifconfig \"$device\" inet | grep -q 'inet '; exit; \
-       fi; \
-     done; exit 1",
-  );
   machine
     .agent
-    .check(&unconfigured, SECONDS)
+    .check(&sh(UNCONFIGURED), SECONDS)
     .expect("the spare has no address");
+  machine
+}
 
+/// Makes a pool on the images disk and extracts the userland into it, as
+/// `images/userland@base`.
+fn pool_the_userland(machine: &Machine) {
   let device = machine.disk_device("images").expect("find the images disk");
   let zfs = Zfs::new(&machine.agent);
   zfs
@@ -376,14 +428,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   zfs
     .snapshot("images/userland@base")
     .expect("snapshot the userland");
-  zfs
-    .clone("images/userland@base", "images/jails/first")
-    .expect("clone the userland");
-  let root = zfs
-    .mountpoint("images/jails/first")
-    .expect("find the clone");
+}
 
-  let jail = Jail::start(&machine.agent, "first", &root, &Network::None, &["mount.devfs"]).expect("start a jail");
+/// Runs commands in a jail on the clone at `root`.
+fn runs_commands_in_a_jail(machine: &Machine, root: &str) {
+  let jail = Jail::start(&machine.agent, "first", root, &Network::None, &["mount.devfs"]).expect("start a jail");
   let ran = jail
     .check(&["freebsd-version", "-u"], SECONDS)
     .expect("run a command in the jail");
@@ -417,6 +466,13 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .expect("the userland does not");
 
   jail.stop().expect("stop the jail");
+}
+
+/// Tries each network mode, in a jail on the clone at `root`, by pinging the
+/// guest's `gateway` and by connecting to the internet. A NAT jail gets
+/// answers only through pf's NAT, because the gateway has no route to
+/// 10.66/16.
+fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str) {
   // Setting up a NAT jail's network must not depend on the jail's own
   // ifconfig or route.
   machine
@@ -427,33 +483,21 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     )
     .expect("remove the clone's ifconfig and route");
 
-  // Try each network mode by pinging the guest's gateway and by connecting to
-  // the host the image came from, resolved through the guest's resolver. A
-  // NAT jail gets answers only through pf's NAT, because the gateway has no
-  // route to 10.66/16.
-  let internet = ["nc", "-4", "-z", "-w", "10", "download.freebsd.org", "443"];
-  let gateway = machine
-    .agent
-    .check(&sh("route -n get default | awk '/gateway:/ { print $2 }'"), SECONDS)
-    .expect("find the guest's gateway")
-    .stdout
-    .trim()
-    .to_string();
   for (network, reaches) in [(Network::None, false), (Network::Inherit, true), (Network::Nat, true)] {
     let jail = Jail::start(
       &machine.agent,
       "first",
-      &root,
+      root,
       &network,
       &["mount.devfs", "allow.raw_sockets"],
     )
     .unwrap_or_else(|error| panic!("start a jail with {network:?}: {error}"));
     let ran = jail
-      .run(&["ping", "-c", "1", "-t", "5", &gateway], SECONDS)
+      .run(&["ping", "-c", "1", "-t", "5", gateway], SECONDS)
       .unwrap_or_else(|error| panic!("ping with {network:?}: {error}"));
     assert_eq!(ran.exit == Exit::Code(0), reaches, "{network:?}: {ran:?}");
     let ran = jail
-      .run(&internet, SECONDS)
+      .run(&INTERNET, SECONDS)
       .unwrap_or_else(|error| panic!("connect out with {network:?}: {error}"));
     assert_eq!(
       ran.exit == Exit::Code(0),
@@ -476,14 +520,12 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .agent
     .check(&sh("! ifconfig -g epair | grep -q ."), SECONDS)
     .expect("no epairs left behind");
+}
 
-  zfs
-    .destroy("images/jails/first")
-    .expect("destroy the clone");
-  assert!(!zfs.exists("images/jails/first").expect("list datasets"));
-
-  // Cached builds: each step becomes a snapshot, and a step built before is
-  // skipped.
+/// Builds in cached steps: each step becomes a snapshot, and a step built
+/// before is skipped.
+fn caches_build_steps(machine: &Machine) {
+  let zfs = Zfs::new(&machine.agent);
   let builder = Builder::new(&machine.agent, "images/builds");
   let steps = [
     Step::new("echo one > /one; echo building"),
@@ -542,11 +584,13 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       SECONDS,
     )
     .expect("only the steps that built have datasets");
+}
 
-  // Containers: a main process that stops cleanly on SIGTERM, in a jail with
-  // its own hostname, resolver, hosts, mounts and sockets. The sockets live
-  // in the temp directory because the work directory's paths are too long
-  // for a socket address.
+/// Runs a container: a main process that stops cleanly on SIGTERM, in a jail
+/// with its own hostname, resolver, hosts, mounts and sockets. The sockets
+/// live in the temp directory because the work directory's paths are too
+/// long for a socket address.
+fn runs_a_container(machine: &Machine, containers: &Containers) {
   machine
     .agent
     .check(
@@ -558,55 +602,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   std::fs::create_dir_all(&sockets).expect("make a directory for sockets");
   let (host_socket, web_socket) = (sockets.join("host.sock"), sockets.join("web.sock"));
   answer_in_capitals(UnixListener::bind(&host_socket).expect("listen on the host"));
-  let containers = Containers::new(&machine.agent, "images/containers");
   let mut web = containers
     .create(
       "web",
       "images/userland@base",
-      Configuration {
-        process: Exec {
-          argv: vec![
-            "sh".into(),
-            "-c".into(),
-            "trap 'echo stopping; exit 3' TERM; echo started; while :; do sleep 0.1; done".into(),
-          ],
-          ..Exec::default()
-        },
-        hostname: Some("web.test".into()),
-        network: Network::Nat,
-        // The container's own loopback, where nothing answers. getent asks
-        // DNS before /etc/hosts, and a nameserver outside the guest would
-        // stall it until the Mac's network dropped the query.
-        dns: Some(Dns {
-          nameservers: vec!["127.0.0.1".into()],
-          search: vec!["test".into()],
-          ..Dns::default()
-        }),
-        hosts: vec![Host {
-          address: "192.0.2.1".into(),
-          names: vec!["db.test".into(), "db".into()],
-        }],
-        mounts: vec![
-          Mount::directory("/mnt/userland", "/mnt/userland"),
-          Mount::directory("/var/cfbsd-data", "/var/data").read_only(),
-          Mount::tmpfs("/scratch"),
-        ],
-        sockets: vec![
-          UnixSocket {
-            host: host_socket.clone(),
-            guest: "/var/run/host.sock".into(),
-            direction: Direction::Into,
-            mode: Some(0o666),
-          },
-          UnixSocket {
-            host: web_socket.clone(),
-            guest: "/var/run/web.sock".into(),
-            direction: Direction::OutOf,
-            mode: Some(0o600),
-          },
-        ],
-        ..Configuration::default()
-      },
+      web_configuration(&host_socket, &web_socket),
     )
     .expect("create a container");
   assert_eq!(containers.list().expect("list containers"), ["web"]);
@@ -614,6 +614,92 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   let main = web.process().expect("its main process");
   assert_eq!(main.recv().expect("its output"), Output::Stdout(b"started\n".to_vec()));
 
+  sets_its_hostname_and_resolver(&web);
+  uses_its_mounts(&web);
+  runs_processes_as_its_users(&web);
+  relays_its_sockets(&web, &web_socket);
+  counts_its_statistics(&web);
+
+  // The main process's stderr is ignored below: sh reports there that its
+  // sleep died of SIGTERM.
+  web.stop().expect("stop the container");
+  assert!(!web_socket.exists(), "its socket on the host outlived it");
+  machine
+    .agent
+    .check(
+      &sh(
+        "! mount -p | awk '{ print $2 }' | grep -q '^/images/containers/web/' && \
+         test ! -e /images/containers/web/scratch/x",
+      ),
+      SECONDS,
+    )
+    .expect("its mounts are gone, and the tmpfs's file with them");
+  let mut stdout = Vec::new();
+  let exit = loop {
+    match main.recv().expect("its last output") {
+      Output::Stdout(bytes) => stdout.extend(bytes),
+      Output::Stderr(_) => {}
+      Output::Exited(exit) => break exit,
+    }
+  };
+  assert_eq!((stdout.as_slice(), exit), (&b"stopping\n"[..], Exit::Code(3)));
+  // Delete only after the agent has closed the host's socket inside the
+  // container.
+  web.delete().expect("delete the container");
+  std::fs::remove_dir_all(&sockets).expect("remove the sockets' directory");
+}
+
+/// The web container's configuration, with the host's socket at
+/// `host_socket` inside it and its own socket at `web_socket` on the host.
+fn web_configuration(host_socket: &Path, web_socket: &Path) -> Configuration {
+  Configuration {
+    process: Exec {
+      argv: vec![
+        "sh".into(),
+        "-c".into(),
+        "trap 'echo stopping; exit 3' TERM; echo started; while :; do sleep 0.1; done".into(),
+      ],
+      ..Exec::default()
+    },
+    hostname: Some("web.test".into()),
+    network: Network::Nat,
+    // The container's own loopback, where nothing answers. getent asks
+    // DNS before /etc/hosts, and a nameserver outside the guest would
+    // stall it until the Mac's network dropped the query.
+    dns: Some(Dns {
+      nameservers: vec!["127.0.0.1".into()],
+      search: vec!["test".into()],
+      ..Dns::default()
+    }),
+    hosts: vec![Host {
+      address: "192.0.2.1".into(),
+      names: vec!["db.test".into(), "db".into()],
+    }],
+    mounts: vec![
+      Mount::directory("/mnt/userland", "/mnt/userland"),
+      Mount::directory("/var/cfbsd-data", "/var/data").read_only(),
+      Mount::tmpfs("/scratch"),
+    ],
+    sockets: vec![
+      UnixSocket {
+        host: host_socket.to_path_buf(),
+        guest: "/var/run/host.sock".into(),
+        direction: Direction::Into,
+        mode: Some(0o666),
+      },
+      UnixSocket {
+        host: web_socket.to_path_buf(),
+        guest: "/var/run/web.sock".into(),
+        direction: Direction::OutOf,
+        mode: Some(0o600),
+      },
+    ],
+    ..Configuration::default()
+  }
+}
+
+/// Checks the container's hostname, resolver and hosts.
+fn sets_its_hostname_and_resolver(web: &Container) {
   let ran = web
     .check(&sh("hostname; cat /etc/resolv.conf; getent hosts db"), SECONDS)
     .expect("run a command in the container");
@@ -627,9 +713,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     lines[3].split_whitespace().collect::<Vec<_>>(),
     ["192.0.2.1", "db.test", "db"]
   );
+}
 
-  // The container's mounts: a host share, a read-only guest directory, and a
-  // tmpfs.
+/// Uses the container's mounts: a host share, a read-only guest directory,
+/// and a tmpfs.
+fn uses_its_mounts(web: &Container) {
   let script = format!(
     "set -e; test -f /mnt/userland/{}; cat /var/data/greeting; \
      touch /var/data/x 2>/dev/null || echo read-only; echo kept > /scratch/x; cat /scratch/x",
@@ -637,9 +725,12 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   );
   let ran = web.check(&sh(&script), SECONDS).expect("use its mounts");
   assert_eq!(ran.lines(), ["hello", "read-only", "kept"]);
+}
 
-  // Processes run as one of the container's users, with extra groups, a umask,
-  // limits and a working directory; and as a uid the container doesn't list.
+/// Runs processes as one of the container's users, with extra groups, a
+/// umask, limits and a working directory; and as a uid the container doesn't
+/// list.
+fn runs_processes_as_its_users(web: &Container) {
   let script = "id -u; id -g; id -G; umask; ulimit -n; echo \"$HOME\"; pwd";
   let (stdout, exit) = finish(
     &web
@@ -684,9 +775,12 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       .expect("run a process as an unlisted uid"),
   );
   assert_eq!((stdout.as_str(), exit), ("4242\n0\n/\n", Exit::Code(0)));
+}
 
-  // Sockets: the host's socket inside the container, open to its users; the
-  // container's socket on the host; and a port on the container's loopback.
+/// Uses the container's sockets: the host's socket inside the container, open
+/// to its users; the container's socket at `web_socket` on the host; and a
+/// port on the container's loopback.
+fn relays_its_sockets(web: &Container, web_socket: &Path) {
   let (stdout, exit) = finish(
     &web
       .exec(Exec {
@@ -702,7 +796,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       .expect("use the host's socket"),
   );
   assert_eq!((stdout.as_str(), exit), ("666\nHELLO\n", Exit::Code(0)));
-  let mode = std::fs::metadata(&web_socket)
+  let mode = std::fs::metadata(web_socket)
     .expect("the container's socket on the host")
     .permissions()
     .mode();
@@ -716,7 +810,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
       .expect("serve in the container")
   };
   let server = serve("echo pong | nc -N -lU /var/run/web.sock");
-  let answer = eventually(|| Some(ask(&web_socket, "ping\n")).filter(|answer| !answer.is_empty()));
+  let answer = eventually(|| Some(ask(web_socket, "ping\n")).filter(|answer| !answer.is_empty()));
   assert_eq!(answer, "pong\n");
   assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
   let server = serve("echo pong | nc -N -l 127.0.0.1 7000");
@@ -729,9 +823,12 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   }
   assert_eq!(answer, b"pong\n");
   assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
+}
 
-  // Statistics: the container's network counters, where its loopback carried
-  // the relayed traffic, and its dataset's I/O from the files it wrote.
+/// Checks the container's statistics: its network counters, where its
+/// loopback carried the relayed traffic, and its dataset's I/O from the files
+/// it wrote.
+fn counts_its_statistics(web: &Container) {
   let statistics = web.statistics().expect("its statistics");
   let loopback = statistics
     .networks
@@ -754,37 +851,11 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     dataset.write_bytes > 0 && dataset.write_operations > 0,
     "{statistics:?}"
   );
+}
 
-  // The main process's stderr is ignored below: sh reports there that its
-  // sleep died of SIGTERM.
-  web.stop().expect("stop the container");
-  assert!(!web_socket.exists(), "its socket on the host outlived it");
-  machine
-    .agent
-    .check(
-      &sh(
-        "! mount -p | awk '{ print $2 }' | grep -q '^/images/containers/web/' && \
-         test ! -e /images/containers/web/scratch/x",
-      ),
-      SECONDS,
-    )
-    .expect("its mounts are gone, and the tmpfs's file with them");
-  let mut stdout = Vec::new();
-  let exit = loop {
-    match main.recv().expect("its last output") {
-      Output::Stdout(bytes) => stdout.extend(bytes),
-      Output::Stderr(_) => {}
-      Output::Exited(exit) => break exit,
-    }
-  };
-  assert_eq!((stdout.as_slice(), exit), (&b"stopping\n"[..], Exit::Code(3)));
-  // Delete only after the agent has closed the host's socket inside the
-  // container.
-  web.delete().expect("delete the container");
-  std::fs::remove_dir_all(&sockets).expect("remove the sockets' directory");
-
-  // A container's limits and statistics. Memory use is sampled once a second,
-  // so the test waits for a nonzero value.
+/// Checks a container's limits and statistics. Memory use is sampled once a
+/// second, so the test waits for a nonzero value.
+fn limits_a_container(machine: &Machine, containers: &Containers) {
   let limited = containers
     .create(
       "limited",
@@ -823,15 +894,17 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .check(&["rctl", "jail:limited:"], SECONDS)
     .expect("list its rules again");
   assert_eq!(ran.stdout, "", "its rules outlived it");
+}
 
-  // A container with its own interface on the NAT network, at an address the
-  // NAT's DHCP server leased. The host can reach it and it can reach the
-  // internet. Deleting the container returns the device to the guest.
-  let interface = Interface::leased(&machine.agent, spare).expect("lease an address");
-  assert_eq!(interface.gateway.as_deref(), Some(gateway.as_str()), "{interface:?}");
+/// Gives a container its own interface on the NAT network, at an address the
+/// NAT's DHCP server leased. The host can reach it and it can reach the
+/// internet. Deleting the container returns the device to the guest.
+fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, gateway: &str) {
+  let interface = Interface::leased(&machine.agent, SPARE).expect("lease an address");
+  assert_eq!(interface.gateway.as_deref(), Some(gateway), "{interface:?}");
   machine
     .agent
-    .check(&unconfigured, SECONDS)
+    .check(&sh(UNCONFIGURED), SECONDS)
     .expect("leasing configures nothing");
   let address = interface
     .address
@@ -869,7 +942,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   drop(stream);
   assert_eq!(finish(&server), (String::new(), Exit::Code(0)));
   reachable
-    .check(&internet, SECONDS)
+    .check(&INTERNET, SECONDS)
     .expect("connect out from its interface");
   reachable
     .delete()
@@ -878,7 +951,10 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .agent
     .check(&sh("ifconfig -a | grep -q 'ether 02:00:5e:10:00:01'"), SECONDS)
     .expect("its device is back in the guest");
+}
 
+/// Deletes containers left behind, by id.
+fn deletes_containers_left_behind(machine: &Machine, containers: &Containers) {
   // A container whose handle was dropped can be deleted by id, mounts and all.
   drop(
     containers
@@ -933,10 +1009,6 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .agent
     .check(&sh("! ifconfig -g epair | grep -q ."), SECONDS)
     .expect("no epairs left behind");
-
-  machine
-    .shut_down(Duration::from_secs(120))
-    .expect("power off");
 }
 
 /// Counts the entries under `path`, including `path` itself, as find(1) does.
