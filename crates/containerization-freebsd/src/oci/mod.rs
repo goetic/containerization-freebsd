@@ -2,6 +2,7 @@
 //! the OCI image spec, a registry client and a content store.
 
 mod content;
+mod curl;
 mod reference;
 mod registry;
 #[cfg(test)]

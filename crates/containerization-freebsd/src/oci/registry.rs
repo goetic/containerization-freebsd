@@ -1,10 +1,9 @@
+use super::curl::{self, Auth, Request, Response};
 use super::{ContentStore, Descriptor, Reference, media_type, sha256_file, sha256_hex};
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 
 /// The largest manifest or index accepted: 4 MiB, the least the OCI
@@ -66,55 +65,6 @@ pub struct RegistryClient {
   /// Cached bearer tokens, keyed by `registry/repository` and whether the
   /// token allows pushing.
   tokens: Mutex<HashMap<(String, bool), Secret>>,
-}
-
-#[derive(Clone, Debug)]
-enum Auth {
-  None,
-  Bearer(Secret),
-  Basic(Credentials),
-}
-
-/// An HTTP request for curl to send.
-struct Request<'a> {
-  method: &'a str,
-  url: String,
-  accept: Option<&'a str>,
-  content_type: Option<&'a str>,
-  /// A file to send as the body.
-  upload: Option<&'a Path>,
-  /// A file to write the response body to.
-  output: Option<&'a Path>,
-}
-
-impl<'a> Request<'a> {
-  fn new(method: &'a str, url: String) -> Self {
-    Self {
-      method,
-      url,
-      accept: None,
-      content_type: None,
-      upload: None,
-      output: None,
-    }
-  }
-}
-
-struct Response {
-  status: u16,
-  /// The headers of the final response after redirects, with lowercase
-  /// names.
-  headers: Vec<(String, String)>,
-}
-
-impl Response {
-  fn header(&self, name: &str) -> Option<&str> {
-    self
-      .headers
-      .iter()
-      .find(|(key, _)| key == name)
-      .map(|(_, value)| value.as_str())
-  }
 }
 
 impl RegistryClient {
@@ -216,7 +166,7 @@ impl RegistryClient {
     let response = if same_origin(&post.url, &put.url) {
       self.send(reference, &put, true)?
     } else {
-      curl(&put, &Auth::None)?
+      curl::send(&put, &Auth::None)?
     };
     match response.status {
       201 => Ok(()),
@@ -277,7 +227,7 @@ impl RegistryClient {
       .cloned();
     let auth = cached.map_or(Auth::None, Auth::Bearer);
 
-    let response = curl(request, &auth)?;
+    let response = curl::send(request, &auth)?;
     if response.status != 401 {
       return Ok(response);
     }
@@ -285,7 +235,7 @@ impl RegistryClient {
       .header("www-authenticate")
       .ok_or_else(|| unexpected(request, 401, request.output))?;
     let auth = self.authorize(reference, &key, challenge)?;
-    curl(request, &auth)
+    curl::send(request, &auth)
   }
 
   /// The authorization a WWW-Authenticate challenge asks for: a bearer token
@@ -314,10 +264,10 @@ impl RegistryClient {
   /// caches it under `key`.
   fn fetch_token(&self, reference: &Reference, key: &(String, bool), url: &url::Url) -> Result<Secret> {
     let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
-    let body = tempfile_path();
+    let body = curl::tempfile_path();
     let mut get = Request::new("GET", url.to_string());
     get.output = Some(&body);
-    let response = curl(&get, &auth);
+    let response = curl::send(&get, &auth);
     let bytes = std::fs::read(&body).unwrap_or_default();
     let _ = std::fs::remove_file(&body);
     let response = response?;
@@ -389,120 +339,6 @@ fn same_origin(one: &str, other: &str) -> bool {
   }
 }
 
-/// Sends `request` with curl, following redirects. curl reads its options,
-/// including credentials, from a config file on stdin.
-fn curl(request: &Request, auth: &Auth) -> Result<Response> {
-  let headers = tempfile_path();
-  let config = request.config(auth, &headers);
-  let result = run_curl(&config, &format!("curl {} {}", request.method, request.url)).map(|status| Response {
-    status,
-    headers: last_headers(&std::fs::read_to_string(&headers).unwrap_or_default()),
-  });
-
-  let _ = std::fs::remove_file(&headers);
-  result
-}
-
-impl Request<'_> {
-  /// curl's config file for sending this request with `auth`. curl follows
-  /// redirects, writes the headers to `headers` and the body to `output`, and
-  /// prints only the status code.
-  fn config(&self, auth: &Auth, headers: &Path) -> String {
-    let mut config = CurlConfig::default();
-
-    config.option("url", &self.url);
-    config.option("dump-header", &headers.to_string_lossy());
-    config.flag("location");
-    config.flag("silent");
-    config.flag("show-error");
-    config.option("retry", "3");
-    config.option("write-out", "%{http_code}");
-    match (self.method, self.upload) {
-      ("HEAD", _) => config.flag("head"),
-      (_, Some(upload)) => {
-        config.option("upload-file", &upload.to_string_lossy());
-        config.option("request", self.method);
-        // An empty Expect header stops curl from waiting for a 100 Continue.
-        config.option("header", "Expect:");
-      }
-      ("GET", None) => {}
-      (method, None) => {
-        config.option("request", method);
-        config.option("data-binary", "");
-      }
-    }
-    // The body goes to a file so that stdout carries only the status code.
-    let output = self.output.unwrap_or(Path::new("/dev/null"));
-    config.option("output", &output.to_string_lossy());
-    if let Some(accept) = self.accept {
-      config.option("header", &format!("Accept: {accept}"));
-    }
-    if let Some(content_type) = self.content_type {
-      config.option("header", &format!("Content-Type: {content_type}"));
-    }
-    match auth {
-      Auth::None => {}
-      Auth::Bearer(token) => config.option("header", &format!("Authorization: Bearer {}", token.expose())),
-      Auth::Basic(credentials) => config.option(
-        "user",
-        &format!("{}:{}", credentials.username, credentials.password.expose()),
-      ),
-    }
-    config.0
-  }
-}
-
-/// A curl config file, one option per line.
-#[derive(Default)]
-struct CurlConfig(String);
-
-impl CurlConfig {
-  fn flag(&mut self, name: &str) {
-    self.0.push_str(name);
-    self.0.push('\n');
-  }
-
-  fn option(&mut self, name: &str, value: &str) {
-    self.0.push_str(&format!("{name} = {}\n", quote(value)));
-  }
-}
-
-/// Runs curl with `config` on stdin and returns the HTTP status it printed.
-/// `command` describes the request in errors.
-fn run_curl(config: &str, command: &str) -> Result<u16> {
-  let failed = |failure: String| Error::Command {
-    command: command.to_string(),
-    failure,
-  };
-  let mut child = Command::new("curl")
-    .args(["--config", "-"])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .map_err(|error| failed(error.to_string()))?;
-  if let Some(mut stdin) = child.stdin.take() {
-    stdin
-      .write_all(config.as_bytes())
-      .map_err(|error| failed(error.to_string()))?;
-  }
-  let output = child
-    .wait_with_output()
-    .map_err(|error| failed(error.to_string()))?;
-  if !output.status.success() {
-    return Err(failed(format!(
-      "exited {}: {}",
-      output.status,
-      String::from_utf8_lossy(&output.stderr).trim()
-    )));
-  }
-
-  String::from_utf8_lossy(&output.stdout)
-    .trim()
-    .parse()
-    .map_err(|_| failed("wrote no HTTP status".to_string()))
-}
-
 /// The error for an unexpected `status` in reply to `request`, including the
 /// start of the response body if there is one.
 fn unexpected(request: &Request, status: u16, body: Option<&Path>) -> Error {
@@ -520,54 +356,6 @@ fn snippet(bytes: &[u8]) -> String {
   let text = String::from_utf8_lossy(&bytes[..bytes.len().min(400)]);
 
   text.trim().to_string()
-}
-
-/// A unique path in the temporary directory for a scratch file of one curl
-/// run.
-fn tempfile_path() -> std::path::PathBuf {
-  use std::sync::atomic::{AtomicU64, Ordering};
-  static NEXT: AtomicU64 = AtomicU64::new(0);
-
-  std::env::temp_dir().join(format!(
-    "containerization-freebsd-curl-{}-{}",
-    std::process::id(),
-    NEXT.fetch_add(1, Ordering::Relaxed)
-  ))
-}
-
-/// `value` as a double-quoted string in curl's config file syntax.
-fn quote(value: &str) -> String {
-  let mut quoted = String::from("\"");
-
-  for character in value.chars() {
-    match character {
-      '"' => quoted.push_str("\\\""),
-      '\\' => quoted.push_str("\\\\"),
-      '\n' => quoted.push_str("\\n"),
-      '\r' => quoted.push_str("\\r"),
-      '\t' => quoted.push_str("\\t"),
-      character => quoted.push(character),
-    }
-  }
-  quoted.push('"');
-  quoted
-}
-
-/// The headers of the last response in curl's header dump, which follows any
-/// redirects.
-fn last_headers(dumped: &str) -> Vec<(String, String)> {
-  let block = dumped
-    .split("\r\n\r\n")
-    .filter(|block| block.trim_start().starts_with("HTTP/"))
-    .last()
-    .unwrap_or_default();
-
-  block
-    .lines()
-    .skip(1)
-    .filter_map(|line| line.split_once(':'))
-    .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
-    .collect()
 }
 
 /// Splits a WWW-Authenticate challenge into its scheme and parameters, such as
@@ -691,35 +479,6 @@ mod tests {
   }
 
   #[test]
-  fn quotes_for_curls_config() {
-    assert_eq!(quote(r#"pa"ss\word"#), r#""pa\"ss\\word""#);
-  }
-
-  #[test]
-  fn writes_curls_config_for_an_upload() {
-    let mut put = Request::new("PUT", "https://ghcr.io/v2/a/b/blobs/uploads/1".to_string());
-    put.content_type = Some("application/octet-stream");
-    put.upload = Some(Path::new("/blob"));
-
-    assert_eq!(
-      put.config(&Auth::Bearer("a-token".into()), Path::new("/headers")),
-      "url = \"https://ghcr.io/v2/a/b/blobs/uploads/1\"\n\
-       dump-header = \"/headers\"\n\
-       location\n\
-       silent\n\
-       show-error\n\
-       retry = \"3\"\n\
-       write-out = \"%{http_code}\"\n\
-       upload-file = \"/blob\"\n\
-       request = \"PUT\"\n\
-       header = \"Expect:\"\n\
-       output = \"/dev/null\"\n\
-       header = \"Content-Type: application/octet-stream\"\n\
-       header = \"Authorization: Bearer a-token\"\n"
-    );
-  }
-
-  #[test]
   fn asks_for_a_token_to_the_repository() {
     let reference = Reference::parse("ghcr.io/a/b").unwrap();
     let (_, parameters) = parse_challenge(r#"Bearer realm="https://ghcr.io/token",service="ghcr.io""#);
@@ -729,20 +488,6 @@ mod tests {
         .unwrap()
         .as_str(),
       "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aa%2Fb%3Apull%2Cpush"
-    );
-  }
-
-  #[test]
-  fn reads_the_headers_after_redirects() {
-    let dumped = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /elsewhere\r\n\r\n\
-                  HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Thing: a:b\r\n\r\n";
-
-    assert_eq!(
-      last_headers(dumped),
-      [
-        ("content-type".to_string(), "application/octet-stream".to_string()),
-        ("x-thing".to_string(), "a:b".to_string())
-      ]
     );
   }
 
