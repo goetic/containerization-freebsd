@@ -137,9 +137,31 @@ fn prepares_boots_and_restores() {
     .check(&["freebsd-version", "-k"], SECONDS)
     .expect("run a command");
   assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
+  streams_input_across_windows(&cold, &work);
+  loads_the_bundles_modules(&cold);
+  shares_files_with_the_host(&cold, &shared);
+  let state = work.join("state.vzvmsave");
+  saves_with_the_share_unused(&cold, &state);
+  cold.stop().expect("stop");
+  drop(cold);
 
-  // The input spans many flow-control windows. The console would drop data if
-  // the host outpaced the agent.
+  let restored = layout.machine("restored").expect("make the machine");
+  restored.restore(&state).expect("restore");
+  restored.resume().expect("resume");
+  restored
+    .wait_ready(SECONDS)
+    .expect("the agent answers after restoring");
+  resumes_where_it_left_off(&restored);
+  runs_a_command_in_a_terminal(&restored);
+
+  restored
+    .shut_down(Duration::from_secs(120))
+    .expect("power off");
+}
+
+/// Streams input that spans many flow-control windows through a checksum.
+/// The console would drop data if the host outpaced the agent.
+fn streams_input_across_windows(cold: &Machine, work: &Path) {
   let input: Vec<u8> = (0..16usize << 20)
     .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
     .collect();
@@ -162,9 +184,11 @@ fn prepares_boots_and_restores() {
     }
   }
   assert_eq!(String::from_utf8_lossy(&sum).trim(), host_sha256(&work.join("input")));
+}
 
-  // rc loaded the bundle's patched modules, including its fusefs rather than
-  // the stock one.
+/// Checks that rc loaded the bundle's patched modules, including its fusefs
+/// rather than the stock one.
+fn loads_the_bundles_modules(cold: &Machine) {
   let ran = cold
     .agent
     .check(&sh("kldstat -v | grep -E 'virtiofs|vtfs|fusefs'"), SECONDS)
@@ -172,7 +196,11 @@ fn prepares_boots_and_restores() {
   for module in ["/boot/modules/fusefs.ko", "virtiofs", "vtfs"] {
     assert!(ran.stdout.contains(module), "{module} is not loaded: {ran:?}");
   }
+}
 
+/// Mounts the share of the host's directory `shared`, and reads and writes
+/// files on it.
+fn shares_files_with_the_host(cold: &Machine, shared: &Path) {
   cold
     .mount_share("shared", "/mnt/shared")
     .expect("mount the share");
@@ -188,9 +216,11 @@ fn prepares_boots_and_restores() {
     std::fs::read_to_string(shared.join("from-guest")).expect("read the guest's file"),
     "written in the guest\n"
   );
+}
 
-  // Saving unmounts the share, so saving fails while the share is in use.
-  let state = work.join("state.vzvmsave");
+/// Saves the guest's state to `state`. Saving unmounts the share, so saving
+/// fails while the share is in use.
+fn saves_with_the_share_unused(cold: &Machine, state: &Path) {
   cold
     .agent
     .check(
@@ -198,7 +228,7 @@ fn prepares_boots_and_restores() {
       SECONDS,
     )
     .expect("use the share in the background");
-  cold.save(&state).expect_err("save with the share in use");
+  cold.save(state).expect_err("save with the share in use");
   cold
     .agent
     .check(
@@ -211,18 +241,13 @@ fn prepares_boots_and_restores() {
     .agent
     .check(&sh("date -f %s $(($(date +%s) - 3600))"), SECONDS)
     .expect("set the guest's clock back");
-  cold.save(&state).expect("save");
-  cold.stop().expect("stop");
-  drop(cold);
+  cold.save(state).expect("save");
+}
 
-  // The restored guest keeps the cold boot's kernel, so mounting the share
-  // below is its second mount in the same boot.
-  let restored = layout.machine("restored").expect("make the machine");
-  restored.restore(&state).expect("restore");
-  restored.resume().expect("resume");
-  restored
-    .wait_ready(SECONDS)
-    .expect("the agent answers after restoring");
+/// Checks that the restored guest resumes where the cold boot left off: on
+/// its NAT network, with its clock corrected, and with the share mounted
+/// again.
+fn resumes_where_it_left_off(restored: &Machine) {
   // Once its link is back, the guest keeps its saved NAT configuration: the
   // Mac answers through the default route.
   restored
@@ -248,6 +273,8 @@ fn prepares_boots_and_restores() {
     guest.abs_diff(host) <= 5,
     "the guest's clock is {guest}, the host's {host}"
   );
+  // The restored guest keeps the cold boot's kernel, so this is its second
+  // mount of the share in the same boot.
   restored
     .mount_share("shared", "/mnt/shared")
     .expect("mount the share again");
@@ -259,9 +286,11 @@ fn prepares_boots_and_restores() {
     )
     .expect("use the share after restoring");
   assert_eq!(ran.lines(), ["restored", "written on the host", "written in the guest"]);
+}
 
-  // Read the output before the command exits: FreeBSD frees a terminal's
-  // unread output a second after its last close.
+/// Runs a command in a terminal, reading its output before it exits: FreeBSD
+/// frees a terminal's unread output a second after its last close.
+fn runs_a_command_in_a_terminal(restored: &Machine) {
   let terminal = restored
     .agent
     .spawn(Exec {
@@ -291,10 +320,6 @@ fn prepares_boots_and_restores() {
     }
   };
   assert_eq!(exit, Exit::Code(0));
-
-  restored
-    .shut_down(Duration::from_secs(120))
-    .expect("power off");
 }
 
 /// The MAC address of the guest's spare NAT device, which a container claims
