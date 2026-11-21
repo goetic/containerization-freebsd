@@ -300,48 +300,8 @@ impl RegistryClient {
         .map(Auth::Basic)
         .ok_or_else(|| Error::Invalid(format!("{} wants an account", reference.domain))),
       "bearer" => {
-        let realm = parameters
-          .get("realm")
-          .ok_or_else(|| Error::Guest(format!("{} named no token realm: {challenge}", reference.domain)))?;
-        let actions = if key.1 { "pull,push" } else { "pull" };
-        let scope = format!("repository:{}:{actions}", reference.repository);
-        let mut url = url::Url::parse(realm)
-          .map_err(|error| Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain)))?;
-        {
-          let mut query = url.query_pairs_mut();
-          if let Some(service) = parameters.get("service") {
-            query.append_pair("service", service);
-          }
-          query.append_pair("scope", parameters.get("scope").unwrap_or(&scope));
-        }
-
-        let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
-        let body = tempfile_path();
-        let mut get = Request::new("GET", url.to_string());
-        get.output = Some(&body);
-        let response = curl(&get, &auth);
-        let bytes = std::fs::read(&body).unwrap_or_default();
-        let _ = std::fs::remove_file(&body);
-        let response = response?;
-        if response.status != 200 {
-          return Err(Error::Command {
-            command: format!("GET {url}"),
-            failure: format!("HTTP {}: {}", response.status, snippet(&bytes)),
-          });
-        }
-
-        let token: TokenResponse = super::parse(&bytes, "the registry's token")?;
-        let token: Secret = token
-          .token
-          .or(token.access_token)
-          .ok_or_else(|| Error::Guest(format!("{} sent no token", reference.domain)))?
-          .into();
-        self
-          .tokens
-          .lock()
-          .unwrap_or_else(PoisonError::into_inner)
-          .insert(key.clone(), token.clone());
-        Ok(Auth::Bearer(token))
+        let url = token_url(reference, key.1, challenge, &parameters)?;
+        self.fetch_token(reference, key, &url).map(Auth::Bearer)
       }
       _ => Err(Error::Invalid(format!(
         "{} asks for {scheme} authentication, which isn't supported",
@@ -349,6 +309,64 @@ impl RegistryClient {
       ))),
     }
   }
+
+  /// Fetches a bearer token from `url`, with the account if there is one, and
+  /// caches it under `key`.
+  fn fetch_token(&self, reference: &Reference, key: &(String, bool), url: &url::Url) -> Result<Secret> {
+    let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
+    let body = tempfile_path();
+    let mut get = Request::new("GET", url.to_string());
+    get.output = Some(&body);
+    let response = curl(&get, &auth);
+    let bytes = std::fs::read(&body).unwrap_or_default();
+    let _ = std::fs::remove_file(&body);
+    let response = response?;
+    if response.status != 200 {
+      return Err(Error::Command {
+        command: format!("GET {url}"),
+        failure: format!("HTTP {}: {}", response.status, snippet(&bytes)),
+      });
+    }
+
+    let token: TokenResponse = super::parse(&bytes, "the registry's token")?;
+    let token: Secret = token
+      .token
+      .or(token.access_token)
+      .ok_or_else(|| Error::Guest(format!("{} sent no token", reference.domain)))?
+      .into();
+    self
+      .tokens
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .insert(key.clone(), token.clone());
+    Ok(token)
+  }
+}
+
+/// The token URL from a bearer `challenge`'s `parameters`: the realm, with
+/// the service and scope. Without a scope, it asks for pull access to
+/// `reference`'s repository, plus push access when `push` is set.
+fn token_url(
+  reference: &Reference,
+  push: bool,
+  challenge: &str,
+  parameters: &HashMap<String, String>,
+) -> Result<url::Url> {
+  let realm = parameters
+    .get("realm")
+    .ok_or_else(|| Error::Guest(format!("{} named no token realm: {challenge}", reference.domain)))?;
+  let actions = if push { "pull,push" } else { "pull" };
+  let scope = format!("repository:{}:{actions}", reference.repository);
+  let mut url = url::Url::parse(realm)
+    .map_err(|error| Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain)))?;
+
+  let mut query = url.query_pairs_mut();
+  if let Some(service) = parameters.get("service") {
+    query.append_pair("service", service);
+  }
+  query.append_pair("scope", parameters.get("scope").unwrap_or(&scope));
+  drop(query);
+  Ok(url)
 }
 
 #[derive(serde::Deserialize)]
@@ -374,90 +392,115 @@ fn same_origin(one: &str, other: &str) -> bool {
 /// Sends `request` with curl, following redirects. curl reads its options,
 /// including credentials, from a config file on stdin.
 fn curl(request: &Request, auth: &Auth) -> Result<Response> {
-  let url = &request.url;
   let headers = tempfile_path();
-  let mut config = format!(
-    "url = {}\ndump-header = {}\nlocation\nsilent\nshow-error\nretry = 3\nwrite-out = \"%{{http_code}}\"\n",
-    quote(url),
-    quote(&headers.to_string_lossy())
-  );
-  match (request.method, request.upload) {
-    ("HEAD", _) => config.push_str("head\n"),
-    // An empty Expect header stops curl from waiting for a 100 Continue.
-    (_, Some(upload)) => config.push_str(&format!(
-      "upload-file = {}\nrequest = {}\nheader = \"Expect:\"\n",
-      quote(&upload.to_string_lossy()),
-      quote(request.method)
-    )),
-    ("GET", None) => {}
-    (method, None) => config.push_str(&format!("request = {}\ndata-binary = \"\"\n", quote(method))),
-  }
-  // The body goes to a file so that stdout carries only the status code.
-  let output = request.output.unwrap_or(Path::new("/dev/null"));
-  config.push_str(&format!("output = {}\n", quote(&output.to_string_lossy())));
-  if let Some(accept) = request.accept {
-    config.push_str(&format!("header = {}\n", quote(&format!("Accept: {accept}"))));
-  }
-  if let Some(content_type) = request.content_type {
-    config.push_str(&format!(
-      "header = {}\n",
-      quote(&format!("Content-Type: {content_type}"))
-    ));
-  }
-  match auth {
-    Auth::None => {}
-    Auth::Bearer(token) => config.push_str(&format!(
-      "header = {}\n",
-      quote(&format!("Authorization: Bearer {}", token.expose()))
-    )),
-    Auth::Basic(credentials) => config.push_str(&format!(
-      "user = {}\n",
-      quote(&format!("{}:{}", credentials.username, credentials.password.expose()))
-    )),
-  }
-
-  let command = || format!("curl {} {url}", request.method);
-  let failed = |failure: String| Error::Command {
-    command: command(),
-    failure,
-  };
-  let result = (|| {
-    let mut child = Command::new("curl")
-      .args(["--config", "-"])
-      .stdin(Stdio::piped())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .spawn()
-      .map_err(|error| failed(error.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-      stdin
-        .write_all(config.as_bytes())
-        .map_err(|error| failed(error.to_string()))?;
-    }
-    let output = child
-      .wait_with_output()
-      .map_err(|error| failed(error.to_string()))?;
-    if !output.status.success() {
-      return Err(failed(format!(
-        "exited {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-      )));
-    }
-
-    let status = String::from_utf8_lossy(&output.stdout)
-      .trim()
-      .parse()
-      .map_err(|_| failed("wrote no HTTP status".to_string()))?;
-    let dumped = std::fs::read_to_string(&headers).unwrap_or_default();
-    Ok(Response {
-      status,
-      headers: last_headers(&dumped),
-    })
-  })();
+  let config = request.config(auth, &headers);
+  let result = run_curl(&config, &format!("curl {} {}", request.method, request.url)).map(|status| Response {
+    status,
+    headers: last_headers(&std::fs::read_to_string(&headers).unwrap_or_default()),
+  });
 
   let _ = std::fs::remove_file(&headers);
   result
+}
+
+impl Request<'_> {
+  /// curl's config file for sending this request with `auth`. curl follows
+  /// redirects, writes the headers to `headers` and the body to `output`, and
+  /// prints only the status code.
+  fn config(&self, auth: &Auth, headers: &Path) -> String {
+    let mut config = CurlConfig::default();
+
+    config.option("url", &self.url);
+    config.option("dump-header", &headers.to_string_lossy());
+    config.flag("location");
+    config.flag("silent");
+    config.flag("show-error");
+    config.option("retry", "3");
+    config.option("write-out", "%{http_code}");
+    match (self.method, self.upload) {
+      ("HEAD", _) => config.flag("head"),
+      (_, Some(upload)) => {
+        config.option("upload-file", &upload.to_string_lossy());
+        config.option("request", self.method);
+        // An empty Expect header stops curl from waiting for a 100 Continue.
+        config.option("header", "Expect:");
+      }
+      ("GET", None) => {}
+      (method, None) => {
+        config.option("request", method);
+        config.option("data-binary", "");
+      }
+    }
+    // The body goes to a file so that stdout carries only the status code.
+    let output = self.output.unwrap_or(Path::new("/dev/null"));
+    config.option("output", &output.to_string_lossy());
+    if let Some(accept) = self.accept {
+      config.option("header", &format!("Accept: {accept}"));
+    }
+    if let Some(content_type) = self.content_type {
+      config.option("header", &format!("Content-Type: {content_type}"));
+    }
+    match auth {
+      Auth::None => {}
+      Auth::Bearer(token) => config.option("header", &format!("Authorization: Bearer {}", token.expose())),
+      Auth::Basic(credentials) => config.option(
+        "user",
+        &format!("{}:{}", credentials.username, credentials.password.expose()),
+      ),
+    }
+    config.0
+  }
+}
+
+/// A curl config file, one option per line.
+#[derive(Default)]
+struct CurlConfig(String);
+
+impl CurlConfig {
+  fn flag(&mut self, name: &str) {
+    self.0.push_str(name);
+    self.0.push('\n');
+  }
+
+  fn option(&mut self, name: &str, value: &str) {
+    self.0.push_str(&format!("{name} = {}\n", quote(value)));
+  }
+}
+
+/// Runs curl with `config` on stdin and returns the HTTP status it printed.
+/// `command` describes the request in errors.
+fn run_curl(config: &str, command: &str) -> Result<u16> {
+  let failed = |failure: String| Error::Command {
+    command: command.to_string(),
+    failure,
+  };
+  let mut child = Command::new("curl")
+    .args(["--config", "-"])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|error| failed(error.to_string()))?;
+  if let Some(mut stdin) = child.stdin.take() {
+    stdin
+      .write_all(config.as_bytes())
+      .map_err(|error| failed(error.to_string()))?;
+  }
+  let output = child
+    .wait_with_output()
+    .map_err(|error| failed(error.to_string()))?;
+  if !output.status.success() {
+    return Err(failed(format!(
+      "exited {}: {}",
+      output.status,
+      String::from_utf8_lossy(&output.stderr).trim()
+    )));
+  }
+
+  String::from_utf8_lossy(&output.stdout)
+    .trim()
+    .parse()
+    .map_err(|_| failed("wrote no HTTP status".to_string()))
 }
 
 /// The error for an unexpected `status` in reply to `request`, including the
@@ -650,6 +693,43 @@ mod tests {
   #[test]
   fn quotes_for_curls_config() {
     assert_eq!(quote(r#"pa"ss\word"#), r#""pa\"ss\\word""#);
+  }
+
+  #[test]
+  fn writes_curls_config_for_an_upload() {
+    let mut put = Request::new("PUT", "https://ghcr.io/v2/a/b/blobs/uploads/1".to_string());
+    put.content_type = Some("application/octet-stream");
+    put.upload = Some(Path::new("/blob"));
+
+    assert_eq!(
+      put.config(&Auth::Bearer("a-token".into()), Path::new("/headers")),
+      "url = \"https://ghcr.io/v2/a/b/blobs/uploads/1\"\n\
+       dump-header = \"/headers\"\n\
+       location\n\
+       silent\n\
+       show-error\n\
+       retry = \"3\"\n\
+       write-out = \"%{http_code}\"\n\
+       upload-file = \"/blob\"\n\
+       request = \"PUT\"\n\
+       header = \"Expect:\"\n\
+       output = \"/dev/null\"\n\
+       header = \"Content-Type: application/octet-stream\"\n\
+       header = \"Authorization: Bearer a-token\"\n"
+    );
+  }
+
+  #[test]
+  fn asks_for_a_token_to_the_repository() {
+    let reference = Reference::parse("ghcr.io/a/b").unwrap();
+    let (_, parameters) = parse_challenge(r#"Bearer realm="https://ghcr.io/token",service="ghcr.io""#);
+
+    assert_eq!(
+      token_url(&reference, true, "", &parameters)
+        .unwrap()
+        .as_str(),
+      "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aa%2Fb%3Apull%2Cpush"
+    );
   }
 
   #[test]

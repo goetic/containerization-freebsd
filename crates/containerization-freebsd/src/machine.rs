@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::memory::Memory;
 use crate::scripts;
 use dispatch2::{DispatchQueue, DispatchRetained};
+use std::io::{PipeReader, PipeWriter};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -131,111 +132,36 @@ impl Layout {
   }
 
   #[cfg_attr(not(feature = "kernel-messages"), allow(unused_variables))]
-  fn configuration(
-    &self,
-    debug: &DebugDevices,
-  ) -> Result<(VirtualMachineConfiguration, std::io::PipeReader, std::io::PipeWriter)> {
+  fn configuration(&self, debug: &DebugDevices) -> Result<(VirtualMachineConfiguration, PipeReader, PipeWriter)> {
     let failed = Error::virtualization;
     let configuration = VirtualMachineConfiguration::new().map_err(failed("make a configuration"))?;
 
-    let platform = GenericPlatformConfiguration::new().map_err(failed("make a platform"))?;
-    let identifier = GenericMachineIdentifier::with_data_representation(&self.identifier)
-      .map_err(failed("read the machine identifier"))?
-      .ok_or_else(|| Error::Guest("the machine identifier did not parse".to_string()))?;
-    platform.set_machine_identifier(&identifier);
-    configuration.set_platform(&platform);
-
-    let boot_loader = EFIBootLoader::new().map_err(failed("make the EFI boot loader"))?;
-    let variables = EFIVariableStore::new(&url(&self.variables)?).map_err(failed("open the EFI variable store"))?;
-    boot_loader.set_variable_store(Some(&variables));
-    configuration.set_boot_loader(Some(&boot_loader));
+    configuration.set_platform(&self.platform()?);
+    configuration.set_boot_loader(Some(&self.boot_loader()?));
     configuration.set_cpu_count(isize::try_from(self.cpus).unwrap_or(isize::MAX));
     configuration.set_memory_size(self.memory);
 
-    let disk = DiskImageStorageDeviceAttachment::new(&url(&self.disk)?, false).map_err(failed("attach the disk"))?;
-    let disk = VirtioBlockDeviceConfiguration::new(&disk).map_err(failed("make the disk device"))?;
-    let seed = match &self.seed {
-      Some(seed) => {
-        let seed = DiskImageStorageDeviceAttachment::new(&url(seed)?, true).map_err(failed("attach the seed"))?;
-        Some(VirtioBlockDeviceConfiguration::new(&seed).map_err(failed("make the seed device"))?)
-      }
-      None => None,
-    };
-    let disks = self
-      .disks
+    let storage = self.storage_devices()?;
+    let storage: Vec<&dyn StorageDeviceConfiguration> = storage
       .iter()
-      .map(|disk| {
-        VirtioBlockDeviceConfiguration::validate_block_device_identifier(&disk.identifier)
-          .map_err(failed("check the disk's identifier"))?;
-        let attachment =
-          DiskImageStorageDeviceAttachment::new(&url(&disk.path)?, disk.read_only).map_err(failed("attach a disk"))?;
-        let device = VirtioBlockDeviceConfiguration::new(&attachment).map_err(failed("make a disk device"))?;
-        device.set_block_device_identifier(&disk.identifier);
-        Ok(device)
-      })
-      .collect::<Result<Vec<_>>>()?;
-    let mut storage: Vec<&dyn StorageDeviceConfiguration> = vec![&disk];
-    storage.extend(
-      seed
-        .as_ref()
-        .map(|seed| seed as &dyn StorageDeviceConfiguration),
-    );
-    storage.extend(
-      disks
-        .iter()
-        .map(|disk| disk as &dyn StorageDeviceConfiguration),
-    );
+      .map(|device| device as &dyn StorageDeviceConfiguration)
+      .collect();
     configuration.set_storage_devices(&storage);
 
-    let macs = self
-      .nat
-      .then_some(self.mac)
-      .into_iter()
-      .chain(self.interfaces.iter().copied());
-    let networks = macs
-      .map(|mac| {
-        let network = VirtioNetworkDeviceConfiguration::new().map_err(failed("make a network device"))?;
-        network.set_attachment(Some(&NATNetworkDeviceAttachment::new().map_err(failed("make NAT"))?));
-        network.set_mac_address(&MACAddress::new(mac).map_err(failed("set a MAC address"))?);
-        Ok(network)
-      })
-      .collect::<Result<Vec<_>>>()?;
+    let networks = self.network_devices()?;
     let networks: Vec<&dyn NetworkDeviceConfiguration> = networks
       .iter()
-      .map(|network| network as &dyn NetworkDeviceConfiguration)
+      .map(|device| device as &dyn NetworkDeviceConfiguration)
       .collect();
     configuration.set_network_devices(&networks);
 
-    // The agent's control channel is a single-port virtio console,
-    // `/dev/ttyV0.0` in the guest. A multiport console device would not work:
-    // when vtcon(4) attaches one under Virtualization, rc stalls and the guest
-    // never reaches networking.
-    let (output, guest_output) = std::io::pipe().map_err(Error::io("make the console's pipes"))?;
-    let (guest_input, input) = std::io::pipe().map_err(Error::io("make the console's pipes"))?;
-    let serial = VirtioConsoleDeviceSerialPortConfiguration::new().map_err(failed("make the console"))?;
-    serial.set_attachment(Some(
-      &FileHandleSerialPortAttachment::new(Some(OwnedFd::from(guest_input)), Some(OwnedFd::from(guest_output)))
-        .map_err(failed("attach the console"))?,
-    ));
+    let (serial, output, input) = console()?;
     configuration.set_serial_ports(&[&serial]);
 
-    let shares = self
-      .shares
-      .iter()
-      .map(|share| {
-        let directory =
-          SharedDirectory::new(&url(&share.path)?, share.read_only).map_err(failed("share the directory"))?;
-        let device =
-          VirtioFileSystemDeviceConfiguration::new(&share.tag).map_err(failed("make the virtio-fs device"))?;
-        device.set_share(Some(
-          &SingleDirectoryShare::new(&directory).map_err(failed("make the share"))?,
-        ));
-        Ok(device)
-      })
-      .collect::<Result<Vec<_>>>()?;
+    let shares = self.share_devices()?;
     let shares: Vec<&dyn DirectorySharingDeviceConfiguration> = shares
       .iter()
-      .map(|share| share as &dyn DirectorySharingDeviceConfiguration)
+      .map(|device| device as &dyn DirectorySharingDeviceConfiguration)
       .collect();
     configuration.set_directory_sharing_devices(&shares);
 
@@ -254,6 +180,84 @@ impl Layout {
       .map_err(failed("validate the configuration"))?;
 
     Ok((configuration, output, input))
+  }
+
+  /// The platform, with this guest's machine identifier.
+  fn platform(&self) -> Result<GenericPlatformConfiguration> {
+    let failed = Error::virtualization;
+    let platform = GenericPlatformConfiguration::new().map_err(failed("make a platform"))?;
+    let identifier = GenericMachineIdentifier::with_data_representation(&self.identifier)
+      .map_err(failed("read the machine identifier"))?
+      .ok_or_else(|| Error::Guest("the machine identifier did not parse".to_string()))?;
+
+    platform.set_machine_identifier(&identifier);
+    Ok(platform)
+  }
+
+  /// The EFI boot loader, with this guest's variable store.
+  fn boot_loader(&self) -> Result<EFIBootLoader> {
+    let failed = Error::virtualization;
+    let boot_loader = EFIBootLoader::new().map_err(failed("make the EFI boot loader"))?;
+    let variables = EFIVariableStore::new(&url(&self.variables)?).map_err(failed("open the EFI variable store"))?;
+
+    boot_loader.set_variable_store(Some(&variables));
+    Ok(boot_loader)
+  }
+
+  /// The disk, then the seed, then the other disks.
+  fn storage_devices(&self) -> Result<Vec<VirtioBlockDeviceConfiguration>> {
+    let mut devices = vec![block_device(&self.disk, false, "the disk")?];
+
+    if let Some(seed) = &self.seed {
+      devices.push(block_device(seed, true, "the seed")?);
+    }
+    for disk in &self.disks {
+      VirtioBlockDeviceConfiguration::validate_block_device_identifier(&disk.identifier)
+        .map_err(Error::virtualization("check the disk's identifier"))?;
+      let device = block_device(&disk.path, disk.read_only, "a disk")?;
+      device.set_block_device_identifier(&disk.identifier);
+      devices.push(device);
+    }
+    Ok(devices)
+  }
+
+  /// A NAT network device with `mac` if `nat` is set, then one for each of
+  /// `interfaces`.
+  fn network_devices(&self) -> Result<Vec<VirtioNetworkDeviceConfiguration>> {
+    let failed = Error::virtualization;
+
+    self
+      .nat
+      .then_some(self.mac)
+      .into_iter()
+      .chain(self.interfaces.iter().copied())
+      .map(|mac| {
+        let network = VirtioNetworkDeviceConfiguration::new().map_err(failed("make a network device"))?;
+        network.set_attachment(Some(&NATNetworkDeviceAttachment::new().map_err(failed("make NAT"))?));
+        network.set_mac_address(&MACAddress::new(mac).map_err(failed("set a MAC address"))?);
+        Ok(network)
+      })
+      .collect()
+  }
+
+  /// A virtio-fs device for each of `shares`.
+  fn share_devices(&self) -> Result<Vec<VirtioFileSystemDeviceConfiguration>> {
+    let failed = Error::virtualization;
+
+    self
+      .shares
+      .iter()
+      .map(|share| {
+        let directory =
+          SharedDirectory::new(&url(&share.path)?, share.read_only).map_err(failed("share the directory"))?;
+        let device =
+          VirtioFileSystemDeviceConfiguration::new(&share.tag).map_err(failed("make the virtio-fs device"))?;
+        device.set_share(Some(
+          &SingleDirectoryShare::new(&directory).map_err(failed("make the share"))?,
+        ));
+        Ok(device)
+      })
+      .collect()
   }
 
   /// Checks that Virtualization can save and restore this configuration.
@@ -291,6 +295,33 @@ impl Layout {
       queue,
     })
   }
+}
+
+/// A virtio block device for the disk image at `path`, named `what` in
+/// errors.
+fn block_device(path: &Path, read_only: bool, what: &str) -> Result<VirtioBlockDeviceConfiguration> {
+  let attachment = DiskImageStorageDeviceAttachment::new(&url(path)?, read_only)
+    .map_err(Error::virtualization(&format!("attach {what}")))?;
+
+  VirtioBlockDeviceConfiguration::new(&attachment).map_err(Error::virtualization(&format!("make {what} device")))
+}
+
+/// The agent's control channel, and the host's ends of it: the pipe to read
+/// the guest's output from and the pipe to write its input to. The channel is
+/// a single-port virtio console, `/dev/ttyV0.0` in the guest. A multiport
+/// console device would not work: when vtcon(4) attaches one under
+/// Virtualization, rc stalls and the guest never reaches networking.
+fn console() -> Result<(VirtioConsoleDeviceSerialPortConfiguration, PipeReader, PipeWriter)> {
+  let failed = Error::virtualization;
+  let (output, guest_output) = std::io::pipe().map_err(Error::io("make the console's pipes"))?;
+  let (guest_input, input) = std::io::pipe().map_err(Error::io("make the console's pipes"))?;
+  let serial = VirtioConsoleDeviceSerialPortConfiguration::new().map_err(failed("make the console"))?;
+
+  serial.set_attachment(Some(
+    &FileHandleSerialPortAttachment::new(Some(OwnedFd::from(guest_input)), Some(OwnedFd::from(guest_output)))
+      .map_err(failed("attach the console"))?,
+  ));
+  Ok((serial, output, input))
 }
 
 pub(crate) fn on_queue<T: Send>(queue: &DispatchQueue, work: impl FnOnce() -> T + Send) -> T {
