@@ -36,6 +36,7 @@
 //! channel closes the same way: the host's Eof stops the listener, and the
 //! agent's Eof confirms it. Error closes any channel.
 
+mod codec;
 pub mod frame;
 pub mod message;
 pub mod mux;

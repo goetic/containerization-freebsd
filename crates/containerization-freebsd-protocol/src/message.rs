@@ -1,10 +1,9 @@
 //! The messages that frames carry. A message is encoded as a frame's kind and
-//! payload.
-//!
-//! A payload is a sequence of little-endian integers and of strings prefixed
-//! with a u32 length, with no trailing bytes. The payload of Data, Stderr and
-//! Error is the raw bytes alone.
+//! a payload of its fields in order, encoded as `codec` describes, with no
+//! trailing bytes. An enum's variant is a u8 tag before its fields. The
+//! payload of Data, Stderr and Error is the raw bytes alone.
 
+use crate::codec::{Decode, Encode, Reader, Writer, encode};
 use crate::frame::Frame;
 use std::fmt;
 
@@ -227,134 +226,27 @@ impl Message {
   }
 
   pub fn frame(&self, channel: u32) -> Frame {
-    let mut payload = Writer::default();
-    let kind = match self {
-      Self::Hello { version, answer } => {
-        payload.u16(*version).u8(u8::from(*answer));
-        kind::HELLO
-      }
-      Self::Ping(number) => {
-        payload.u64(*number);
-        kind::PING
-      }
-      Self::Pong(number) => {
-        payload.u64(*number);
-        kind::PONG
-      }
-      Self::Received(bytes) => {
-        payload.u32(*bytes);
-        kind::RECEIVED
-      }
-      Self::SetTime { seconds, nanoseconds } => {
-        payload.u64(*seconds).u32(*nanoseconds);
-        kind::SET_TIME
-      }
-      Self::Exec(exec) => {
-        payload.strings(&exec.argv).u32(length(exec.env.len()));
-        for (name, value) in &exec.env {
-          payload.string(name).string(value);
-        }
-        match &exec.cwd {
-          Some(cwd) => payload.u8(1).string(cwd),
-          None => payload.u8(0),
-        };
-        match exec.pty {
-          Some(size) => payload.u8(1).window(size),
-          None => payload.u8(0),
-        };
-        match &exec.jail {
-          Some(jail) => payload.u8(1).string(jail),
-          None => payload.u8(0),
-        };
-        match &exec.user {
-          Some(user) => {
-            payload.u8(1).string(&user.name);
-            match &user.group {
-              Some(group) => payload.u8(1).string(group),
-              None => payload.u8(0),
-            };
-            payload.strings(&user.groups)
-          }
-          None => payload.u8(0),
-        };
-        match exec.umask {
-          Some(umask) => payload.u8(1).u16(umask),
-          None => payload.u8(0),
-        };
-        payload.u32(length(exec.limits.len()));
-        for limit in &exec.limits {
-          payload
-            .i32(limit.resource.0)
-            .u64(limit.soft)
-            .u64(limit.hard);
-        }
-        payload.u8(u8::from(exec.rescue));
-        kind::EXEC
-      }
-      Self::Connect(connect) => {
-        match &connect.to {
-          Address::Port(port) => payload.u8(0).u16(*port),
-          Address::Unix(path) => payload.u8(1).string(path),
-        };
-        match &connect.jail {
-          Some(jail) => payload.u8(1).string(jail),
-          None => payload.u8(0),
-        };
-        kind::CONNECT
-      }
-      Self::Listen(listen) => {
-        payload.string(&listen.path);
-        match &listen.jail {
-          Some(jail) => payload.u8(1).string(jail),
-          None => payload.u8(0),
-        };
-        match listen.mode {
-          Some(mode) => payload.u8(1).u16(mode),
-          None => payload.u8(0),
-        };
-        kind::LISTEN
-      }
-      Self::Accepted { listener } => {
-        payload.u32(*listener);
-        kind::ACCEPTED
-      }
-      Self::Opened => kind::OPENED,
-      Self::Data(bytes) => {
-        payload.0.extend_from_slice(bytes);
-        kind::DATA
-      }
-      Self::Stderr(bytes) => {
-        payload.0.extend_from_slice(bytes);
-        kind::STDERR
-      }
-      Self::Eof => kind::EOF,
-      Self::Resize(size) => {
-        payload.window(*size);
-        kind::RESIZE
-      }
-      Self::Signal(signal) => {
-        payload.i32(*signal);
-        kind::SIGNAL
-      }
-      Self::Exited(Exit::Code(code)) => {
-        payload.u8(0).i32(*code);
-        kind::EXITED
-      }
-      Self::Exited(Exit::Signal(signal)) => {
-        payload.u8(1).i32(*signal);
-        kind::EXITED
-      }
-      Self::Error(message) => {
-        payload.0.extend_from_slice(message.as_bytes());
-        kind::ERROR
-      }
+    let (kind, payload) = match self {
+      Self::Hello { version, answer } => (kind::HELLO, encode(&(*version, *answer))),
+      Self::Ping(number) => (kind::PING, encode(number)),
+      Self::Pong(number) => (kind::PONG, encode(number)),
+      Self::Received(bytes) => (kind::RECEIVED, encode(bytes)),
+      Self::SetTime { seconds, nanoseconds } => (kind::SET_TIME, encode(&(*seconds, *nanoseconds))),
+      Self::Exec(exec) => (kind::EXEC, encode(exec)),
+      Self::Connect(connect) => (kind::CONNECT, encode(connect)),
+      Self::Listen(listen) => (kind::LISTEN, encode(listen)),
+      Self::Accepted { listener } => (kind::ACCEPTED, encode(listener)),
+      Self::Opened => (kind::OPENED, Vec::new()),
+      Self::Data(bytes) => (kind::DATA, bytes.clone()),
+      Self::Stderr(bytes) => (kind::STDERR, bytes.clone()),
+      Self::Eof => (kind::EOF, Vec::new()),
+      Self::Resize(size) => (kind::RESIZE, encode(size)),
+      Self::Signal(signal) => (kind::SIGNAL, encode(signal)),
+      Self::Exited(exit) => (kind::EXITED, encode(exit)),
+      Self::Error(message) => (kind::ERROR, message.as_bytes().to_vec()),
     };
 
-    Frame {
-      channel,
-      kind,
-      payload: payload.0,
-    }
+    Frame { channel, kind, payload }
   }
 
   pub fn from_frame(frame: Frame) -> Result<Self, DecodeError> {
@@ -371,199 +263,182 @@ impl Message {
       _ => {}
     }
 
-    let mut reader = Reader(&payload);
-    let reader = &mut reader;
+    let mut reader = Reader::new(&payload);
     let message = match kind {
       kind::HELLO => Self::Hello {
-        version: reader.u16()?,
-        answer: reader.flag()?,
+        version: reader.get()?,
+        answer: reader.get()?,
       },
-      kind::PING => Self::Ping(reader.u64()?),
-      kind::PONG => Self::Pong(reader.u64()?),
-      kind::RECEIVED => Self::Received(reader.u32()?),
+      kind::PING => Self::Ping(reader.get()?),
+      kind::PONG => Self::Pong(reader.get()?),
+      kind::RECEIVED => Self::Received(reader.get()?),
       kind::SET_TIME => Self::SetTime {
-        seconds: reader.u64()?,
-        nanoseconds: reader.u32()?,
+        seconds: reader.get()?,
+        nanoseconds: reader.get()?,
       },
-      kind::EXEC => Self::Exec(Exec {
-        argv: reader.strings()?,
-        env: (0..reader.u32()?)
-          .map(|_| Ok((reader.string()?, reader.string()?)))
-          .collect::<Result<_, DecodeError>>()?,
-        cwd: reader.option(Reader::string)?,
-        pty: reader.option(Reader::window)?,
-        jail: reader.option(Reader::string)?,
-        user: reader.option(|reader| {
-          Ok(User {
-            name: reader.string()?,
-            group: reader.option(Reader::string)?,
-            groups: reader.strings()?,
-          })
-        })?,
-        umask: reader.option(Reader::u16)?,
-        limits: (0..reader.u32()?)
-          .map(|_| {
-            Ok(Limit {
-              resource: Resource(reader.i32()?),
-              soft: reader.u64()?,
-              hard: reader.u64()?,
-            })
-          })
-          .collect::<Result<_, DecodeError>>()?,
-        rescue: reader.flag()?,
-      }),
-      kind::CONNECT => Self::Connect(Connect {
-        to: match reader.u8()? {
-          0 => Address::Port(reader.u16()?),
-          1 => Address::Unix(reader.string()?),
-          tag => return Err(DecodeError::UnknownTag(tag)),
-        },
-        jail: reader.option(Reader::string)?,
-      }),
-      kind::LISTEN => Self::Listen(Listen {
-        path: reader.string()?,
-        jail: reader.option(Reader::string)?,
-        mode: reader.option(Reader::u16)?,
-      }),
+      kind::EXEC => Self::Exec(reader.get()?),
+      kind::CONNECT => Self::Connect(reader.get()?),
+      kind::LISTEN => Self::Listen(reader.get()?),
       kind::ACCEPTED => Self::Accepted {
-        listener: reader.u32()?,
+        listener: reader.get()?,
       },
       kind::OPENED => Self::Opened,
       kind::EOF => Self::Eof,
-      kind::RESIZE => Self::Resize(reader.window()?),
-      kind::SIGNAL => Self::Signal(reader.i32()?),
-      kind::EXITED => Self::Exited(match reader.u8()? {
-        0 => Exit::Code(reader.i32()?),
-        1 => Exit::Signal(reader.i32()?),
-        tag => return Err(DecodeError::UnknownTag(tag)),
-      }),
+      kind::RESIZE => Self::Resize(reader.get()?),
+      kind::SIGNAL => Self::Signal(reader.get()?),
+      kind::EXITED => Self::Exited(reader.get()?),
       kind => return Err(DecodeError::UnknownKind(kind)),
     };
 
-    if reader.0.is_empty() {
-      Ok(message)
-    } else {
-      Err(DecodeError::TooLong)
-    }
+    reader.finish()?;
+    Ok(message)
   }
 }
 
-/// Converts a length for the wire. A length that does not fit in a u32 also
-/// exceeds MAX_PAYLOAD, so the frame is refused before it is sent.
-fn length(length: usize) -> u32 {
-  u32::try_from(length).unwrap_or(u32::MAX)
-}
-
-#[derive(Default)]
-struct Writer(Vec<u8>);
-
-impl Writer {
-  fn u8(&mut self, value: u8) -> &mut Self {
-    self.0.push(value);
-    self
-  }
-
-  fn u16(&mut self, value: u16) -> &mut Self {
-    self.0.extend_from_slice(&value.to_le_bytes());
-    self
-  }
-
-  fn u32(&mut self, value: u32) -> &mut Self {
-    self.0.extend_from_slice(&value.to_le_bytes());
-    self
-  }
-
-  fn u64(&mut self, value: u64) -> &mut Self {
-    self.0.extend_from_slice(&value.to_le_bytes());
-    self
-  }
-
-  fn i32(&mut self, value: i32) -> &mut Self {
-    self.0.extend_from_slice(&value.to_le_bytes());
-    self
-  }
-
-  fn string(&mut self, value: &str) -> &mut Self {
-    self.u32(length(value.len()));
-    self.0.extend_from_slice(value.as_bytes());
-    self
-  }
-
-  fn strings(&mut self, values: &[String]) -> &mut Self {
-    self.u32(length(values.len()));
-    for value in values {
-      self.string(value);
-    }
-    self
-  }
-
-  fn window(&mut self, size: WindowSize) -> &mut Self {
-    self.u16(size.rows).u16(size.columns)
+impl Encode for Exec {
+  fn encode(&self, out: &mut Writer) {
+    out
+      .put(&self.argv)
+      .put(&self.env)
+      .put(&self.cwd)
+      .put(&self.pty)
+      .put(&self.jail)
+      .put(&self.user)
+      .put(&self.umask)
+      .put(&self.limits)
+      .put(&self.rescue);
   }
 }
 
-struct Reader<'a>(&'a [u8]);
-
-impl Reader<'_> {
-  fn take<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
-    let (taken, rest) = self.0.split_first_chunk().ok_or(DecodeError::Truncated)?;
-
-    self.0 = rest;
-    Ok(*taken)
-  }
-
-  fn u8(&mut self) -> Result<u8, DecodeError> {
-    self.take().map(u8::from_le_bytes)
-  }
-
-  fn u16(&mut self) -> Result<u16, DecodeError> {
-    self.take().map(u16::from_le_bytes)
-  }
-
-  fn u32(&mut self) -> Result<u32, DecodeError> {
-    self.take().map(u32::from_le_bytes)
-  }
-
-  fn u64(&mut self) -> Result<u64, DecodeError> {
-    self.take().map(u64::from_le_bytes)
-  }
-
-  fn i32(&mut self) -> Result<i32, DecodeError> {
-    self.take().map(i32::from_le_bytes)
-  }
-
-  fn string(&mut self) -> Result<String, DecodeError> {
-    let length = self.u32()? as usize;
-    if self.0.len() < length {
-      return Err(DecodeError::Truncated);
-    }
-    let (bytes, rest) = self.0.split_at(length);
-
-    self.0 = rest;
-    String::from_utf8(bytes.to_vec()).map_err(|_| DecodeError::NotUtf8)
-  }
-
-  fn strings(&mut self) -> Result<Vec<String>, DecodeError> {
-    (0..self.u32()?).map(|_| self.string()).collect()
-  }
-
-  fn window(&mut self) -> Result<WindowSize, DecodeError> {
-    Ok(WindowSize {
-      rows: self.u16()?,
-      columns: self.u16()?,
+impl Decode for Exec {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    Ok(Self {
+      argv: reader.get()?,
+      env: reader.get()?,
+      cwd: reader.get()?,
+      pty: reader.get()?,
+      jail: reader.get()?,
+      user: reader.get()?,
+      umask: reader.get()?,
+      limits: reader.get()?,
+      rescue: reader.get()?,
     })
   }
+}
 
-  fn flag(&mut self) -> Result<bool, DecodeError> {
-    match self.u8()? {
-      0 => Ok(false),
-      1 => Ok(true),
+impl Encode for User {
+  fn encode(&self, out: &mut Writer) {
+    out.put(&self.name).put(&self.group).put(&self.groups);
+  }
+}
+
+impl Decode for User {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    Ok(Self {
+      name: reader.get()?,
+      group: reader.get()?,
+      groups: reader.get()?,
+    })
+  }
+}
+
+impl Encode for Limit {
+  fn encode(&self, out: &mut Writer) {
+    out.put(&self.resource.0).put(&self.soft).put(&self.hard);
+  }
+}
+
+impl Decode for Limit {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    Ok(Self {
+      resource: Resource(reader.get()?),
+      soft: reader.get()?,
+      hard: reader.get()?,
+    })
+  }
+}
+
+impl Encode for Connect {
+  fn encode(&self, out: &mut Writer) {
+    out.put(&self.to).put(&self.jail);
+  }
+}
+
+impl Decode for Connect {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    Ok(Self {
+      to: reader.get()?,
+      jail: reader.get()?,
+    })
+  }
+}
+
+impl Encode for Address {
+  fn encode(&self, out: &mut Writer) {
+    match self {
+      Self::Port(port) => out.put(&0u8).put(port),
+      Self::Unix(path) => out.put(&1u8).put(path),
+    };
+  }
+}
+
+impl Decode for Address {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    match reader.get()? {
+      0u8 => Ok(Self::Port(reader.get()?)),
+      1 => Ok(Self::Unix(reader.get()?)),
       tag => Err(DecodeError::UnknownTag(tag)),
     }
   }
+}
 
-  fn option<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, DecodeError>) -> Result<Option<T>, DecodeError> {
-    if self.flag()? { read(self).map(Some) } else { Ok(None) }
+impl Encode for Listen {
+  fn encode(&self, out: &mut Writer) {
+    out.put(&self.path).put(&self.jail).put(&self.mode);
+  }
+}
+
+impl Decode for Listen {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    Ok(Self {
+      path: reader.get()?,
+      jail: reader.get()?,
+      mode: reader.get()?,
+    })
+  }
+}
+
+impl Encode for WindowSize {
+  fn encode(&self, out: &mut Writer) {
+    out.put(&self.rows).put(&self.columns);
+  }
+}
+
+impl Decode for WindowSize {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    Ok(Self {
+      rows: reader.get()?,
+      columns: reader.get()?,
+    })
+  }
+}
+
+impl Encode for Exit {
+  fn encode(&self, out: &mut Writer) {
+    match self {
+      Self::Code(code) => out.put(&0u8).put(code),
+      Self::Signal(signal) => out.put(&1u8).put(signal),
+    };
+  }
+}
+
+impl Decode for Exit {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    match reader.get()? {
+      0u8 => Ok(Self::Code(reader.get()?)),
+      1 => Ok(Self::Signal(reader.get()?)),
+      tag => Err(DecodeError::UnknownTag(tag)),
+    }
   }
 }
 
@@ -662,6 +537,71 @@ mod tests {
     for message in messages {
       assert_eq!(Message::from_frame(message.frame(5)), Ok(message));
     }
+  }
+
+  /// Agents in released guest bundles decode these bytes.
+  #[test]
+  fn keeps_its_wire_format() {
+    let exec = Message::Exec(Exec {
+      argv: vec!["sh".into()],
+      env: vec![("A".into(), "b".into())],
+      cwd: Some("/".into()),
+      pty: Some(WindowSize { rows: 24, columns: 80 }),
+      jail: None,
+      user: Some(User {
+        name: "u".into(),
+        group: None,
+        groups: vec!["g".into()],
+      }),
+      umask: Some(0o022),
+      limits: vec![Limit {
+        resource: Resource::CPU,
+        soft: 1,
+        hard: 2,
+      }],
+      rescue: true,
+    });
+    let encoded: &[&[u8]] = &[
+      &[1, 0, 0, 0, 2, 0, 0, 0],
+      b"sh",
+      &[1, 0, 0, 0, 1, 0, 0, 0],
+      b"A",
+      &[1, 0, 0, 0],
+      b"b",
+      &[1, 1, 0, 0, 0],
+      b"/",
+      &[1, 24, 0, 80, 0],
+      &[0],
+      &[1, 1, 0, 0, 0],
+      b"u",
+      &[0, 1, 0, 0, 0, 1, 0, 0, 0],
+      b"g",
+      &[1, 0o022, 0],
+      &[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+      &[1],
+    ];
+    let listen = Message::Listen(Listen {
+      path: "/s".into(),
+      jail: Some("j".into()),
+      mode: None,
+    });
+
+    assert_eq!(exec.frame(0).payload, encoded.concat());
+    assert_eq!(
+      listen.frame(0).payload,
+      [&[2, 0, 0, 0][..], b"/s", &[1, 1, 0, 0, 0], b"j", &[0]].concat()
+    );
+    let connect = Message::Connect(Connect {
+      to: Address::Port(80),
+      jail: None,
+    });
+    assert_eq!(connect.frame(0).payload, [0, 80, 0, 0]);
+    let hello = Message::Hello {
+      version: 2,
+      answer: true,
+    };
+    assert_eq!(hello.frame(0).payload, [2, 0, 1]);
+    assert_eq!(Message::Exited(Exit::Signal(9)).frame(0).payload, [1, 9, 0, 0, 0]);
   }
 
   #[test]
