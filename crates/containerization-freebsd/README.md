@@ -11,4 +11,4 @@ project's [README] covers the guest additions.
   reaches the console. Off by default, because the device breaks save
   (`VZErrorDomain` 11).
   
-[README](https://github.com/goetic/containerization-freebsd/README.md)
+[README]: https://github.com/goetic/containerization-freebsd/README.md

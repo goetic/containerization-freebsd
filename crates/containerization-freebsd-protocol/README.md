@@ -7,4 +7,4 @@ describe the session. The project's [README] describes its usage.
 The crate has no dependencies because the agent also builds it for
 `aarch64-unknown-freebsd`, a Tier 3 target.
 
-[README](https://github.com/goetic/containerization-freebsd/README.md)
+[README]: https://github.com/goetic/containerization-freebsd/README.md
