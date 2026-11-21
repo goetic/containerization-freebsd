@@ -4,28 +4,30 @@ use std::path::PathBuf;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-  /// A host tool (`curl`, `hdiutil`, `diskutil`, `cp`, `tar`) failed.
+  /// A host tool (`curl`, `shasum`, `hdiutil`, `diskutil`, `cp`, `tar`)
+  /// failed, or a registry answered with an HTTP error.
   Command {
     command: String,
     failure: String,
   },
-  /// A download's sha256 differs from the one published for it.
+  /// A download's sha256 differs from the published one.
   Checksum {
     path: PathBuf,
     actual: String,
     expected: String,
   },
-  /// The guest behaved unexpectedly.
+  /// The guest, Virtualization, a host tool or a registry returned something
+  /// unexpected.
   Guest(String),
-  /// The request is invalid, such as a jail id FreeBSD does not accept, or
-  /// starting a container twice.
+  /// An invalid request, such as an id jail(8) rejects, or starting a
+  /// container twice.
   Invalid(String),
   Io {
     action: String,
     error: std::io::Error,
   },
-  /// The guest agent's session ended, for example because the guest rebooted,
-  /// while the operation the message names was waiting on it.
+  /// The guest agent's session ended, as on a guest reboot, while the named
+  /// operation waited on it.
   SessionEnded(String),
   Timeout(String),
   Virtualization {

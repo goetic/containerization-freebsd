@@ -1,5 +1,5 @@
-//! Configures a FreeBSD guest's virtual machine and drives it: start, pause,
-//! save, restore, and shut down.
+//! A guest's Virtualization.framework configuration and VM lifecycle: start,
+//! pause, save, restore and shutdown.
 
 use crate::agent::Agent;
 use crate::clock::ClockSync;
@@ -24,18 +24,18 @@ use virtualization::{
 };
 
 /// Tunables for `/efi/freebsd/loader.env`. Apple's virtio-net rejects the
-/// checksum offload and multiqueue features that vtnet(4) requests, and vtnet
-/// then fails to attach ("desired features were not accepted"). The first two
-/// tunables stop vtnet requesting them. The third turns on the kernel's
-/// resource accounting, which jail limits and statistics need.
+/// checksum offload and multiqueue features vtnet(4) negotiates, and vtnet then
+/// fails to attach ("desired features were not accepted"); the first two
+/// tunables stop it requesting them. `kern.racct.enable` turns on the resource
+/// accounting that rctl limits and jail statistics need.
 pub const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\nkern.racct.enable=1\n";
 
-/// A host directory the guest mounts with `Machine::mount_share`.
+/// A host directory exported over virtio-fs and mounted in the guest with
+/// `Machine::mount_share`.
 ///
-/// On a case-insensitive volume, which is macOS's default, names that differ
-/// only in case refer to one file. FreeBSD's base system has such pairs, like
-/// `/usr/bin/cc` and `CC`, so a FreeBSD tree extracted onto such a share loses
-/// one file of each pair.
+/// On a case-insensitive volume (macOS's default), names differing only in
+/// case are one file. FreeBSD's base has such pairs, like `/usr/bin/cc` and
+/// `CC`, so a base tree extracted onto such a share loses one of each pair.
 #[derive(Clone, Debug)]
 pub struct Share {
   pub tag: String,
@@ -43,12 +43,13 @@ pub struct Share {
   pub read_only: bool,
 }
 
-/// A raw disk image attached after the root disk, such as one holding a pool
-/// of images. `Machine::disk_device` finds the disk's device in the guest.
+/// A raw disk image attached after the root disk, such as one holding a ZFS
+/// pool of images. `Machine::disk_device` finds its guest device.
 #[derive(Clone, Debug)]
 pub struct Disk {
   pub path: PathBuf,
-  /// At most 20 ASCII bytes, as Virtualization requires.
+  /// The virtio-blk serial, which the guest reports as the disk's ident: at
+  /// most 20 ASCII bytes.
   pub identifier: String,
   pub read_only: bool,
 }
@@ -59,7 +60,7 @@ pub struct Layout {
   pub cpus: usize,
   pub disk: PathBuf,
   pub memory: u64,
-  /// Whether the guest gets NAT networking through the Mac.
+  /// Attach a NAT network device with `mac`, as `vtnet0`.
   pub nat: bool,
   /// A read-only volume attached after the disk, such as a NoCloud seed.
   pub seed: Option<PathBuf>,
@@ -69,11 +70,11 @@ pub struct Layout {
   pub variables: PathBuf,
   pub identifier: Vec<u8>,
   pub mac: [u8; 6],
-  /// MAC addresses of extra NAT network devices for jails' interfaces
-  /// (`Network::Interfaces`). Each device moves into the jail that names it.
-  /// They are listed here because Virtualization cannot add devices to a
-  /// running machine. The guest runs DHCP only on `vtnet0`, which is the
-  /// `nat` device, or the first of these when `nat` is off.
+  /// MACs of extra NAT network devices for jails' interfaces
+  /// (`Network::Interfaces`); each moves into the VNET jail that names it.
+  /// They're declared up front because Virtualization can't hot-add devices.
+  /// The guest runs DHCP only on `vtnet0`: the `nat` device, or the first of
+  /// these when `nat` is off.
   pub interfaces: Vec<[u8; 6]>,
 }
 
@@ -99,9 +100,9 @@ fn url(path: &Path) -> Result<Url> {
 }
 
 impl Layout {
-  /// Returns a layout for a guest's first boot from `disk`, with a new machine
-  /// identifier, MAC address, and EFI variable store in `directory`. It has 4
-  /// CPUs and 4 GiB of memory, and no network, seed, or shares.
+  /// A first-boot layout for `disk`: a new machine identifier, a random
+  /// locally administered MAC, and a fresh EFI variable store in `directory`;
+  /// 4 CPUs, 4 GiB, and no NAT, seed, extra disks, shares or interfaces.
   pub fn first(directory: &Path, disk: PathBuf) -> Result<Self> {
     let variables = directory.join("efi-variables");
     let _ = std::fs::remove_file(&variables);
@@ -171,9 +172,9 @@ impl Layout {
       .configuration()
       .map_err(failed("make the memory device"))?]);
 
-    // The machine has no graphics device, because FreeBSD hangs attaching
-    // vtgpu(4); no entropy device, which is suspected of stalling rc; and no
-    // USB, because Apple's xHCI is reported to abort the VM under xhci(4).
+    // No graphics device: FreeBSD hangs attaching vtgpu(4). No entropy
+    // device: suspected of stalling rc. No USB: Apple's xHCI reportedly aborts
+    // the VM under xhci(4).
 
     configuration
       .validate()
@@ -182,7 +183,6 @@ impl Layout {
     Ok((configuration, output, input))
   }
 
-  /// The platform, with this guest's machine identifier.
   fn platform(&self) -> Result<GenericPlatformConfiguration> {
     let failed = Error::virtualization;
     let platform = GenericPlatformConfiguration::new().map_err(failed("make a platform"))?;
@@ -194,7 +194,6 @@ impl Layout {
     Ok(platform)
   }
 
-  /// The EFI boot loader, with this guest's variable store.
   fn boot_loader(&self) -> Result<EFIBootLoader> {
     let failed = Error::virtualization;
     let boot_loader = EFIBootLoader::new().map_err(failed("make the EFI boot loader"))?;
@@ -240,7 +239,6 @@ impl Layout {
       .collect()
   }
 
-  /// A virtio-fs device for each of `shares`.
   fn share_devices(&self) -> Result<Vec<VirtioFileSystemDeviceConfiguration>> {
     let failed = Error::virtualization;
 
@@ -297,7 +295,7 @@ impl Layout {
   }
 }
 
-/// A virtio block device for the disk image at `path`, named `what` in
+/// A virtio-blk device for the disk image at `path`; `what` names it in
 /// errors.
 fn block_device(path: &Path, read_only: bool, what: &str) -> Result<VirtioBlockDeviceConfiguration> {
   let attachment = DiskImageStorageDeviceAttachment::new(&url(path)?, read_only)
@@ -306,11 +304,10 @@ fn block_device(path: &Path, read_only: bool, what: &str) -> Result<VirtioBlockD
   VirtioBlockDeviceConfiguration::new(&attachment).map_err(Error::virtualization(&format!("make {what} device")))
 }
 
-/// The agent's control channel, and the host's ends of it: the pipe to read
-/// the guest's output from and the pipe to write its input to. The channel is
-/// a single-port virtio console, `/dev/ttyV0.0` in the guest. A multiport
-/// console device would not work: when vtcon(4) attaches one under
-/// Virtualization, rc stalls and the guest never reaches networking.
+/// The agent's channel, a single-port virtio console (`/dev/ttyV0.0` in the
+/// guest), and the host's pipe ends for its output and input. Not multiport:
+/// when vtcon(4) attaches a multiport console under Virtualization, rc stalls
+/// before networking.
 fn console() -> Result<(VirtioConsoleDeviceSerialPortConfiguration, PipeReader, PipeWriter)> {
   let failed = Error::virtualization;
   let (output, guest_output) = std::io::pipe().map_err(Error::io("make the console's pipes"))?;
@@ -335,8 +332,8 @@ pub(crate) fn on_queue<T: Send>(queue: &DispatchQueue, work: impl FnOnce() -> T 
 type Done = Box<dyn FnOnce(Result<(), virtualization::Error>) + Send>;
 
 impl Machine {
-  /// Calls `operation` on the machine's queue with a completion handler, waits
-  /// for the handler, and returns the elapsed seconds.
+  /// Runs `operation` on the machine's queue, waits for its completion
+  /// handler, and returns the elapsed seconds.
   fn completed(
     &self,
     action: &str,
@@ -392,21 +389,21 @@ impl Machine {
     Ok(seconds)
   }
 
-  /// Stops the machine immediately, like pulling its power plug.
-  pub fn stop(&self) -> Result<f64> {
+  /// Stops the VM without a guest shutdown, like pulling its power.
+  pub fn force_stop(&self) -> Result<f64> {
     self.completed("stop", |machine, done| {
       machine.stop(done);
       Ok(())
     })
   }
 
-  /// Unmounts the guest's shares, pauses the machine, and saves its state to
-  /// `path`. The machine stays paused. This fails if a share is in use. Mount
-  /// the shares again after restoring.
+  /// Unmounts the guest's virtio-fs shares, pauses, and saves the machine's
+  /// state to `path`, leaving it paused. Fails if a share is busy. Remount the
+  /// shares after restoring.
   ///
-  /// Shares are unmounted because a share mounted across a save goes stale:
-  /// the host's virtio-fs server restarts with the restored machine and
-  /// forgets the files the guest cached, so each cached file fails once.
+  /// A share mounted across a save goes stale: the host's virtio-fs server
+  /// restarts with the restored machine and forgets the files the guest
+  /// cached, so each cached file fails once.
   pub fn save(&self, path: &Path) -> Result<f64> {
     let started = Instant::now();
     let url = url(path)?;
@@ -421,9 +418,9 @@ impl Machine {
     Ok(started.elapsed().as_secs_f64())
   }
 
-  /// Returns the guest's device for the disk with `identifier`, such as
-  /// `/dev/vtbd1`. The device is found by searching because the image turns
-  /// off the `/dev/diskid` labels that would otherwise name it.
+  /// Returns the guest device of the disk with `identifier`, such as
+  /// `/dev/vtbd1`. It scans `kern.disks` because the image disables the
+  /// `/dev/diskid` labels that would otherwise name it.
   pub fn disk_device(&self, identifier: &str) -> Result<String> {
     let ran = self
       .agent
@@ -447,9 +444,8 @@ impl Machine {
   }
 
   /// Restores a state written by `save` into this machine, which must have the
-  /// same layout and must not have started. The machine stays paused. When it
-  /// resumes, the guest's agent answers the Hello that this machine has
-  /// already sent.
+  /// same layout and not have started. The machine stays paused; on resume,
+  /// the guest's agent answers the Hello this sends.
   pub fn restore(&self, path: &Path) -> Result<f64> {
     let url = url(path)?;
 
@@ -468,9 +464,9 @@ impl Machine {
   }
 
   /// Waits for a session with the guest's agent and returns the elapsed
-  /// seconds. With NAT, it also waits for the default route and its
-  /// interface's link, because rc sets up the route after starting the agent,
-  /// and a restored machine's link comes up after the agent answers.
+  /// seconds. With NAT, also waits for the default route and its interface's
+  /// link: rc adds the route after starting the agent, and a restored
+  /// machine's link comes up after the agent answers.
   pub fn wait_ready(&self, timeout: Duration) -> Result<f64> {
     let started = Instant::now();
 
@@ -516,8 +512,8 @@ impl Machine {
     )))
   }
 
-  /// Returns the kernel's messages so far, read from guest memory, or the
-  /// reason they could not be read.
+  /// Returns the kernel message buffer, read from guest RAM, or why it
+  /// couldn't be read.
   #[cfg(feature = "kernel-messages")]
   pub fn kernel_messages(&self) -> Result<String, String> {
     self.debug.memory.kernel_messages()

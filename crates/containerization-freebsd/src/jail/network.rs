@@ -1,5 +1,5 @@
-//! How jails reach the network: not at all, through the guest's stack, by NAT
-//! from a bridge in the guest, or on interfaces of their own.
+//! Jail networking: none, the guest's stack, VNET behind pf NAT on a guest
+//! bridge, or VNET on dedicated Virtualization NAT devices.
 
 use super::{Jail, QUICK};
 use crate::agent::Agent;
@@ -8,48 +8,44 @@ use crate::scripts;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-/// The bridge that NAT jails attach to, and its address, which is the jails'
-/// gateway.
+/// The bridge NAT jails' epairs join, and its address, the jails' default
+/// gateway. `scripts/nat.sh` hard-codes both too.
 const BRIDGE: &str = "cfbsd0";
 const GATEWAY: &str = "10.66.0.1";
 
 /// How a jail reaches the network.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Network {
-  /// The jail has no network.
   None,
-  /// The jail shares the guest's network stack and addresses.
+  /// The guest's network stack and addresses (`ip4=inherit`, `ip6=inherit`).
   #[default]
   Inherit,
-  /// The jail has its own stack (VNET) and address on a bridge in the guest,
-  /// and pf translates its traffic to the guest's address. This requires the
-  /// machine's NAT (`Layout::nat`).
+  /// A VNET jail on an epair to a guest bridge, with pf NAT to the guest's
+  /// address. Requires the machine's NAT (`Layout::nat`).
   Nat,
-  /// The jail has its own stack with these interfaces, like
-  /// Containerization's `interfaces`. The host reaches the jail at their
-  /// addresses.
+  /// A VNET jail with these interfaces, like Containerization's
+  /// `interfaces`. The host reaches the jail at their addresses.
   Interfaces(Vec<Interface>),
 }
 
-/// A jail's interface on Virtualization's NAT network, which the host is also
+/// A jail interface on Virtualization's NAT network, which the host is also
 /// on, like Containerization's `NATInterface`. It is one of the machine's
-/// spare network devices (`Layout::interfaces`), and only that jail sees it.
+/// spare network devices (`Layout::interfaces`), moved into the jail's vnet.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Interface {
   /// The device's MAC address.
   pub mac: [u8; 6],
-  /// The IPv4 address and prefix length, such as `192.168.64.3/24`. The
-  /// NAT's DHCP server leases from the same network, so choose an address it
-  /// has not leased, or use one it leased with `Interface::leased`.
+  /// IPv4 address and prefix length, such as `192.168.64.3/24`. The NAT's
+  /// DHCP server leases from the same subnet, so pick an address it hasn't
+  /// leased, or get a leased one from `Interface::leased`.
   pub address: String,
   /// The default route's gateway, such as `192.168.64.1`, if any.
   pub gateway: Option<String>,
 }
 
 impl Network {
-  /// The jail(8) parameters that put a new jail on this network. For NAT, it
-  /// first sets up NAT in the guest and makes the jail's epair, which it also
-  /// returns.
+  /// The jail(8) parameters for this network. For `Nat`, first sets up NAT in
+  /// the guest and creates the jail's epair, which it also returns.
   pub(super) fn parameters(&self, agent: &Agent) -> Result<(Vec<String>, Option<Epair>)> {
     Ok(match self {
       Self::None => (Vec::new(), None),
@@ -65,12 +61,11 @@ impl Network {
 }
 
 impl Interface {
-  /// Returns an interface on the spare device with MAC address `mac`, using
-  /// the address the NAT's DHCP server leases to it and the lease's router as
-  /// the gateway. The server gives that address to no other machine while the
-  /// lease lasts. Nothing renews the lease, but the server leases the same
-  /// address to the same MAC address again. Call this before a jail claims
-  /// the device.
+  /// An interface on the spare device with MAC `mac`, using the address the
+  /// NAT's DHCP server leases it and the lease's first router as gateway.
+  /// The server gives that address to no other machine while the lease lasts.
+  /// Nothing renews the lease, but the server leases the same address to the
+  /// same MAC again. Call this before a jail claims the device.
   pub fn leased(agent: &Agent, mac: [u8; 6]) -> Result<Self> {
     let colons = colons(mac);
     let ran = agent.check(&scripts::LEASE.argv(&[&colons]), LEASING)?;
@@ -112,8 +107,9 @@ fn lease(leases: &str) -> Option<(String, Option<String>)> {
 }
 
 impl Jail<'_> {
-  /// Configures a new jail's network: the inside end of `epair` for a NAT
-  /// jail, or its interfaces, and the resolver for any jail with a network.
+  /// Configures a new jail's network: lo0 and the epair's b end for `Nat`,
+  /// lo0 and the claimed devices for `Interfaces`, and resolv.conf for any
+  /// networked jail.
   pub(super) fn configure(&self, path: &str, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
       let (inside, address) = (format!("{}b", epair.name), format!("{}/16", epair.address));
@@ -135,7 +131,9 @@ impl Jail<'_> {
       }
     }
     if *network != Network::None {
-      self.agent.check(&scripts::RESOLVER.argv(&[path]), QUICK)?;
+      self
+        .agent
+        .check(&scripts::COPY_RESOLV_CONF.argv(&[path]), QUICK)?;
     }
     Ok(())
   }
@@ -173,9 +171,9 @@ fn epair(agent: &Agent) -> Result<Epair> {
   Ok(Epair { name, address })
 }
 
-/// Returns the address for the jail on `epair<unit>`. FreeBSD never gives two
-/// live epairs the same unit, so no two NAT jails share an address. Addresses
-/// start after `GATEWAY`, which is 10.66.0.1.
+/// The address for the jail on `epair<unit>`: 10.66.0.0/16 at offset unit + 2,
+/// so addresses start after `GATEWAY`. FreeBSD never gives two live epairs
+/// the same unit, so no two NAT jails share an address.
 fn address(epair: &str) -> Option<String> {
   let index = epair.strip_prefix("epair")?.parse::<u32>().ok()? + 2;
 

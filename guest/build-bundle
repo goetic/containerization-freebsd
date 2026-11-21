@@ -8,7 +8,8 @@
 # Writes freebsd-15.1-arm64-guest-<revision>.tar.xz and its .sha256 to
 # <out-dir>. The tarball's paths are the guest's paths, so
 # `tar -xf <tarball> -C /` installs it. The output is reproducible: names are
-# sorted, owners are root and times are zero. Requires GNU tar.
+# sorted, owners are root, times are zero and xz runs single-threaded.
+# Requires GNU tar.
 
 set -eu
 

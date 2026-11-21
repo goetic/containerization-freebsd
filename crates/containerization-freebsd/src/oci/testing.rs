@@ -1,7 +1,7 @@
-//! A loopback OCI registry for tests. It accepts pushes and serves pulls for
-//! any repository behind bearer tokens, as ghcr.io does. Each token covers
-//! one repository: GET and HEAD accept a pull or push token; POST and PUT
-//! need push. Blob requests redirect to a storage path outside the API, as
+//! A loopback registry for tests, serving pulls and pushes for any
+//! repository. Like ghcr.io, it requires a bearer token scoped to the
+//! repository: GET and HEAD accept pull or push, POST and PUT need push. Blob
+//! GETs and HEADs redirect to unauthenticated storage outside the API, as
 //! real registries often do.
 
 use super::sha256_digest;
@@ -12,16 +12,16 @@ use url::Url;
 
 #[derive(Default)]
 pub(crate) struct FakeRegistry {
-  /// Manifests and indexes, with their media types, by `repository/target`.
+  /// Media type and bytes by `<repository>/<tag or digest>`.
   manifests: HashMap<String, (String, Vec<u8>)>,
-  /// Blobs by digest, shared by every repository.
+  /// By digest, shared by every repository.
   blobs: HashMap<String, Vec<u8>>,
   uploads: u32,
 }
 
 impl FakeRegistry {
-  /// Adds the manifest or index `bytes` to `repository`, under `target` and
-  /// under its digest, as a push would.
+  /// Adds the manifest or index `bytes` under both `target` and its digest,
+  /// as a push would.
   pub(crate) fn manifest(mut self, repository: &str, target: &str, media_type: &str, bytes: &[u8]) -> Self {
     self.put_manifest(repository, target, media_type, bytes.to_vec());
     self
@@ -32,7 +32,7 @@ impl FakeRegistry {
     self
   }
 
-  /// Serves the registry on a thread and returns its address.
+  /// Serves on a thread and returns the `host:port`.
   pub(crate) fn serve(mut self) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -113,8 +113,8 @@ impl FakeRegistry {
   }
 }
 
-/// Grants a token for scope `repository:<name>:<actions>`, naming the
-/// repository and whether it may push.
+/// Grants a token `<push|pull>:<repository>` for the scope
+/// `repository:<repository>:<actions>`.
 fn token(request: &Request) -> Response {
   let scope = request.query("scope").unwrap_or_default();
   let Some((repository, actions)) = scope
@@ -139,7 +139,6 @@ fn found(found: Option<(&str, &Vec<u8>)>) -> Response {
   }
 }
 
-/// What a request's path names.
 enum Route {
   Token,
   Storage {
@@ -149,7 +148,7 @@ enum Route {
     repository: String,
     target: String,
   },
-  /// Where a blob upload starts.
+  /// Where a POST opens an upload session.
   Uploads {
     repository: String,
   },
@@ -251,7 +250,7 @@ impl Request {
       .map(|(_, value)| value.into_owned())
   }
 
-  /// Whether the request's token grants it access to `repository`.
+  /// Whether the bearer token's scope covers this method on `repository`.
   fn allowed(&self, repository: &str) -> bool {
     let Some((action, granted)) = self
       .headers
@@ -293,7 +292,7 @@ impl Response {
     self
   }
 
-  /// Writes the response, omitting the body if `head`.
+  /// Omits the body if `head`.
   fn write(&self, stream: &mut TcpStream, head: bool) -> io::Result<()> {
     write!(stream, "HTTP/1.1 {}\r\n", self.status)?;
     for (name, value) in &self.headers {

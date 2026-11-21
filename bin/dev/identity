@@ -1,10 +1,8 @@
 #!/usr/bin/env sh
 #
-# Prints the hash of the codesigning identity that belongs to a team id.
-#
-# `codesign --sign` matches on the certificate's common name, which does not
-# hold the team id; the team id is in the OU. So this script reads each
-# certificate's subject.
+# Prints the hash of the codesigning identity whose certificate's subject OU
+# is the given team id. `codesign --sign` can't select by team: it matches
+# names against the CN, which doesn't hold the team id.
 
 set -e
 

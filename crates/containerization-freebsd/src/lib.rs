@@ -1,8 +1,7 @@
-//! Runs FreeBSD virtual machines on macOS with Apple's Virtualization
-//! framework. Each machine boots the stock FreeBSD VM image through UEFI from
-//! a copy-on-write clone and can share host directories over virtio-fs. The
-//! crate also manages ZFS datasets, jails, and containers in the guest;
-//! containers may come from OCI images.
+//! FreeBSD guests on macOS through Virtualization.framework. Each machine
+//! boots the stock FreeBSD VM image via UEFI from an APFS copy-on-write clone
+//! and can mount host directories over virtio-fs. In the guest, the crate
+//! manages ZFS datasets, jails, and containers, optionally from OCI images.
 
 pub mod agent;
 pub mod build;

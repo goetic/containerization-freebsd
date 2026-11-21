@@ -1,7 +1,7 @@
 //! The channels the host opens with the agent: processes, relays and
 //! listeners, each over a stream of the agent's messages.
 
-use super::OPENING;
+use super::AGENT_TIMEOUT;
 use super::session::Shared;
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{Exit, Message, WINDOW, WindowSize};
@@ -169,14 +169,14 @@ impl Listener {
     }
 
     loop {
-      match self.stream.recv(Some(OPENING))? {
+      match self.stream.recv(Some(AGENT_TIMEOUT))? {
         Some(Message::Eof) => return Ok(()),
         Some(_) => {}
         None => {
           return Err(Error::Timeout(format!(
             "{}: the agent did not close it within {}s",
             self.stream.what,
-            OPENING.as_secs()
+            AGENT_TIMEOUT.as_secs()
           )));
         }
       }
@@ -210,7 +210,7 @@ impl Stream {
 
   /// Waits for the agent to send Opened on the new channel.
   pub(super) fn opened(self) -> Result<Self> {
-    match self.recv(Some(OPENING))? {
+    match self.recv(Some(AGENT_TIMEOUT))? {
       Some(Message::Opened) => Ok(self),
       Some(other) => Err(Error::Guest(format!(
         "{}: the agent sent {} before opened",
@@ -220,7 +220,7 @@ impl Stream {
       None => Err(Error::Timeout(format!(
         "{}: the agent did not open it within {}s",
         self.what,
-        OPENING.as_secs()
+        AGENT_TIMEOUT.as_secs()
       ))),
     }
   }

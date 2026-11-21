@@ -4,7 +4,7 @@ use crate::check;
 use std::io;
 use std::mem::MaybeUninit;
 
-/// Sends `signal` to `target`: a pid, or a process group's id negated.
+/// Sends `signal` to `target`: a pid, or a negated process group id.
 pub fn signal(target: libc::pid_t, signal: i32) -> io::Result<()> {
   // SAFETY: kill touches no memory.
   check(unsafe { libc::kill(target, signal) })?;
@@ -34,7 +34,7 @@ pub fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
   }
 }
 
-/// Waits for `pid` to exit, reaps it, and returns its status.
+/// Waits for `pid` to exit, reaps it, and returns its wait status.
 pub(crate) fn reap(pid: libc::pid_t) -> io::Result<libc::c_int> {
   let mut status = 0;
 

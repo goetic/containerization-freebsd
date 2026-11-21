@@ -1,8 +1,7 @@
 #!/bin/sh
-# Applies the layer tarball $2, whose sha256 must be $3, to the root $1.
-# Whiteouts delete files from the layers beneath, so they are applied before
-# the layer's own files are extracted. A whiteout that resolves outside the
-# root is an error.
+# Applies the OCI layer tarball $2, whose sha256 must be $3, to the root $1.
+# Whiteouts delete from the layers beneath, so they go before extraction. A
+# whiteout resolving outside the root is an error.
 set -e
 root=$(realpath -- "$1")
 layer=$2

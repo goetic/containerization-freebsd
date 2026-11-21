@@ -9,9 +9,12 @@
 - A guest agent, installed with the base as part of the guest bundle, over
   the virtio console: runs commands on pipes or in a terminal, with input,
   signals and resizing; relays TCP ports and Unix sockets; and keeps the
-  guest's clock with the host's.
+  guest's clock in step with the host's.
 - Mounts shared host directories in the guest through virtiofs, with
-  patches of our own to FreeBSD 15.1's modules.
+  FreeBSD 15.1's modules built from upstream's virtiofs patch plus two of
+  our own: the module Makefile's missing vnode_if.h, and re-enabling the
+  virtqueue interrupts that unmounting turns off, so a share can be mounted
+  again in the same boot.
 - Attaches extra disks, found in the guest by their identifiers.
 - ZFS in the guest: pools, datasets, snapshots and clones, including under
   the pool of FreeBSD's VM image.

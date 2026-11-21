@@ -18,7 +18,8 @@ does over the console.
   queue by its speed. After each read, the agent sends Received with the
   number of bytes read, so the host may send that many more.
 - **Sessions:** the agent announces itself at startup and after losing frames.
-  A new session kills the process groups of the old session's channels.
+  A new session ends the old session's channels, killing their process
+  groups.
 - **Clock:** SetTime sets the guest's clock, like `vminitd`'s setTime. The
   host sends it at each new session and every 30 seconds.
 - **Exec:** the given environment is added to the agent's own. Signal and

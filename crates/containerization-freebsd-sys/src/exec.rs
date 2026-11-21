@@ -32,7 +32,7 @@ pub struct Ids {
 
 /// The setup a process performs between fork and exec.
 pub struct Entry {
-  pub jail: Option<libc::c_int>,
+  pub jid: Option<libc::c_int>,
   pub limits: Vec<Limit>,
   pub umask: Option<u16>,
   pub ids: Option<Ids>,
@@ -105,14 +105,14 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering
     })
     .collect();
   let umask = entry.umask.map(|umask| umask as libc::mode_t);
-  let Entry { jail, ids, cwd, .. } = entry;
+  let Entry { jid, ids, cwd, .. } = entry;
 
   // SAFETY: between fork and exec, the closure makes only async-signal-safe
   // system calls on data it owns, and allocates nothing.
   unsafe {
     command.pre_exec(move || {
       let report = writer.as_fd();
-      if let Some(jid) = jail {
+      if let Some(jid) = jid {
         attach(jid).map_err(failed_at(report, Step::Jail))?;
       }
       for (resource, limit) in &limits {
@@ -122,8 +122,8 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering
         libc::umask(umask);
       }
       if let Some(ids) = &ids {
-        // setgroups sets only the supplementary groups, on FreeBSD 15 as on
-        // other systems.
+        // On FreeBSD 15, as on other systems, setgroups sets only the
+        // supplementary groups; earlier FreeBSD took the first entry as egid.
         check(libc::setgroups(ids.groups.len() as _, ids.groups.as_ptr()))
           .and_then(|_| check(libc::setgid(ids.gid)))
           .and_then(|_| check(libc::setuid(ids.uid)))
@@ -155,10 +155,11 @@ unsafe impl Send for Rescue {}
 // SAFETY: as for Send, and nothing is written through the pointers.
 unsafe impl Sync for Rescue {}
 
-/// Makes the command's process run the guest's `/rescue` tool named
-/// `argv[0]` with `argv`, after all other pre-exec setup. The tool is opened
-/// now, in the guest, so it can run in a jail whose root does not contain it.
-/// The environment is the agent's, overlaid with the command's.
+/// Makes the command's process fexecve the guest's `/rescue` tool named
+/// `argv[0]` with `argv`. Register it after every other pre_exec hook: hooks
+/// run in registration order, and later ones never would. The tool is
+/// opened now, in the guest, so it can run in a jail whose root does not
+/// contain it. The environment is the agent's, overlaid with the command's.
 pub fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> {
   use std::collections::BTreeMap;
   use std::os::unix::ffi::OsStrExt;

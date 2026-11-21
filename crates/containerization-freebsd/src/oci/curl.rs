@@ -1,6 +1,5 @@
-//! HTTP requests sent with curl(1). curl reads its options, including
-//! credentials, from a config file on stdin, so other processes cannot see
-//! them.
+//! HTTP over curl(1). Options, credentials included, go to curl as a config
+//! file on stdin, so they never appear in the process's arguments.
 
 use super::registry::{Credentials, Secret};
 use crate::error::{Error, Result};
@@ -8,7 +7,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// The authorization a request carries.
 #[derive(Clone, Debug)]
 pub(super) enum Auth {
   None,
@@ -16,22 +14,20 @@ pub(super) enum Auth {
   Basic(Credentials),
 }
 
-/// An HTTP request for curl to send.
 pub(super) struct Request<'a> {
   pub(super) method: &'a str,
   pub(super) url: String,
   pub(super) accept: Option<&'a str>,
   pub(super) content_type: Option<&'a str>,
-  /// A file to send as the body.
+  /// The file sent as the request body.
   pub(super) upload: Option<&'a Path>,
-  /// A file to write the response body to.
+  /// The file the response body is written to.
   pub(super) output: Option<&'a Path>,
 }
 
 pub(super) struct Response {
   pub(super) status: u16,
-  /// The headers of the final response after redirects, with lowercase
-  /// names.
+  /// The final response's headers, after redirects, with lowercase names.
   headers: Vec<(String, String)>,
 }
 
@@ -47,9 +43,9 @@ impl<'a> Request<'a> {
     }
   }
 
-  /// curl's config file for sending this request with `auth`. curl follows
-  /// redirects, writes the headers to `headers` and the body to `output`, and
-  /// prints only the status code.
+  /// The curl config for this request with `auth`: follow redirects, dump
+  /// headers to `headers`, write the body to `output`, and print only the
+  /// status code.
   fn config(&self, auth: &Auth, headers: &Path) -> String {
     let mut config = Config::default();
 
@@ -65,7 +61,7 @@ impl<'a> Request<'a> {
       (_, Some(upload)) => {
         config.option("upload-file", &upload.to_string_lossy());
         config.option("request", self.method);
-        // An empty Expect header stops curl from waiting for a 100 Continue.
+        // An empty Expect header stops curl waiting for 100 Continue.
         config.option("header", "Expect:");
       }
       ("GET", None) => {}
@@ -74,7 +70,7 @@ impl<'a> Request<'a> {
         config.option("data-binary", "");
       }
     }
-    // The body goes to a file so that stdout carries only the status code.
+    // The body goes to a file so stdout carries only the status code.
     let output = self.output.unwrap_or(Path::new("/dev/null"));
     config.option("output", &output.to_string_lossy());
     if let Some(accept) = self.accept {
@@ -105,7 +101,6 @@ impl Response {
   }
 }
 
-/// Sends `request` with curl, following redirects.
 pub(super) fn send(request: &Request, auth: &Auth) -> Result<Response> {
   let headers = tempfile_path();
   let config = request.config(auth, &headers);
@@ -118,7 +113,7 @@ pub(super) fn send(request: &Request, auth: &Auth) -> Result<Response> {
   result
 }
 
-/// A curl config file, one option per line.
+/// A curl config file (`--config`), one option per line.
 #[derive(Default)]
 struct Config(String);
 
@@ -134,7 +129,7 @@ impl Config {
 }
 
 /// Runs curl with `config` on stdin and returns the HTTP status it printed.
-/// `command` describes the request in errors.
+/// Errors name the request as `command`.
 fn run(config: &str, command: &str) -> Result<u16> {
   let failed = |failure: String| Error::Command {
     command: command.to_string(),
@@ -169,8 +164,7 @@ fn run(config: &str, command: &str) -> Result<u16> {
     .map_err(|_| failed("wrote no HTTP status".to_string()))
 }
 
-/// A unique path in the temporary directory for a scratch file of one curl
-/// run.
+/// A unique scratch path in the temporary directory.
 pub(super) fn tempfile_path() -> PathBuf {
   use std::sync::atomic::{AtomicU64, Ordering};
   static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -182,7 +176,7 @@ pub(super) fn tempfile_path() -> PathBuf {
   ))
 }
 
-/// `value` as a double-quoted string in curl's config file syntax.
+/// `value` as a double-quoted string in curl's config syntax.
 fn quote(value: &str) -> String {
   let mut quoted = String::from("\"");
 
@@ -200,8 +194,8 @@ fn quote(value: &str) -> String {
   quoted
 }
 
-/// The headers of the last response in curl's header dump, which follows any
-/// redirects.
+/// The last response's headers from curl's `dump-header` output, which has a
+/// block for each response, redirects included.
 fn last_headers(dumped: &str) -> Vec<(String, String)> {
   let block = dumped
     .split("\r\n\r\n")

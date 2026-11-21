@@ -1,8 +1,7 @@
 //! Unpacks images into ZFS in the guest. Each layer is applied to a clone of
-//! the layer beneath it and then snapshotted. The dataset is named by the
-//! layer's chain id, so a layer shared by several images is unpacked only
-//! once. The top layer's snapshot is the root filesystem to clone for a
-//! container.
+//! the snapshot beneath it, then snapshotted. Datasets are named by chain ID,
+//! so a layer stack shared by several images is unpacked once. The top
+//! layer's snapshot is what a container's root is cloned from.
 
 use crate::agent::{Agent, Exec, Exit, Output, Process};
 use crate::error::{Error, Result};
@@ -16,7 +15,7 @@ use std::time::Duration;
 const QUICK: Duration = Duration::from_secs(60);
 /// Extracting a userland-sized layer takes about a minute.
 const UNPACKING: Duration = Duration::from_secs(600);
-/// The snapshot name each layer's dataset gets once the layer is applied.
+/// The snapshot taken of each layer's dataset once the layer is applied.
 const UNPACKED: &str = "unpacked";
 
 pub struct Unpacker<'a> {
@@ -25,20 +24,18 @@ pub struct Unpacker<'a> {
   store: String,
 }
 
-/// The result of an unpack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unpacked {
   /// The top layer's snapshot.
   pub snapshot: String,
-  /// The number of layers unpacked by this call, and the number that were
-  /// already unpacked.
+  /// Layers this call unpacked, and layers already unpacked.
   pub unpacked: usize,
   pub cached: usize,
 }
 
 impl<'a> Unpacker<'a> {
-  /// An unpacker that puts layers in datasets under `store`, such as
-  /// `images/layers`. `unpack` creates and mounts `store` if needed.
+  /// Unpacks into datasets under `store`, such as `images/layers`. `unpack`
+  /// creates and mounts `store` if needed.
   pub fn new(agent: &'a Agent, store: &str) -> Self {
     Self {
       agent,
@@ -48,10 +45,10 @@ impl<'a> Unpacker<'a> {
   }
 
   /// Unpacks `image`'s layers for `platform`, streaming each through the
-  /// agent and skipping layers already unpacked. The guest verifies each
-  /// decompressed layer against its diff id in the image config, so a
-  /// snapshot always holds the content its chain id names. Unpacks into the
-  /// same store must not run concurrently.
+  /// agent and skipping those already unpacked. The guest verifies each
+  /// decompressed layer against its diff ID, so a snapshot always holds the
+  /// content its chain ID names. Unpacks into one store must not run
+  /// concurrently.
   pub fn unpack(&self, image: &Image, platform: &Platform) -> Result<Unpacked> {
     let (_, manifest) = image.manifest(platform)?;
     let config = image.config(platform)?;
@@ -105,9 +102,9 @@ impl<'a> Unpacker<'a> {
     Ok(unpacked)
   }
 
-  /// Unpacks `layer` into a new `dataset` cloned from the snapshot `below`,
-  /// via the decompressed tarball at `staging`. The tarball is always
-  /// removed, and the dataset is destroyed if the unpack fails.
+  /// Applies `layer` to a new `dataset`, a clone of the snapshot `below` or
+  /// empty if there is none, via the decompressed tarball at `staging`. The
+  /// tarball is always removed, and the dataset is destroyed on failure.
   fn layer(
     &self,
     image: &Image,
@@ -117,8 +114,8 @@ impl<'a> Unpacker<'a> {
     dataset: &str,
     staging: &str,
   ) -> Result<()> {
-    // An earlier unpack can leave the dataset behind if it failed without
-    // cleaning up, such as when the guest stopped.
+    // An earlier unpack that failed without cleaning up, such as when the
+    // guest stopped, can leave the dataset behind.
     if self.zfs.exists(dataset)? {
       self.zfs.destroy(dataset)?;
     }
@@ -141,7 +138,7 @@ impl<'a> Unpacker<'a> {
     result
   }
 
-  /// Streams `layer`'s blob through the agent and writes it, decompressed, to
+  /// Streams `layer`'s blob to the guest, which decompresses it to
   /// `staging`.
   fn receive(&self, image: &Image, layer: &Descriptor, staging: &str) -> Result<()> {
     let compression = compression(&layer.media_type)?;
@@ -171,8 +168,8 @@ impl<'a> Unpacker<'a> {
 
     match written {
       Ok(()) => finish(&process, UNPACKING),
-      // A failed write usually means the decompressor exited early, so its
-      // error is more useful than the write error.
+      // A failed write usually means the decompressor exited early, and its
+      // error says why.
       Err(error) => match finish(&process, QUICK) {
         Err(failed @ Error::Guest(_)) => Err(failed),
         _ => Err(error),
@@ -181,8 +178,7 @@ impl<'a> Unpacker<'a> {
   }
 }
 
-/// The compression of a layer of `media_type`, as `scripts::DECOMPRESS` names
-/// it.
+/// A layer media type's compression, as `scripts::DECOMPRESS` names it.
 fn compression(media_type: &str) -> Result<&'static str> {
   match media_type {
     media_type::LAYER | "application/vnd.docker.image.rootfs.diff.tar" => Ok("none"),
@@ -192,8 +188,8 @@ fn compression(media_type: &str) -> Result<&'static str> {
   }
 }
 
-/// Waits up to `timeout` for `process` to exit. Any exit status but 0 is an
-/// error.
+/// Waits for `process` to exit 0. `timeout` bounds each wait for output, so
+/// stderr resets it.
 fn finish(process: &Process, timeout: Duration) -> Result<()> {
   let mut stderr = Vec::new();
 

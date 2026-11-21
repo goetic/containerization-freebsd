@@ -4,8 +4,8 @@
 # which Virtualization.framework requires. Every rebuild drops the signature.
 #
 # DEVELOPMENT_TEAM selects that team's identity. Without it, the binary is
-# signed ad hoc. That is enough for the entitlement, but each build gets a new
-# code identity, so anything keyed to the identity prompts again.
+# signed ad hoc. That is enough for the entitlement, but an ad hoc identity is
+# the build's cdhash, so anything keyed to it prompts again after each build.
 
 set -e
 

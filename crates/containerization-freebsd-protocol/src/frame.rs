@@ -27,9 +27,9 @@ use std::mem;
 pub const MAGIC: [u8; 4] = [0xF5, 0xC0, 0xFB, 0x5D];
 pub const MAX_PAYLOAD: usize = 1 << 20;
 
-/// The escape byte, sent after an F5 that does not start a magic.
+/// Stuffed after each F5 that does not start a magic.
 const ESCAPED: u8 = 0x00;
-/// The size of the channel, kind, length and header checksum.
+/// The size of the channel, kind, length and header CRC.
 const HEADER: usize = 13;
 const TRAILER: usize = 4;
 

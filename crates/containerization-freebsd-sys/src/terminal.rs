@@ -35,9 +35,8 @@ pub fn make_raw(terminal: &impl AsFd) -> io::Result<()> {
   Ok(())
 }
 
-/// Opens a pseudo-terminal of `size`. Returns the controller end, which the
-/// caller reads and writes, and the child end, which a process uses as its
-/// terminal.
+/// Opens a pty of `size`. Returns the controller, which the caller reads and
+/// writes, and the child end, which a process takes as its terminal.
 pub fn open_terminal(size: WindowSize) -> io::Result<(File, OwnedFd)> {
   let (mut controller, mut child) = (-1, -1);
   let mut size = window(size);
@@ -57,7 +56,8 @@ pub fn open_terminal(size: WindowSize) -> io::Result<(File, OwnedFd)> {
   let (controller, child) = unsafe { (OwnedFd::from_raw_fd(controller), OwnedFd::from_raw_fd(child)) };
 
   // openpty leaves both inheritable. Every process spawned later would inherit
-  // them, and the terminal would not end until those processes exit too.
+  // them, and the controller would not see the child end close until those
+  // processes exit too.
   close_on_exec(controller.as_fd())?;
   close_on_exec(child.as_fd())?;
   Ok((File::from(controller), child))

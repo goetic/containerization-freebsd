@@ -25,8 +25,8 @@ pub struct UnixSocket {
   /// The socket's path in the guest, or in the jail.
   pub guest: String,
   pub direction: Direction,
-  /// The permissions of the socket the relay creates: in the guest for
-  /// `Into`, on the host for `OutOf`. `None` leaves what the umask gives.
+  /// The mode of the socket the relay creates: in the guest for `Into`, on
+  /// the host for `OutOf`. `None` leaves it to the umask.
   pub mode: Option<u16>,
 }
 
@@ -41,10 +41,9 @@ pub enum Direction {
   OutOf,
 }
 
-/// A running socket relay started by `Agent::relay_socket`. Connections
-/// already relayed continue after the relay stops. Dropping the relay stops
-/// it, but for `Into` it leaves the socket file in the guest; `close` removes
-/// that file.
+/// A socket relay started by `Agent::relay_socket`. Connections already
+/// relayed outlive it. Dropping it stops the relay but, for `Into`, leaves the
+/// socket in the guest; `close` also removes it.
 pub struct SocketRelay {
   relaying: Relaying,
 }
@@ -54,17 +53,16 @@ enum Relaying {
   OutOf(HostListener),
 }
 
-/// The host's end of a relay out of the guest: the socket's path, and a flag
-/// that tells the accepting thread to stop.
+/// The host side of an `OutOf` relay.
 struct HostListener {
   path: PathBuf,
   stopped: Arc<AtomicBool>,
 }
 
 impl Agent {
-  /// Relays `socket` between the host and the guest. An existing socket at
-  /// the path where the relay listens is replaced. For `Into`, the socket's
-  /// directory in the guest must exist.
+  /// Relays `socket` between the host and the guest, replacing any socket
+  /// already at the listening path. For `Into`, the socket's guest directory
+  /// must exist.
   pub fn relay_socket(&self, socket: &UnixSocket) -> Result<SocketRelay> {
     self.relay_socket_in(socket, None)
   }
@@ -98,9 +96,9 @@ impl Agent {
 }
 
 impl SocketRelay {
-  /// Stops the relay and removes its socket. For `Into`, the file is removed
-  /// after the agent closes the listener, so that the listener no longer
-  /// keeps the socket's file system busy.
+  /// Stops the relay and removes its socket. For `Into`, waits for the agent
+  /// to close the listener and unlink the socket, so the listener no longer
+  /// holds the socket's file system busy.
   pub fn close(self) -> Result<()> {
     match self.relaying {
       Relaying::Into(listener) => listener.close(),
@@ -145,8 +143,8 @@ impl HostListener {
 }
 
 impl Drop for HostListener {
-  /// Stops accepting connections and removes the socket. A connection of its
-  /// own wakes the accepting thread so it sees the stop flag.
+  /// Stops accepting and removes the socket. A self-connection wakes the
+  /// blocked accept(2) so the thread sees the stop flag.
   fn drop(&mut self) {
     self.stopped.store(true, Ordering::Relaxed);
     let _ = UnixStream::connect(&self.path);
@@ -164,8 +162,8 @@ fn remove_socket(path: &Path) -> io::Result<()> {
   }
 }
 
-/// Relays between `relay` and `local`, a connection on the host, until both
-/// directions have finished.
+/// Relays between `relay` and `local`, a host connection, until both
+/// directions finish.
 pub(crate) fn pump(relay: Relay, local: UnixStream) {
   let Ok(mut to_local) = local.try_clone() else {
     return;

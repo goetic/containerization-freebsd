@@ -1,5 +1,5 @@
-//! Runs a guest's first boot from FreeBSD's VM image. The result is the base
-//! disk that later machines clone or restore.
+//! A guest's first boot from FreeBSD's VM image, producing the base disk that
+//! later machines clone or restore.
 
 use crate::error::{Error, Result};
 use crate::image;
@@ -8,9 +8,9 @@ use crate::scripts;
 use std::path::Path;
 use std::time::Duration;
 
-/// The seed volume's user-data, which nuageinit runs on the first boot.
+/// The NoCloud seed's user-data, which nuageinit runs on the first boot.
 const FIRST_BOOT: &str = include_str!("../../../guest/first-boot.sh");
-/// The guest bundle's name on the seed volume, where `FIRST_BOOT` finds it.
+/// The guest bundle's file name on the seed, where `FIRST_BOOT` expects it.
 const BUNDLE: &str = "bundle.tar.xz";
 /// The most boots to wait through. A first boot that upgrades reboots once,
 /// and the agent then starts again.
@@ -27,10 +27,10 @@ pub enum Upgrade {
   None,
 }
 
-/// Clones `base` into `directory` as a disk of `size` bytes, boots it once
-/// with a seed volume that installs `bundle` (the agent and the virtiofs
-/// modules), waits for the first boot to finish, and powers the machine off.
-/// The returned layout boots the prepared disk without a seed or network.
+/// Clones `base` into `directory` as a `size`-byte disk, writes `LOADER_ENV`,
+/// boots it once with a seed that installs `bundle` (the agent and the
+/// patched virtiofs modules), waits for the first boot to finish, and powers
+/// off. The returned layout boots the prepared disk without seed or NAT.
 pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundle: &Path) -> Result<Layout> {
   std::fs::create_dir_all(directory).map_err(Error::io(format!("making {}", directory.display())))?;
 
@@ -60,10 +60,12 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
   Ok(layout)
 }
 
-/// Waits for rc to delete /firstboot. rc deletes it only after the first boot
-/// finishes: the seed's script has started the agent, and the system has
-/// rebooted if the upgrade installed anything. A machine powered off sooner
-/// runs a first boot again on its next boot.
+/// Waits for rc to delete /firstboot, which it does at the end of the first
+/// boot, after the seed's script has started the agent; a machine powered off
+/// sooner repeats the first boot. If an upgrade requested a reboot
+/// (/firstboot-reboot), rc deletes /firstboot and then reboots, so the wait
+/// can succeed just before that reboot, or end in `SessionEnded` and succeed
+/// on the next boot.
 fn wait_first_boot(machine: &crate::Machine) -> Result<()> {
   let wait = scripts::FIRST_BOOT.argv(&[]);
 

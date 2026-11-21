@@ -1,17 +1,15 @@
-//! Limits and usage statistics for a jail's processes as a group, through
-//! rctl(8). These correspond to Containerization's per-container `cpus` and
-//! memory, which size its VMs, and to its statistics. rctl needs
-//! `kern.racct.enable` set at boot, which `LOADER_ENV` does. Network counters
-//! come from netstat(1), and a container's block IO from ZFS.
+//! Per-jail resource limits and usage through rctl(8), standing in for
+//! Containerization's per-container `cpus` and memory, which size its VMs,
+//! and its statistics. rctl needs the `kern.racct.enable` tunable, which
+//! `machine::LOADER_ENV` sets. Network counters come from netstat(1), and a
+//! container's block IO from ZFS kstats.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 
-/// The combined resource usage of a jail's processes, like
-/// Containerization's `ContainerStatistics`.
+/// A jail's resource usage, like Containerization's `ContainerStatistics`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Statistics {
-  /// CPU time, in whole seconds.
   pub cpu_seconds: u64,
   /// Recent CPU usage, in percent of one core.
   pub cpu_percent: u64,
@@ -25,17 +23,16 @@ pub struct Statistics {
   pub write_bytes_per_second: u64,
   pub read_operations_per_second: u64,
   pub write_operations_per_second: u64,
-  /// The interfaces, including loopback, of a jail with its own network
-  /// stack. A jail that shares the guest's stack has none here, because
-  /// those counters belong to the guest.
+  /// The interfaces, loopback included, of a VNET jail. Empty for a jail on
+  /// the guest's stack, whose counters belong to the guest.
   pub networks: Vec<NetworkStatistics>,
-  /// A container's dataset IO, in place of Containerization's block devices,
-  /// because FreeBSD does not count block IO per jail. Empty for a plain
-  /// jail.
+  /// A container's dataset IO, in place of Containerization's block
+  /// devices, since FreeBSD doesn't count block IO per jail. Empty for a
+  /// plain jail.
   pub block_io: Vec<DatasetIo>,
 }
 
-/// An interface's counters since it was created.
+/// Counters since the interface was created.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NetworkStatistics {
   pub interface: String,
@@ -49,8 +46,8 @@ pub struct NetworkStatistics {
   pub transmitted_dropped: u64,
 }
 
-/// A dataset's file reads and writes since it was mounted, as ZFS counts
-/// them, including reads served from cache.
+/// A dataset's objset kstats since it was mounted, which count reads served
+/// from the ARC.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DatasetIo {
   pub dataset: String,
@@ -60,8 +57,8 @@ pub struct DatasetIo {
   pub write_operations: u64,
 }
 
-/// Returns the rctl(8) rules that limit the jail named `jail` to `cpus` CPUs
-/// and `memory_in_bytes` of resident memory.
+/// rctl(8) rules denying `jail` more than `cpus` CPUs (`pcpu`) and
+/// `memory_in_bytes` of resident memory (`memoryuse`).
 pub(crate) fn rules(jail: &str, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
   let rule = |resource: &str, amount: Option<u64>| amount.map(|amount| format!("jail:{jail}:{resource}:deny={amount}"));
 
@@ -103,8 +100,8 @@ pub(crate) fn statistics(usage: &str) -> Result<Statistics> {
   })
 }
 
-/// Parses the output of `scripts::INTERFACES`: netstat's link rows, with
-/// columns found by their header names.
+/// Parses the `<Link#n>` rows of `scripts::INTERFACES`'s netstat output,
+/// finding columns by header name.
 pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
   let unreadable = || Error::Guest(format!("netstat printed {table:?}"));
   let mut lines = table.lines();
@@ -148,7 +145,7 @@ pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
     .collect()
 }
 
-/// Parses the dataset's counters from the output of `scripts::DATASET_IO`.
+/// Parses `scripts::DATASET_IO`'s output for `dataset`.
 pub(crate) fn dataset_io(dataset: &str, counters: &str) -> Result<DatasetIo> {
   let values = counters
     .lines()

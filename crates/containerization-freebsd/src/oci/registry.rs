@@ -6,16 +6,15 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
-/// The largest manifest or index accepted: 4 MiB, the least the OCI
-/// distribution spec says registries should accept.
+/// 4 MiB: the distribution spec says registries should accept manifests at
+/// least this large.
 const MAX_MANIFEST: u64 = 4 << 20;
 const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, \
                                 application/vnd.oci.image.manifest.v1+json, \
                                 application/vnd.docker.distribution.manifest.list.v2+json, \
                                 application/vnd.docker.distribution.manifest.v2+json";
 
-/// A password or token. Both `Display` and `Debug` print it as asterisks;
-/// `expose` returns the actual text.
+/// A password or token, redacted by `Display` and `Debug`.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Secret(String);
 
@@ -49,21 +48,20 @@ impl fmt::Debug for Secret {
   }
 }
 
-/// A registry account, for registries that require one.
+/// Sent as basic auth to the registry or to its token realm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
   pub username: String,
   pub password: Secret,
 }
 
-/// Pulls from and pushes to registries over the OCI distribution API, using
-/// curl(1). Tokens and passwords are passed to curl on stdin, never as
-/// arguments, so other processes cannot see them.
+/// A distribution API client over curl(1), which gets tokens and passwords
+/// on stdin rather than in its arguments.
 #[derive(Debug, Default)]
 pub struct RegistryClient {
   credentials: Option<Credentials>,
-  /// Cached bearer tokens, keyed by `registry/repository` and whether the
-  /// token allows pushing.
+  /// Bearer tokens, keyed by `<API host>/<repository>` and whether they
+  /// grant push.
   tokens: Mutex<HashMap<(String, bool), Secret>>,
 }
 
@@ -75,8 +73,9 @@ impl RegistryClient {
     }
   }
 
-  /// Fetches the manifest or index named `target`, a tag or digest, from
-  /// `reference`'s repository into `store`.
+  /// Fetches the manifest or index `target`, a tag or digest, from
+  /// `reference`'s repository into `store`, verifying it if `target` is a
+  /// digest.
   pub fn fetch_manifest(&self, reference: &Reference, target: &str, store: &ContentStore) -> Result<Descriptor> {
     let partial = store.partial();
     let result = (|| {
@@ -116,7 +115,6 @@ impl RegistryClient {
     result
   }
 
-  /// Fetches `descriptor`'s blob from `reference`'s repository into `store`.
   pub fn fetch_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
     let partial = store.partial();
     let result = self
@@ -127,9 +125,9 @@ impl RegistryClient {
     result
   }
 
-  /// Uploads `descriptor`'s blob from `store` to `reference`'s repository,
-  /// unless the repository already has it. A POST starts the upload and a
-  /// single PUT sends the whole blob.
+  /// Uploads `descriptor`'s blob unless a HEAD finds it in the repository,
+  /// as a monolithic upload: a POST opens the session and one PUT sends the
+  /// blob.
   pub fn push_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
     let path = format!("blobs/{}", descriptor.digest);
     let head = Request::new("HEAD", url(reference, &path));
@@ -161,8 +159,8 @@ impl RegistryClient {
     let mut put = Request::new("PUT", upload.to_string());
     put.content_type = Some("application/octet-stream");
     put.upload = Some(&blob);
-    // Credentials go only to the registry itself, not to an upload location
-    // on another origin such as a storage service.
+    // Credentials go only to the registry, not to an upload location on
+    // another origin such as a storage service.
     let response = if same_origin(&post.url, &put.url) {
       self.send(reference, &put, true)?
     } else {
@@ -174,8 +172,8 @@ impl RegistryClient {
     }
   }
 
-  /// Uploads the manifest or index `descriptor` from `store` to
-  /// `reference`'s repository under `target`, a tag or the document's digest.
+  /// Uploads the manifest or index `descriptor` under `target`, a tag or its
+  /// digest.
   pub fn push_manifest(
     &self,
     reference: &Reference,
@@ -200,8 +198,8 @@ impl RegistryClient {
     result
   }
 
-  /// GETs `path` under the repository into the file `body`. Any status other
-  /// than 200 is an error.
+  /// GETs `path` under the repository into the file `body`, failing on any
+  /// status but 200.
   fn get(&self, reference: &Reference, path: &str, accept: Option<&str>, body: &Path) -> Result<Response> {
     let mut get = Request::new("GET", url(reference, path));
     get.accept = accept;
@@ -214,11 +212,11 @@ impl RegistryClient {
     }
   }
 
-  /// Sends `request` to `reference`'s registry. If the registry answers 401,
-  /// authenticates as its challenge asks and sends the request again. The
-  /// token grants pull access, plus push access when `push` is set.
+  /// Sends `request` with any cached token. On a 401, authenticates as the
+  /// WWW-Authenticate challenge asks and retries once. The token's scope is
+  /// pull, plus push if `push` is set.
   fn send(&self, reference: &Reference, request: &Request, push: bool) -> Result<Response> {
-    let key = (format!("{}/{}", reference.registry(), reference.repository), push);
+    let key = (format!("{}/{}", reference.api_host(), reference.repository), push);
     let cached = self
       .tokens
       .lock()
@@ -239,7 +237,7 @@ impl RegistryClient {
   }
 
   /// The authorization a WWW-Authenticate challenge asks for: a bearer token
-  /// fetched from the challenge's realm, or basic auth with the account.
+  /// from its realm, or basic auth with the credentials.
   fn authorize(&self, reference: &Reference, key: &(String, bool), challenge: &str) -> Result<Auth> {
     let (scheme, parameters) = parse_challenge(challenge);
 
@@ -260,8 +258,8 @@ impl RegistryClient {
     }
   }
 
-  /// Fetches a bearer token from `url`, with the account if there is one, and
-  /// caches it under `key`.
+  /// Fetches a bearer token from `url`, with basic auth if there are
+  /// credentials, and caches it under `key`.
   fn fetch_token(&self, reference: &Reference, key: &(String, bool), url: &url::Url) -> Result<Secret> {
     let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
     let body = curl::tempfile_path();
@@ -293,9 +291,9 @@ impl RegistryClient {
   }
 }
 
-/// The token URL from a bearer `challenge`'s `parameters`: the realm, with
-/// the service and scope. Without a scope, it asks for pull access to
-/// `reference`'s repository, plus push access when `push` is set.
+/// The token request URL: a bearer challenge's `realm`, with its `service`
+/// and `scope` as query parameters. Without a challenge scope, the scope is
+/// `reference`'s repository with pull, plus push if `push` is set.
 fn token_url(
   reference: &Reference,
   push: bool,
@@ -325,11 +323,11 @@ struct TokenResponse {
   access_token: Option<String>,
 }
 
-/// The URL of `path` under `reference`'s repository.
+/// The `/v2/<repository>/<path>` URL.
 fn url(reference: &Reference, path: &str) -> String {
-  let scheme = if reference.local() { "http" } else { "https" };
+  let scheme = if reference.is_loopback() { "http" } else { "https" };
 
-  format!("{scheme}://{}/v2/{}/{path}", reference.registry(), reference.repository)
+  format!("{scheme}://{}/v2/{}/{path}", reference.api_host(), reference.repository)
 }
 
 fn same_origin(one: &str, other: &str) -> bool {
@@ -339,8 +337,7 @@ fn same_origin(one: &str, other: &str) -> bool {
   }
 }
 
-/// The error for an unexpected `status` in reply to `request`, including the
-/// start of the response body if there is one.
+/// The error for an unexpected `status`, quoting the start of `body`.
 fn unexpected(request: &Request, status: u16, body: Option<&Path>) -> Error {
   let bytes = body
     .and_then(|body| std::fs::read(body).ok())
@@ -358,8 +355,9 @@ fn snippet(bytes: &[u8]) -> String {
   text.trim().to_string()
 }
 
-/// Splits a WWW-Authenticate challenge into its scheme and parameters, such as
-/// `Bearer realm="https://ghcr.io/token",service="ghcr.io"`.
+/// Splits a WWW-Authenticate challenge, such as
+/// `Bearer realm="https://ghcr.io/token",service="ghcr.io"`, into its scheme
+/// and parameters, with the parameter names lowercased.
 fn parse_challenge(challenge: &str) -> (String, HashMap<String, String>) {
   let challenge = challenge.trim();
   let (scheme, rest) = challenge.split_once(' ').unwrap_or((challenge, ""));
@@ -397,9 +395,9 @@ fn parse_challenge(challenge: &str) -> (String, HashMap<String, String>) {
   (scheme.to_string(), parameters)
 }
 
-/// A manifest's media type. The registry's Content-Type is used if it is a
-/// known type, then the document's own `mediaType`. Failing both, a document
-/// with a `manifests` list is an index and anything else is a manifest.
+/// A fetched manifest's media type: the Content-Type if it is a known type,
+/// else the document's `mediaType`, else an index if it has `manifests` and
+/// a manifest if not.
 fn media_type_of(content_type: Option<&str>, bytes: &[u8]) -> String {
   let known = [
     media_type::INDEX,

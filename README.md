@@ -22,8 +22,8 @@ Pre-release.
 - `hw.vtnet.csum_disable=1` and `hw.vtnet.mq_disable=1` in
   `/efi/freebsd/loader.env` on the disk's EFI partition, because Apple's
   virtio-net rejects the offloads vtnet(4) asks for by default.
-- `kern.racct.enable=1` in the same file, so the kernel accounts for resource
-  use, which jails' limits and statistics need.
+- `kern.racct.enable=1` in the same file, for the racct accounting that
+  rctl(8) limits and jail statistics need.
 - NAT networking, only when requested.
 - Host directories over virtio-fs. FreeBSD 15.1 can mount them only with the
   patched modules in `guest/`.
@@ -32,7 +32,7 @@ Pre-release.
 
 | Path | What |
 | --- | --- |
-| `crates/containerization-freebsd` | The library: images, machines, and the agent client. |
+| `crates/containerization-freebsd` | The library: VM images, machines and the agent client; ZFS, jails, builds and containers in the guest; OCI images. |
 | `crates/containerization-freebsd-protocol` | The protocol between host and agent. |
 | `crates/containerization-freebsd-agent` | The guest agent. |
 | `crates/containerization-freebsd-sys` | The agent's system calls, its only unsafe code. |

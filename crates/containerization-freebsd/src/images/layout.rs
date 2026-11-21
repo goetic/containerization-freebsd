@@ -1,4 +1,4 @@
-//! Loading images from, and saving them to, OCI image layout directories.
+//! Loading images from, and saving them to, OCI image layouts.
 
 use super::{Image, ImageStore, LAYOUT};
 use crate::error::{Error, Result};
@@ -8,12 +8,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 impl ImageStore {
-  /// Loads the images in the OCI image layout at `directory`, as
-  /// Containerization's `load(from:)` does. An archived layout, such as
-  /// FreeBSD's container images on download.freebsd.org, must be unpacked
-  /// first. Each image is named by its `org.opencontainers.image.ref.name`
-  /// annotation, normalized like any reference, so
-  /// `freebsd-static:15.1-RELEASE-aarch64` becomes
+  /// Loads the images in the OCI image layout at `directory`, like
+  /// Containerization's `load(from:)`. An archived layout, such as FreeBSD's
+  /// container images on download.freebsd.org, must be extracted first. Each
+  /// image is named by its `REF_NAME` annotation, normalized like any
+  /// reference, so `freebsd-static:15.1-RELEASE-aarch64` becomes
   /// `docker.io/library/freebsd-static:15.1-RELEASE-aarch64`. Blobs already
   /// in the store are not copied.
   pub fn load(&self, directory: &Path) -> Result<Vec<Image>> {
@@ -46,11 +45,11 @@ impl ImageStore {
       .collect()
   }
 
-  /// Saves the images named `references`, with every blob they need, as an
-  /// OCI image layout at `out`, as Containerization's
-  /// `save(references:out:platform:)` does. With `platform`, an index is
-  /// saved as a new index of only that platform's manifests. `out` is
-  /// created if needed, and any `index.json` there is replaced.
+  /// Saves the images `references`, with every blob they reach, as an OCI
+  /// image layout at `out`, like Containerization's
+  /// `save(references:out:platform:)`. With `platform`, an index is saved as
+  /// a new index of only that platform's manifests. `out` is created if
+  /// needed, and any `index.json` there is replaced.
   pub fn save(&self, references: &[&str], out: &Path, platform: Option<&Platform>) -> Result<()> {
     let manifests = references
       .iter()
@@ -85,10 +84,10 @@ impl ImageStore {
     Ok(())
   }
 
-  /// Copies `descriptor`'s blob, and the blobs it refers to, from the layout
-  /// at `directory` into the store, skipping blobs the store already has. An
-  /// index's manifests may be absent, as after a pull; this skips them, and
-  /// later checks report any other absent blob.
+  /// Copies `descriptor`'s blob and those it references from the layout at
+  /// `directory`, skipping blobs the store has. Absent blobs are skipped
+  /// too, since an index's manifests may be absent, as after a pull;
+  /// `missing` reports any others afterwards.
   fn import(&self, directory: &Path, descriptor: &Descriptor) -> Result<()> {
     if !self.copy_in(directory, &descriptor.digest)? {
       return Ok(());
@@ -106,7 +105,7 @@ impl ImageStore {
   }
 
   /// Copies the blob `digest` from the layout at `directory` unless the
-  /// store already has it. Returns whether the store has it afterwards.
+  /// store has it. Returns whether the store has it afterwards.
   fn copy_in(&self, directory: &Path, digest: &str) -> Result<bool> {
     if self.content.has(digest) {
       return Ok(true);
@@ -120,9 +119,8 @@ impl ImageStore {
     }
   }
 
-  /// A blob that the index's images need and the store lacks, if any. A
-  /// missing manifest is not reported, since a pull fetches only one
-  /// platform's manifest.
+  /// A blob reachable from `index` that the store lacks. Missing manifests
+  /// aren't reported, since a pull fetches only one platform's manifest.
   fn missing(&self, index: &Index) -> Result<Option<String>> {
     Ok(
       self
@@ -133,7 +131,7 @@ impl ImageStore {
   }
 }
 
-/// The path of the blob `digest` in the OCI image layout at `root`.
+/// The path of the blob `digest` in the layout at `root`.
 fn layout_blob(root: &Path, digest: &str) -> Result<PathBuf> {
   let hex = sha256_hex(digest).ok_or_else(|| Error::Invalid(format!("{digest:?} is not a sha256 digest")))?;
 

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Moves the guest's network device with MAC address $2 into the jail named
-# $1, and prints the device's name.
+# Moves the guest's network device with MAC $2 into the VNET jail $1, and
+# prints the device's name.
 set -e
 for device in $(ifconfig -l ether); do
   if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $2"; then

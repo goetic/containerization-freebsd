@@ -1,7 +1,7 @@
 #!/bin/sh
-# Resolves $2, a path in the jail rooted at $1, prints the guest path it
-# refers to, and makes any missing directories. Symbolic links resolve within
-# the root: absolute links start at the root, and `..` stops there.
+# Resolves $2, a path in the jail rooted at $1, prints the guest path, and
+# creates missing directories. Symlinks resolve within the root, as under
+# chroot(2): absolute targets start at the root, and `..` stops there.
 set -e
 root=$1 rest=$2 resolved='' links=0
 while [ -n "$rest" ]; do

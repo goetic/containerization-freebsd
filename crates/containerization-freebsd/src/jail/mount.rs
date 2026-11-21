@@ -8,21 +8,21 @@ use crate::scripts;
 /// container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mount {
-  /// mount(8)'s type: `nullfs`, `tmpfs` or another.
+  /// mount(8)'s `-t`, such as `nullfs` or `tmpfs`.
   pub kind: String,
-  /// For nullfs, a directory in the guest.
+  /// For nullfs, a guest directory.
   pub source: String,
-  /// A path in the jail. Symbolic links along the path resolve within the
-  /// jail, and missing directories are made.
+  /// A path in the jail. Symlinks along it resolve within the jail, and
+  /// missing directories are created.
   pub destination: String,
   /// mount(8)'s `-o`, such as `ro`, or tmpfs's `size=64m`.
   pub options: Vec<String>,
 }
 
 impl Mount {
-  /// Mounts the guest directory `source` at `destination` with nullfs.
-  /// `source` may be a host share mounted by `Machine::mount_share`, or a
-  /// directory under one.
+  /// A nullfs mount of the guest directory `source` at `destination`.
+  /// `source` may be a virtio-fs share mounted by `Machine::mount_share`, or
+  /// a directory under one.
   pub fn directory(source: &str, destination: &str) -> Self {
     Self {
       kind: "nullfs".into(),
@@ -50,8 +50,8 @@ impl Mount {
 
 impl Jail<'_> {
   /// Mounts `mount` in the jail until `stop`. Mount before anything runs in
-  /// the jail: otherwise a process there could replace a directory on the
-  /// path with a symbolic link while the mount is made.
+  /// the jail: otherwise a jailed process could swap a directory on the path
+  /// for a symlink between resolution and mount(8).
   pub fn mount(&self, mount: &Mount) -> Result<()> {
     let root = self.root()?;
     let resolved = self
@@ -78,7 +78,7 @@ mod tests {
   use std::process::Command;
 
   /// Runs `scripts::RESOLVE` on `path` in `root` with the host's sh, and
-  /// returns the path it prints or its error.
+  /// returns its stdout or stderr.
   fn resolve(root: &Path, path: &str) -> std::result::Result<String, String> {
     let argv = scripts::RESOLVE.argv(&[root.to_str().unwrap(), path]);
     let output = Command::new(argv[0]).args(&argv[1..]).output().unwrap();

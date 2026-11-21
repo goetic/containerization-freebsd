@@ -31,10 +31,11 @@
 //!   connection on a new channel that it opens with Accepted.
 //!
 //! The opener sends Data (stdin or relay bytes), Resize and Signal. The runner
-//! answers with Opened, then Data (stdout), Stderr and Exited. Eof ends the
-//! sender's Data. A relay closes once both ends have sent Eof. A Listen
-//! channel closes the same way: the host's Eof stops the listener, and the
-//! agent's Eof confirms it. Error closes any channel.
+//! answers with Opened, then Data (stdout or relay bytes), Stderr and Exited.
+//! Eof ends the sender's Data. A relay closes once both ends have sent Eof. A
+//! Listen channel closes the same way: the host's Eof stops the listener, and
+//! the agent's Eof confirms it. Exited closes an Exec channel, and Error
+//! closes any channel.
 
 mod codec;
 pub mod frame;

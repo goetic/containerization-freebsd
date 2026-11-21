@@ -6,8 +6,8 @@
 //! Hello sent on a timer could therefore arrive after the session it was
 //! meant to start, and end that session.
 //!
-//! The guest drops console bytes it has no room for, so the host keeps at
-//! most `WINDOW` bytes in flight and writes frames in slices that fit. One
+//! The guest's tty drops input it has no room for, so the host keeps at most
+//! `WINDOW` bytes in flight and writes frames in slices that fit. One
 //! thread reads the console and counts the agent's Received reports. Another
 //! thread handles everything else, so a writer blocked on a full window can't
 //! deadlock the reader whose Received counts reopen it.
@@ -30,9 +30,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
-/// How long the agent has to open or close a channel, and to read the console
-/// once the window is full.
-const OPENING: Duration = Duration::from_secs(60);
+/// How long the agent has to open or close a channel, or to drain a full
+/// window.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Agent {
   shared: Arc<Shared>,

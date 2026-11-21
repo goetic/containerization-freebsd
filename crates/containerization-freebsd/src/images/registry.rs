@@ -1,5 +1,4 @@
-//! Moving images between the store and registries: pull, push and asking
-//! for an image's platforms.
+//! Pull, push and platform queries against registries.
 
 use super::{Image, ImageStore, check_runs, choose};
 use crate::error::{Error, Result};
@@ -7,8 +6,9 @@ use crate::oci::{Credentials, Descriptor, Document, Platform, Reference, Registr
 
 impl ImageStore {
   /// Pulls `reference`'s image for `platform`: the index if there is one,
-  /// and that platform's manifest, config and layers. Blobs already in the
-  /// store are not downloaded again.
+  /// and that platform's manifest, config and layers. The index or manifest
+  /// `reference` names is always fetched; anything else the store has is
+  /// not.
   pub fn pull(&self, reference: &str, platform: &Platform, credentials: Option<Credentials>) -> Result<Image> {
     let reference = Reference::parse(reference)?;
     let client = RegistryClient::new(credentials);
@@ -38,10 +38,11 @@ impl ImageStore {
     self.create(&reference.to_string(), top)
   }
 
-  /// Pushes the image named `reference` to the registry in that name, as
-  /// Containerization's `push(reference:platform:)` does. Blobs the registry
-  /// lacks go first, then the manifests, and an index's manifests before the
-  /// index itself. To push under another name, tag the image first.
+  /// Pushes the image `reference` to the repository it names, like
+  /// Containerization's `push(reference:platform:)`. Blobs the registry
+  /// lacks go first, then child manifests by digest, then the top-level
+  /// index or manifest, since registries may reject a manifest that
+  /// references unknown content. To push under another name, tag first.
   ///
   /// With `platform`, an index is pushed as a new index of only that
   /// platform's manifests. Without it, the whole index is pushed, which needs
@@ -56,10 +57,9 @@ impl ImageStore {
     client.push_manifest(&reference, reference.target(), &descriptor, &self.content)
   }
 
-  /// The platforms `reference`'s image supports, as Containerization's
-  /// `platforms(reference:)` reports them. Uses the store's image of that
-  /// name if there is one, otherwise asks the registry without pulling
-  /// layers.
+  /// The platforms `reference`'s image supports, like Containerization's
+  /// `platforms(reference:)`. Uses the store's image of that name if there
+  /// is one, otherwise asks the registry without pulling layers.
   pub fn platforms(&self, reference: &str, credentials: Option<Credentials>) -> Result<Vec<Platform>> {
     let reference = Reference::parse(reference)?;
     let name = reference.to_string();
@@ -76,10 +76,9 @@ impl ImageStore {
     self.platforms_of(&top, Some((&client, &reference)))
   }
 
-  /// The platforms of the index or manifest `descriptor`. For an index, these
-  /// are its entries' platforms, excluding the `unknown/unknown` that marks
-  /// attestations. For a manifest, it is its config's platform, with the
-  /// config fetched from `remote` if the store lacks it.
+  /// An index's entries' platforms, skipping those with an `unknown` OS or
+  /// architecture, which mark attestation manifests; or a manifest's config's
+  /// platform, fetching the config from `remote` if the store lacks it.
   fn platforms_of(
     &self,
     descriptor: &Descriptor,
@@ -105,8 +104,8 @@ impl ImageStore {
     }
   }
 
-  /// Pushes everything `descriptor` refers to: a manifest's config and
-  /// layers, or an index's manifests (by digest) and their contents.
+  /// Pushes everything `descriptor` references: a manifest's config and
+  /// layers, or an index's manifests, by digest, and their blobs.
   fn push_children(&self, client: &RegistryClient, reference: &Reference, descriptor: &Descriptor) -> Result<()> {
     let index = match self.content.document(descriptor)? {
       Document::Index(index) => index,
@@ -140,8 +139,7 @@ mod tests {
   use crate::oci::testing::FakeRegistry;
   use crate::oci::{Index, media_type};
 
-  /// Stores `bytes` in `store` and returns a descriptor of `media_type` for
-  /// them.
+  /// Ingests `bytes` and returns a `media_type` descriptor for them.
   fn blob_of(store: &ImageStore, media_type: &str, bytes: &[u8]) -> Descriptor {
     store.content().ingest(bytes).unwrap();
     descriptor(media_type, bytes, None)

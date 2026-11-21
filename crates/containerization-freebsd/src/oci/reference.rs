@@ -56,7 +56,7 @@ impl Reference {
     {
       return Err(invalid("its registry is not a host name"));
     }
-    if !repository.split('/').all(component) {
+    if !repository.split('/').all(valid_component) {
       return Err(invalid(
         "its name's parts must be lowercase letters and digits, joined by '.', '_' or '-'",
       ));
@@ -82,8 +82,7 @@ impl Reference {
     })
   }
 
-  /// The version to request from the registry: the digest if there is one,
-  /// otherwise the tag.
+  /// The manifest reference to request: the digest if set, else the tag.
   pub fn target(&self) -> &str {
     self
       .digest
@@ -92,9 +91,8 @@ impl Reference {
       .unwrap_or("latest")
   }
 
-  /// The host that serves the registry's API. For Docker Hub this differs
-  /// from the domain.
-  pub(crate) fn registry(&self) -> &str {
+  /// Differs from `domain` for Docker Hub.
+  pub(crate) fn api_host(&self) -> &str {
     if self.domain == DOCKER_HUB {
       "registry-1.docker.io"
     } else {
@@ -102,9 +100,8 @@ impl Reference {
     }
   }
 
-  /// Whether the registry runs on this machine, so it is reached over plain
-  /// HTTP.
-  pub(crate) fn local(&self) -> bool {
+  /// Loopback registries are reached over plain HTTP.
+  pub(crate) fn is_loopback(&self) -> bool {
     let host = self
       .domain
       .rsplit_once(':')
@@ -115,10 +112,9 @@ impl Reference {
   }
 }
 
-/// Whether `part` is a valid path component of a repository name: lowercase
-/// letters and digits, separated by one `.`, one or two `_`, or any number of
-/// `-`.
-fn component(part: &str) -> bool {
+/// Repository path components are lowercase alphanumerics separated by one
+/// `.`, one or two `_`, or any number of `-`.
+fn valid_component(part: &str) -> bool {
   let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
   let bytes = part.as_bytes();
 
@@ -207,15 +203,19 @@ mod tests {
 
     assert_eq!(pinned.target(), DIGEST);
     assert_eq!(tagged.target(), "t");
-    assert_eq!(Reference::parse("alpine").unwrap().registry(), "registry-1.docker.io");
+    assert_eq!(Reference::parse("alpine").unwrap().api_host(), "registry-1.docker.io");
   }
 
   #[test]
   fn reaches_only_this_machines_registries_over_http() {
-    assert!(Reference::parse("localhost:5000/a").unwrap().local());
-    assert!(Reference::parse("127.0.0.1:5000/a").unwrap().local());
-    assert!(!Reference::parse("ghcr.io/a").unwrap().local());
-    assert!(!Reference::parse("localhost.example.com/a").unwrap().local());
+    assert!(Reference::parse("localhost:5000/a").unwrap().is_loopback());
+    assert!(Reference::parse("127.0.0.1:5000/a").unwrap().is_loopback());
+    assert!(!Reference::parse("ghcr.io/a").unwrap().is_loopback());
+    assert!(
+      !Reference::parse("localhost.example.com/a")
+        .unwrap()
+        .is_loopback()
+    );
   }
 
   #[test]

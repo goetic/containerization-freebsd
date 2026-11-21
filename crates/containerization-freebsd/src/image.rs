@@ -1,5 +1,5 @@
-//! The FreeBSD VM image and other release downloads, and the disks and
-//! volumes the host makes from them.
+//! Downloads of the FreeBSD VM image, userland and guest bundle, and the
+//! disks and volumes the host makes from them.
 
 use crate::error::{Error, Result};
 use std::fs::File;
@@ -9,15 +9,15 @@ use std::process::Command;
 
 pub const RELEASE: &str = "15.1-RELEASE";
 pub const IMAGE: &str = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.raw.xz";
-/// The file name of the decompressed image in the `base_disk` cache.
+/// The decompressed `IMAGE`'s file name in the `base_disk` cache.
 pub const BASE_DISK: &str = "base.raw";
-/// The guest bundle for `RELEASE`, containing the agent and the virtiofs
-/// modules, as published by this repository's CI.
+/// The guest bundle for `RELEASE`, holding the agent and the virtiofs
+/// modules, as this repository's CI publishes it.
 pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r4.tar.xz";
 const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r4/freebsd-15.1-arm64-guest-r4.tar.xz";
 const BUNDLE_SHA256: &str = "eddf74f52ad2d18dfcea136dfa98d41809f7324085682b27d1568003f47947ca";
-/// The file name of `RELEASE`'s base system, the userland for jails, in the
-/// `userland` cache.
+/// `RELEASE`'s base system, the jails' userland, as named in the `userland`
+/// cache.
 pub const USERLAND: &str = "FreeBSD-15.1-RELEASE-arm64-base.txz";
 const USERLAND_URL: &str = "https://download.freebsd.org/releases/arm64/aarch64/15.1-RELEASE/base.txz";
 const USERLAND_SHA256: &str = "5b7a46a0abfbe23a1d4454b5600e2efcfce16b705bc7e9c851c37470c035ef98";
@@ -85,8 +85,8 @@ fn verify(path: &Path, expected: &str) -> Result<()> {
   }
 }
 
-/// The path of the decompressed base disk in `cache`. The image is
-/// downloaded, verified and decompressed only if the cache lacks it.
+/// The decompressed base disk in `cache`, downloaded, verified and
+/// decompressed if the cache lacks it.
 pub fn base_disk(cache: &Path) -> Result<PathBuf> {
   base_disk_from(
     &format!("https://download.freebsd.org/releases/VM-IMAGES/{RELEASE}/aarch64/Latest"),
@@ -94,8 +94,7 @@ pub fn base_disk(cache: &Path) -> Result<PathBuf> {
   )
 }
 
-/// Like `base_disk`, but downloads from the release directory at the URL
-/// `directory`.
+/// `base_disk`, from the release directory URL `directory`.
 fn base_disk_from(directory: &str, cache: &Path) -> Result<PathBuf> {
   let raw = cache.join(BASE_DISK);
 
@@ -122,14 +121,14 @@ fn base_disk_from(directory: &str, cache: &Path) -> Result<PathBuf> {
   Ok(raw)
 }
 
-/// The path of the guest bundle in `cache`, downloaded and verified if the
-/// cache lacks it.
+/// The guest bundle in `cache`, downloaded and verified if the cache lacks
+/// it.
 pub fn bundle(cache: &Path) -> Result<PathBuf> {
   pinned(cache, BUNDLE, BUNDLE_URL, BUNDLE_SHA256)
 }
 
-/// The path of `RELEASE`'s `base.txz` in `cache`, downloaded and verified if
-/// the cache lacks it. A jail's root starts as this userland.
+/// `RELEASE`'s `base.txz` in `cache`, downloaded and verified if the cache
+/// lacks it. A jail's root starts as this userland.
 pub fn userland(cache: &Path) -> Result<PathBuf> {
   pinned(cache, USERLAND, USERLAND_URL, USERLAND_SHA256)
 }
@@ -145,8 +144,8 @@ fn pinned(cache: &Path, name: &str, url: &str, sha256: &str) -> Result<PathBuf> 
   Ok(path)
 }
 
-/// Creates an empty, sparse raw disk of `size` bytes at `path`. Fails rather
-/// than overwrite an existing file.
+/// Creates a sparse raw disk of `size` bytes at `path`, failing if `path`
+/// exists.
 pub fn create_disk(path: &Path, size: u64) -> Result<()> {
   let creating = || format!("creating {}", path.display());
 
@@ -158,8 +157,8 @@ pub fn create_disk(path: &Path, size: u64) -> Result<()> {
     .map_err(Error::io(creating()))
 }
 
-/// The sha256 that the `CHECKSUM.SHA256` file `sums` lists for `name`, from a
-/// line of the form `SHA256 (name) = …`.
+/// The sha256 that `CHECKSUM.SHA256`'s `sums` lists for `name`, on a line
+/// `SHA256 (name) = …`.
 fn published_sha256<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
   sums
     .lines()
@@ -168,7 +167,7 @@ fn published_sha256<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Decompresses the xz file `source` to `destination`, seeking over zeroed
-/// chunks so the result is sparse and takes only the space its data needs.
+/// chunks so the result is sparse.
 fn decompress_sparse(source: &Path, destination: &Path) -> Result<()> {
   let decompressing = || format!("decompressing {}", source.display());
   let input = File::open(source).map_err(Error::io(decompressing()))?;
@@ -206,8 +205,8 @@ fn decompress_sparse(source: &Path, destination: &Path) -> Result<()> {
   output.set_len(length).map_err(Error::io(decompressing()))
 }
 
-/// Makes `destination` a copy-on-write clone of `base` (APFS `clonefile`, via
-/// `cp -c`), grown to `size` bytes so the guest can expand into it.
+/// Makes `destination` an APFS clone of `base` (`clonefile(2)` via `cp -c`),
+/// grown to at least `size` bytes for the guest to expand into.
 pub fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
   let _ = std::fs::remove_file(destination);
   run(Command::new("cp").arg("-c").arg(base).arg(destination))?;
@@ -224,10 +223,9 @@ pub fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
   Ok(())
 }
 
-/// Writes `/efi/freebsd/loader.env` on the disk's EFI system partition.
-/// FreeBSD's loader sets these variables before reading `loader.conf` and
-/// passes them to the kernel as tunables. The partition is FAT, so macOS can
-/// mount it without root.
+/// Writes `/efi/freebsd/loader.env` on the disk's ESP. loader.efi(8) sets
+/// these variables before reading `loader.conf` and passes them to the
+/// kernel as tunables. The ESP is FAT, so macOS can mount it without root.
 pub fn write_loader_env(disk: &Path, mount_point: &Path, contents: &str) -> Result<()> {
   let attached = run(
     Command::new("hdiutil")
@@ -268,9 +266,8 @@ pub fn write_loader_env(disk: &Path, mount_point: &Path, contents: &str) -> Resu
   written
 }
 
-/// Builds the cloud-init NoCloud seed volume `iso`, labelled `cidata`, from a
-/// staging `directory`. Each entry of `files` is a name on the volume and the
-/// host file to put there.
+/// Builds the cloud-init NoCloud seed volume `iso`, labelled `cidata`, via
+/// the staging `directory`. `files` maps names on the volume to host files.
 pub fn seed(directory: &Path, iso: &Path, files: &[(&str, &Path)]) -> Result<()> {
   let _ = std::fs::remove_dir_all(directory);
   let _ = std::fs::remove_file(iso);
@@ -333,9 +330,9 @@ mod tests {
     assert_eq!(out, data);
   }
 
-  /// Writes a release directory holding `data` as the image, and a
-  /// `CHECKSUM.SHA256` listing `listed` (or the true sha256) for it. Returns
-  /// the directory's `file://` URL.
+  /// Writes a release directory holding `data` as the image, with a
+  /// `CHECKSUM.SHA256` listing `listed` or else its true sha256. Returns the
+  /// directory's `file://` URL.
   fn release(directory: &Path, data: &[u8], listed: Option<&str>) -> String {
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
     encoder.write_all(data).unwrap();

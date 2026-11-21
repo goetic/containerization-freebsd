@@ -32,9 +32,9 @@ if [ "${#targets[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# `--message-format=json` writes build messages to stdout and the compiler's
-# output to stderr, so this collects the binaries' paths while progress shows
-# as usual.
+# `--message-format=json` writes JSON messages, compiler diagnostics among
+# them, to stdout and cargo's progress to stderr, so this collects the
+# binaries' paths while progress shows as usual. The filter drops diagnostics.
 binaries="$(
   cargo test -p "$package" "${targets[@]}" --no-run --message-format=json |
     python3 -c 'import json, sys

@@ -23,9 +23,8 @@ use std::thread::{self, JoinHandle};
 /// A running process, which the session loop signals and resizes.
 pub(crate) struct Process {
   pid: libc::pid_t,
-  /// Set to false once the process has exited, just before it is reaped.
-  /// After reaping, the pid may be reused by another process, which must not
-  /// receive our signals.
+  /// Cleared after the process exits and before it is reaped, so no signal
+  /// reaches another process that reuses the pid.
   alive: Mutex<bool>,
   terminal: Option<File>,
 }
@@ -86,9 +85,9 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
     .args(args)
     .envs(exec.env.iter().map(|(name, value)| (name, value)));
   if exec.pty.is_some() {
-    // Give the process its own session with the terminal as its controlling
-    // terminal, as a login shell has. This hook is registered first so it
-    // runs while the process is still root.
+    // Make the process a session leader with the pty as its controlling
+    // terminal, as for a login shell. Registered first, so the hook runs
+    // before privileges are dropped.
     sys::take_terminal_on_exec(&mut command);
   }
   let mut entering = enter(&mut command, exec)?;
@@ -153,7 +152,7 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
   sys::enter_on_exec(
     command,
     sys::Entry {
-      jail,
+      jid: jail,
       limits: exec
         .limits
         .iter()
@@ -230,9 +229,9 @@ fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Re
   Ok(Handle::Process { input, process })
 }
 
-/// Writes the host's Data to `sink`. The host's Eof closes `sink` if `closes`
-/// is true, and is ignored otherwise.
-fn feed(mut sink: impl Write, inputs: &Receiver<Input>, closes: bool) {
+/// Writes the host's Data to `sink`; the host's Eof is ignored unless
+/// `close_on_eof`.
+fn feed(mut sink: impl Write, inputs: &Receiver<Input>, close_on_eof: bool) {
   for input in inputs {
     match input {
       Input::Data(bytes) => {
@@ -241,19 +240,19 @@ fn feed(mut sink: impl Write, inputs: &Receiver<Input>, closes: bool) {
           return;
         }
       }
-      Input::Eof if closes => return,
+      Input::Eof if close_on_eof => return,
       Input::Eof => {}
     }
   }
 }
 
 /// Reads `source` until it ends, sending each read as a message built by
-/// `wrap`, then sends Eof if `eof` is true.
+/// `wrap`.
 fn pump(
   mut source: impl Read + Send + 'static,
   outbox: Outbox,
   wrap: fn(Vec<u8>) -> Message,
-  eof: bool,
+  send_eof: bool,
 ) -> JoinHandle<()> {
   thread::spawn(move || {
     let mut buffer = vec![0; READ];
@@ -272,7 +271,7 @@ fn pump(
         Err(_) => break,
       }
     }
-    if eof {
+    if send_eof {
       outbox.send(Message::Eof);
     }
   })

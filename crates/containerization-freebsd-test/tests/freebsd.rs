@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DISK_SIZE: u64 = 24 << 30;
-const SECONDS: Duration = Duration::from_secs(60);
+const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Returns a fresh directory for a test's disks and state. It lives under
-/// `target` so that, when `target` shares a volume with the cache, disk clones
-/// are copy-on-write.
+/// Returns a fresh directory for a test's disks and state, under `target` so
+/// that disks clone copy-on-write when `target` shares an APFS volume with the
+/// cache.
 fn work(name: &str) -> PathBuf {
   let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
 
@@ -60,7 +60,7 @@ fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
     if let Some(value) = attempt() {
       return value;
     }
-    assert!(started.elapsed() < SECONDS, "gave up after {}s", SECONDS.as_secs());
+    assert!(started.elapsed() < TIMEOUT, "gave up after {}s", TIMEOUT.as_secs());
     std::thread::sleep(Duration::from_millis(100));
   }
 }
@@ -134,7 +134,7 @@ fn prepares_boots_and_restores() {
     .expect("the agent starts");
   let ran = cold
     .agent
-    .check(&["freebsd-version", "-k"], SECONDS)
+    .check(&["freebsd-version", "-k"], TIMEOUT)
     .expect("run a command");
   assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
   streams_input_across_windows(&cold, &work);
@@ -142,14 +142,14 @@ fn prepares_boots_and_restores() {
   shares_files_with_the_host(&cold, &shared);
   let state = work.join("state.vzvmsave");
   saves_with_the_share_unused(&cold, &state);
-  cold.stop().expect("stop");
+  cold.force_stop().expect("stop");
   drop(cold);
 
   let restored = layout.machine("restored").expect("make the machine");
   restored.restore(&state).expect("restore");
   restored.resume().expect("resume");
   restored
-    .wait_ready(SECONDS)
+    .wait_ready(TIMEOUT)
     .expect("the agent answers after restoring");
   resumes_where_it_left_off(&restored);
   runs_a_command_in_a_terminal(&restored);
@@ -159,8 +159,8 @@ fn prepares_boots_and_restores() {
     .expect("power off");
 }
 
-/// Streams input that spans many flow-control windows through a checksum.
-/// The console would drop data if the host outpaced the agent.
+/// Streams input spanning many flow-control windows through sha256(1). The
+/// virtio console would drop bytes if the host outpaced the agent.
 fn streams_input_across_windows(cold: &Machine, work: &Path) {
   let input: Vec<u8> = (0..16usize << 20)
     .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
@@ -191,15 +191,14 @@ fn streams_input_across_windows(cold: &Machine, work: &Path) {
 fn loads_the_bundles_modules(cold: &Machine) {
   let ran = cold
     .agent
-    .check(&sh("kldstat -v | grep -E 'virtiofs|vtfs|fusefs'"), SECONDS)
+    .check(&sh("kldstat -v | grep -E 'virtiofs|vtfs|fusefs'"), TIMEOUT)
     .expect("list the modules");
   for module in ["/boot/modules/fusefs.ko", "virtiofs", "vtfs"] {
     assert!(ran.stdout.contains(module), "{module} is not loaded: {ran:?}");
   }
 }
 
-/// Mounts the share of the host's directory `shared`, and reads and writes
-/// files on it.
+/// Mounts the virtio-fs share of `shared` and reads and writes through it.
 fn shares_files_with_the_host(cold: &Machine, shared: &Path) {
   cold
     .mount_share("shared", "/mnt/shared")
@@ -208,7 +207,7 @@ fn shares_files_with_the_host(cold: &Machine, shared: &Path) {
     .agent
     .check(
       &sh("cat /mnt/shared/from-host && echo written in the guest > /mnt/shared/from-guest"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("use the share");
   assert_eq!(ran.lines(), ["written on the host"]);
@@ -218,14 +217,14 @@ fn shares_files_with_the_host(cold: &Machine, shared: &Path) {
   );
 }
 
-/// Saves the guest's state to `state`. Saving unmounts the share, so saving
-/// fails while the share is in use.
+/// Saves the guest's state to `state`. Saving first unmounts every virtiofs
+/// file system, so it fails while the share is busy.
 fn saves_with_the_share_unused(cold: &Machine, state: &Path) {
   cold
     .agent
     .check(
       &sh("(cd /mnt/shared && touch /tmp/busy && exec sleep 30) >/dev/null 2>&1 & while [ ! -e /tmp/busy ]; do sleep 0.1; done"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("use the share in the background");
   cold.save(state).expect_err("save with the share in use");
@@ -233,13 +232,13 @@ fn saves_with_the_share_unused(cold: &Machine, state: &Path) {
     .agent
     .check(
       &sh("pkill -x sleep; while pgrep -x sleep >/dev/null; do sleep 0.1; done"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("stop using the share");
   // Set the guest's clock an hour behind. Restoring should correct it.
   cold
     .agent
-    .check(&sh("date -f %s $(($(date +%s) - 3600))"), SECONDS)
+    .check(&sh("date -f %s $(($(date +%s) - 3600))"), TIMEOUT)
     .expect("set the guest's clock back");
   cold.save(state).expect("save");
 }
@@ -254,12 +253,12 @@ fn resumes_where_it_left_off(restored: &Machine) {
     .agent
     .check(
       &sh("ping -c 1 -t 5 $(route -n get default | awk '/gateway:/ { print $2 }')"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("ping the gateway after restoring");
   let guest: u64 = restored
     .agent
-    .check(&["date", "+%s"], SECONDS)
+    .check(&["date", "+%s"], TIMEOUT)
     .expect("read the guest's clock")
     .stdout
     .trim()
@@ -282,14 +281,14 @@ fn resumes_where_it_left_off(restored: &Machine) {
     .agent
     .check(
       &sh("echo restored; cat /mnt/shared/from-host /mnt/shared/from-guest"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("use the share after restoring");
   assert_eq!(ran.lines(), ["restored", "written on the host", "written in the guest"]);
 }
 
-/// Runs a command in a terminal, reading its output before it exits: FreeBSD
-/// frees a terminal's unread output a second after its last close.
+/// Runs a command on a pty, reading its output before it exits: FreeBSD
+/// discards a pty's unread output a second after its last close.
 fn runs_a_command_in_a_terminal(restored: &Machine) {
   let terminal = restored
     .agent
@@ -344,7 +343,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   pool_the_userland(&machine);
   let gateway = machine
     .agent
-    .check(&sh("route -n get default | awk '/gateway:/ { print $2 }'"), SECONDS)
+    .check(&sh("route -n get default | awk '/gateway:/ { print $2 }'"), TIMEOUT)
     .expect("find the guest's gateway")
     .stdout
     .trim()
@@ -407,17 +406,17 @@ fn boot_for_jails(work: &Path) -> Machine {
   // before the network.
   machine
     .agent
-    .check(&["route", "-n", "get", "default"], SECONDS)
+    .check(&["route", "-n", "get", "default"], TIMEOUT)
     .expect("a default route");
   machine
     .mount_share("userland", "/mnt/userland")
     .expect("mount the userland's share");
   // The guest runs DHCP on its NAT device only, leaving the spare interface
-  // for a jail to claim. rc starts devd after the network, so waiting for devd
-  // waits for the network configuration.
+  // for a jail to claim. rc starts devd after netif, so waiting for devd waits
+  // for the interfaces' configuration.
   machine
     .agent
-    .check(&sh("until pgrep -qx devd; do sleep 0.5; done"), SECONDS)
+    .check(&sh("until pgrep -qx devd; do sleep 0.5; done"), TIMEOUT)
     .expect("rc configures the network");
   let mac = layout.mac.map(|byte| format!("{byte:02x}")).join(":");
   machine
@@ -426,12 +425,12 @@ fn boot_for_jails(work: &Path) -> Machine {
       &sh(&format!(
         "ifconfig vtnet0 | grep -q 'ether {mac}' && ifconfig vtnet0 | grep -q ACCEPT_RTADV"
       )),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("vtnet0 is the NAT device, taking router advertisements");
   machine
     .agent
-    .check(&sh(UNCONFIGURED), SECONDS)
+    .check(&sh(UNCONFIGURED), TIMEOUT)
     .expect("the spare has no address");
   machine
 }
@@ -455,18 +454,17 @@ fn pool_the_userland(machine: &Machine) {
     .expect("snapshot the userland");
 }
 
-/// Runs commands in a jail on the clone at `root`.
 fn runs_commands_in_a_jail(machine: &Machine, root: &str) {
   let jail = Jail::start(&machine.agent, "first", root, &Network::None, &["mount.devfs"]).expect("start a jail");
   let ran = jail
-    .check(&["freebsd-version", "-u"], SECONDS)
+    .check(&["freebsd-version", "-u"], TIMEOUT)
     .expect("run a command in the jail");
   assert!(ran.stdout.starts_with("15.1-RELEASE"), "{ran:?}");
   // The jail's root is the clone, which has no agent; only the guest does.
   jail
     .check(
       &["test", "!", "-e", "/usr/local/sbin/containerization-freebsd-agent"],
-      SECONDS,
+      TIMEOUT,
     )
     .expect("a root of its own");
 
@@ -483,11 +481,11 @@ fn runs_commands_in_a_jail(machine: &Machine, root: &str) {
   assert_eq!(process.recv().expect("its exit"), Output::Exited(Exit::Code(0)));
   machine
     .agent
-    .check(&["test", "-e", &format!("{root}/root/mark")], SECONDS)
+    .check(&["test", "-e", &format!("{root}/root/mark")], TIMEOUT)
     .expect("the clone has the jail's file");
   machine
     .agent
-    .check(&["test", "!", "-e", "/images/userland/root/mark"], SECONDS)
+    .check(&["test", "!", "-e", "/images/userland/root/mark"], TIMEOUT)
     .expect("the userland does not");
 
   jail.stop().expect("stop the jail");
@@ -504,7 +502,7 @@ fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str
     .agent
     .check(
       &["rm", &format!("{root}/sbin/ifconfig"), &format!("{root}/sbin/route")],
-      SECONDS,
+      TIMEOUT,
     )
     .expect("remove the clone's ifconfig and route");
 
@@ -518,11 +516,11 @@ fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str
     )
     .unwrap_or_else(|error| panic!("start a jail with {network:?}: {error}"));
     let ran = jail
-      .run(&["ping", "-c", "1", "-t", "5", gateway], SECONDS)
+      .run(&["ping", "-c", "1", "-t", "5", gateway], TIMEOUT)
       .unwrap_or_else(|error| panic!("ping with {network:?}: {error}"));
     assert_eq!(ran.exit == Exit::Code(0), reaches, "{network:?}: {ran:?}");
     let ran = jail
-      .run(&INTERNET, SECONDS)
+      .run(&INTERNET, TIMEOUT)
       .unwrap_or_else(|error| panic!("connect out with {network:?}: {error}"));
     assert_eq!(
       ran.exit == Exit::Code(0),
@@ -543,7 +541,7 @@ fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str
   }
   machine
     .agent
-    .check(&sh("! ifconfig -g epair | grep -q ."), SECONDS)
+    .check(&sh("! ifconfig -g epair | grep -q ."), TIMEOUT)
     .expect("no epairs left behind");
 }
 
@@ -577,11 +575,11 @@ fn caches_build_steps(machine: &Machine) {
   let built = zfs.mountpoint(built).expect("find the build");
   machine
     .agent
-    .check(&sh(&format!("[ \"$(cat {built}/two)\" = one ]")), SECONDS)
+    .check(&sh(&format!("[ \"$(cat {built}/two)\" = one ]")), TIMEOUT)
     .expect("each step builds on the one before");
   machine
     .agent
-    .check(&["test", "!", "-e", &format!("{built}/etc/resolv.conf")], SECONDS)
+    .check(&["test", "!", "-e", &format!("{built}/etc/resolv.conf")], TIMEOUT)
     .expect("the guest's resolver is not built in");
 
   // A changed step rebuilds from that step on. A failing step leaves no
@@ -606,21 +604,21 @@ fn caches_build_steps(machine: &Machine) {
     .agent
     .check(
       &sh("[ $(zfs list -H -r -d 1 -o name images/builds | wc -l) -eq 4 ]"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("only the steps that built have datasets");
 }
 
 /// Runs a container: a main process that stops cleanly on SIGTERM, in a jail
 /// with its own hostname, resolver, hosts, mounts and sockets. The sockets
-/// live in the temp directory because the work directory's paths are too
-/// long for a socket address.
+/// live in the temp directory because the work directory's paths overflow
+/// `sun_path`.
 fn runs_a_container(machine: &Machine, containers: &Containers) {
   machine
     .agent
     .check(
       &sh("mkdir -p /var/cfbsd-data && echo hello > /var/cfbsd-data/greeting"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("make a guest directory to mount");
   let sockets = std::env::temp_dir().join(format!("cfbsd-{}", std::process::id()));
@@ -636,10 +634,10 @@ fn runs_a_container(machine: &Machine, containers: &Containers) {
     .expect("create a container");
   assert_eq!(containers.list().expect("list containers"), ["web"]);
   web.start().expect("start its main process");
-  let main = web.process().expect("its main process");
+  let main = web.main_process().expect("its main process");
   assert_eq!(main.recv().expect("its output"), Output::Stdout(b"started\n".to_vec()));
 
-  sets_its_hostname_and_resolver(&web);
+  sets_its_hostname_resolver_and_hosts(&web);
   uses_its_mounts(&web);
   runs_processes_as_its_users(&web);
   relays_its_sockets(&web, &web_socket);
@@ -656,7 +654,7 @@ fn runs_a_container(machine: &Machine, containers: &Containers) {
         "! mount -p | awk '{ print $2 }' | grep -q '^/images/containers/web/' && \
          test ! -e /images/containers/web/scratch/x",
       ),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("its mounts are gone, and the tmpfs's file with them");
   let mut stdout = Vec::new();
@@ -688,9 +686,10 @@ fn web_configuration(host_socket: &Path, web_socket: &Path) -> Configuration {
     },
     hostname: Some("web.test".into()),
     network: Network::Nat,
-    // The container's own loopback, where nothing answers. getent asks
-    // DNS before /etc/hosts, and a nameserver outside the guest would
-    // stall it until the Mac's network dropped the query.
+    // The container's own loopback, where nothing answers. getent looks up
+    // IPv6 first, which /etc/hosts lacks for db, so it asks DNS; a
+    // nameserver outside the guest would stall it until the Mac's network
+    // dropped the query.
     dns: Some(Dns {
       nameservers: vec!["127.0.0.1".into()],
       search: vec!["test".into()],
@@ -723,10 +722,9 @@ fn web_configuration(host_socket: &Path, web_socket: &Path) -> Configuration {
   }
 }
 
-/// Checks the container's hostname, resolver and hosts.
-fn sets_its_hostname_and_resolver(web: &Container) {
+fn sets_its_hostname_resolver_and_hosts(web: &Container) {
   let ran = web
-    .check(&sh("hostname; cat /etc/resolv.conf; getent hosts db"), SECONDS)
+    .check(&sh("hostname; cat /etc/resolv.conf; getent hosts db"), TIMEOUT)
     .expect("run a command in the container");
   let lines = ran.lines();
   assert_eq!(
@@ -740,21 +738,21 @@ fn sets_its_hostname_and_resolver(web: &Container) {
   );
 }
 
-/// Uses the container's mounts: a host share, a read-only guest directory,
-/// and a tmpfs.
+/// Uses the container's mounts: nullfs mounts of a virtio-fs share and of a
+/// read-only guest directory, and a tmpfs.
 fn uses_its_mounts(web: &Container) {
   let script = format!(
     "set -e; test -f /mnt/userland/{}; cat /var/data/greeting; \
      touch /var/data/x 2>/dev/null || echo read-only; echo kept > /scratch/x; cat /scratch/x",
     image::USERLAND
   );
-  let ran = web.check(&sh(&script), SECONDS).expect("use its mounts");
+  let ran = web.check(&sh(&script), TIMEOUT).expect("use its mounts");
   assert_eq!(ran.lines(), ["hello", "read-only", "kept"]);
 }
 
-/// Runs processes as one of the container's users, with extra groups, a
-/// umask, limits and a working directory; and as a uid the container doesn't
-/// list.
+/// Runs processes as a user in the container's passwd, with supplementary
+/// groups, a umask, rlimits and a working directory; and as a uid missing from
+/// its passwd.
 fn runs_processes_as_its_users(web: &Container) {
   let script = "id -u; id -g; id -G; umask; ulimit -n; echo \"$HOME\"; pwd";
   let (stdout, exit) = finish(
@@ -878,8 +876,8 @@ fn counts_its_statistics(web: &Container) {
   );
 }
 
-/// Checks a container's limits and statistics. Memory use is sampled once a
-/// second, so the test waits for a nonzero value.
+/// Checks a container's rctl rules and statistics. racct samples memoryuse
+/// once a second, so the test waits for a nonzero value.
 fn limits_a_container(machine: &Machine, containers: &Containers) {
   let limited = containers
     .create(
@@ -894,7 +892,7 @@ fn limits_a_container(machine: &Machine, containers: &Containers) {
     .expect("create a container with limits");
   let ran = machine
     .agent
-    .check(&["rctl", "jail:limited:"], SECONDS)
+    .check(&["rctl", "jail:limited:"], TIMEOUT)
     .expect("list its rules");
   let mut rules = ran.lines();
   rules.sort_unstable();
@@ -916,7 +914,7 @@ fn limits_a_container(machine: &Machine, containers: &Containers) {
   limited.delete().expect("delete the container with limits");
   let ran = machine
     .agent
-    .check(&["rctl", "jail:limited:"], SECONDS)
+    .check(&["rctl", "jail:limited:"], TIMEOUT)
     .expect("list its rules again");
   assert_eq!(ran.stdout, "", "its rules outlived it");
 }
@@ -929,7 +927,7 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
   assert_eq!(interface.gateway.as_deref(), Some(gateway), "{interface:?}");
   machine
     .agent
-    .check(&sh(UNCONFIGURED), SECONDS)
+    .check(&sh(UNCONFIGURED), TIMEOUT)
     .expect("leasing configures nothing");
   let address = interface
     .address
@@ -958,7 +956,7 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
   let address: std::net::SocketAddr = format!("{address}:8080").parse().expect("its address");
   let mut stream = eventually(|| std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok());
   stream
-    .set_read_timeout(Some(SECONDS))
+    .set_read_timeout(Some(TIMEOUT))
     .expect("time out reading");
   let mut answer = String::new();
   stream.read_to_string(&mut answer).expect("read from it");
@@ -967,18 +965,17 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
   drop(stream);
   assert_eq!(finish(&server), (String::new(), Exit::Code(0)));
   reachable
-    .check(&INTERNET, SECONDS)
+    .check(&INTERNET, TIMEOUT)
     .expect("connect out from its interface");
   reachable
     .delete()
     .expect("delete the container with an interface");
   machine
     .agent
-    .check(&sh("ifconfig -a | grep -q 'ether 02:00:5e:10:00:01'"), SECONDS)
+    .check(&sh("ifconfig -a | grep -q 'ether 02:00:5e:10:00:01'"), TIMEOUT)
     .expect("its device is back in the guest");
 }
 
-/// Deletes containers left behind, by id.
 fn deletes_containers_left_behind(machine: &Machine, containers: &Containers) {
   // A container whose handle was dropped can be deleted by id, mounts and all.
   drop(
@@ -1014,14 +1011,14 @@ fn deletes_containers_left_behind(machine: &Machine, containers: &Containers) {
   );
   machine
     .agent
-    .check(&["jail", "-r", "removed"], SECONDS)
+    .check(&["jail", "-r", "removed"], TIMEOUT)
     .expect("remove its jail outside");
   containers
     .delete("removed")
     .expect("delete the container whose jail is gone");
   let ran = machine
     .agent
-    .check(&["rctl", "jail:removed:"], SECONDS)
+    .check(&["rctl", "jail:removed:"], TIMEOUT)
     .expect("list its rules");
   assert_eq!(ran.stdout, "", "its rules outlived it");
   assert!(containers.list().expect("list containers").is_empty());
@@ -1032,7 +1029,7 @@ fn deletes_containers_left_behind(machine: &Machine, containers: &Containers) {
   );
   machine
     .agent
-    .check(&sh("! ifconfig -g epair | grep -q ."), SECONDS)
+    .check(&sh("! ifconfig -g epair | grep -q ."), TIMEOUT)
     .expect("no epairs left behind");
 }
 
@@ -1116,8 +1113,8 @@ fn runs_a_build_sized_workload_on_a_share() {
     .expect("mount the userland's share");
 
   // Extract the userland onto the share for many files, minus the 45 names
-  // that collide on the Mac's case-insensitive volume (cc and CC, mail and
-  // Mail, and man pages).
+  // that collide on the Mac's case-insensitive volume: CC (cc), mail (Mail),
+  // and man pages, whose trees are excluded whole.
   let extract = format!(
     "mkdir /mnt/shared/tree && tar -xf /mnt/userland/{} -C /mnt/shared/tree \
      --exclude ./usr/share/man --exclude ./usr/share/openssl/man --exclude ./usr/bin/CC --exclude ./usr/bin/mail \
@@ -1133,7 +1130,7 @@ fn runs_a_build_sized_workload_on_a_share() {
   assert_eq!(entries(&tree), in_guest, "the host sees what the guest wrote");
   let guest_sum = machine
     .agent
-    .check(&["sha256", "-q", "/mnt/shared/tree/bin/sh"], SECONDS)
+    .check(&["sha256", "-q", "/mnt/shared/tree/bin/sh"], TIMEOUT)
     .expect("checksum in the guest")
     .stdout;
   assert_eq!(guest_sum.trim(), host_sha256(&tree.join("bin/sh")));
@@ -1161,8 +1158,8 @@ fn runs_a_build_sized_workload_on_a_share() {
 }
 
 /// Returns a layer tarball holding `files`, given as paths and contents. The
-/// files are owned by root and carry none of the Mac's metadata, such as
-/// `com.apple.provenance` attributes, which FreeBSD can't restore.
+/// files are owned by root and carry no macOS metadata (AppleDouble files,
+/// ACLs, xattrs such as `com.apple.provenance`), which FreeBSD can't restore.
 fn layer(work: &Path, name: &str, files: &[(&str, &str)]) -> Vec<u8> {
   let staging = work.join(name);
   let mut tops: Vec<&str> = Vec::new();
@@ -1264,7 +1261,7 @@ fn pulls_unpacks_and_runs_oci_images() {
 
 /// Makes an image of two layers on top of the runtime's and names it
 /// `localhost/cfbsd/whiteouts:1`. The second layer whites out a file from the
-/// first, a whole directory (opaque), and a file from the runtime.
+/// first and one from the runtime's, and makes a directory opaque.
 fn layers_an_image_on_the_runtime(work: &Path, store: &ImageStore, runtime: &Image, platform: &Platform) -> Image {
   let added = layer(
     work,
@@ -1364,7 +1361,7 @@ fn runs_the_images_process(containers: &Containers, runtime: &Image, platform: &
     )
     .expect("create a container of the image");
   shell.start().expect("start its shell");
-  let main = shell.process().expect("its shell");
+  let main = shell.main_process().expect("its shell");
   main
     .write(b"freebsd-version -u; exit 3\n")
     .expect("give it commands");
@@ -1393,7 +1390,7 @@ fn applies_whiteouts(hidden: &Container) {
   let ran = hidden
     .check(
       &sh("cat /cfbsd/kept /cfbsd/x.wh.y; ls -A /cfbsd/opaque /cfbsd; test ! -e /bin/freebsd-version && echo hidden"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("look at its files");
   assert_eq!(
@@ -1413,8 +1410,8 @@ fn applies_whiteouts(hidden: &Container) {
   );
 }
 
-/// Copies files and directories in and out of `hidden`. Copying uses the
-/// guest's `/rescue` tools, not the image's.
+/// Copies files and directories in and out of `hidden`, through the guest's
+/// `/rescue` tools rather than the image's.
 fn copies_in_and_out(hidden: &Container, work: &Path) {
   let copies = work.join("copies");
   let tree = copies.join("tree");
@@ -1438,7 +1435,7 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
   let ran = hidden
     .check(
       &sh("ls -ln /cfbsd/new/big /cfbsd/tree/sub/two | while read mode links uid rest; do echo $mode $uid; done; cat /cfbsd/tree/one"),
-      SECONDS,
+      TIMEOUT,
     )
     .expect("look at the files copied in");
   assert_eq!(ran.lines(), ["-rw------- 0", "-rw-r--r-- 0", "one"]);

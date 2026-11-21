@@ -3,10 +3,10 @@
 //! reaping it, the clock, jails, pre-exec process setup, and sockets opened
 //! from inside a jail. This crate holds all of the agent's unsafe code.
 //!
-//! Descriptors this crate opens are set to close on exec, but are briefly
-//! inheritable first. Spawn processes from one thread only, as the agent's
-//! session loop does; otherwise a process spawned in that window inherits
-//! them.
+//! Descriptors from openpty(3) and SCM_RIGHTS get FD_CLOEXEC only after the
+//! call returns, so they are briefly inheritable. Spawn processes from one
+//! thread only, as the agent's session loop does; otherwise a process spawned
+//! in that window inherits them.
 
 mod clock;
 mod exec;

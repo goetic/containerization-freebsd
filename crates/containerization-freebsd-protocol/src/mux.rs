@@ -72,13 +72,14 @@ pub struct VersionMismatch {
 pub enum Error {
   Decode(DecodeError),
   Version(VersionMismatch),
-  /// A non-control message arrived before the Hellos started a session.
+  /// A channel was opened, or a non-control message sent or received, before
+  /// the Hellos started a session.
   NoSession,
   /// A message for a channel that is not open. Often the message was in
   /// flight when the channel closed.
   UnknownChannel(u32),
-  /// An opening message on a channel that is already open, or that only the
-  /// other side may open.
+  /// An opening message on a channel that is already open, or whose number
+  /// belongs to the receiver.
   BadChannel(u32),
   NotAllowed {
     channel: u32,
@@ -240,9 +241,9 @@ impl Mux {
     Ok((channel, frame))
   }
 
-  /// Sends a message on an open channel, or on [`CONTROL`]. The control
-  /// channel accepts Ping and Pong from either side, Received from the guest,
-  /// and SetTime from the host.
+  /// Frames a message for an open channel or [`CONTROL`], if this side may
+  /// send it now. The control channel accepts Ping and Pong from either side,
+  /// Received from the guest, and SetTime from the host.
   pub fn send(&mut self, channel: u32, message: Message) -> Result<Frame, Error> {
     if channel == CONTROL {
       return match message {

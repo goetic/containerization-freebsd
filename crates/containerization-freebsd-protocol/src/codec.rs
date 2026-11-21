@@ -66,15 +66,15 @@ impl<'a> Reader<'a> {
     Ok(taken)
   }
 
-  /// A list's length.
+  /// A string's or list's length prefix.
   fn length(&mut self) -> Result<usize, DecodeError> {
     self.get::<u32>().map(|length| length as usize)
   }
 }
 
-/// Converts a length for the wire. A length that does not fit in a u32 also
-/// exceeds MAX_PAYLOAD, so the frame is refused before it is sent.
-fn length(length: usize) -> u32 {
+/// Saturating is safe: a length over u32::MAX also exceeds MAX_PAYLOAD, so
+/// the frame is refused before it is sent.
+fn wire_length(length: usize) -> u32 {
   u32::try_from(length).unwrap_or(u32::MAX)
 }
 
@@ -114,7 +114,7 @@ impl Decode for bool {
 
 impl Encode for str {
   fn encode(&self, out: &mut Writer) {
-    out.put(&length(self.len()));
+    out.put(&wire_length(self.len()));
     out.0.extend_from_slice(self.as_bytes());
   }
 }
@@ -154,7 +154,7 @@ impl<T: Decode> Decode for Option<T> {
 
 impl<T: Encode> Encode for Vec<T> {
   fn encode(&self, out: &mut Writer) {
-    out.put(&length(self.len()));
+    out.put(&wire_length(self.len()));
     for item in self {
       out.put(item);
     }

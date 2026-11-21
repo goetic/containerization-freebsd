@@ -9,9 +9,9 @@
 #
 # The target is Tier 3, so Rust ships no std for it. Cargo builds std from the
 # toolchain's rust-src (-Zbuild-std), which RUSTC_BOOTSTRAP allows on the
-# pinned stable toolchain. The agent links with LLVM against FreeBSD's own
+# pinned stable toolchain. clang and ld.lld link the agent against FreeBSD's
 # libraries from the release's base.txz. Set CROSS_BINDIR to the directory
-# holding clang and ld.lld, as for guest/build-modules.
+# holding them, as for guest/build-modules.
 
 set -eu
 

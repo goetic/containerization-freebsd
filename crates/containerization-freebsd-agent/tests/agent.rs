@@ -481,9 +481,8 @@ fn writes_all_the_host_sent_before_its_eof_closes_a_relay() {
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let port = listener.local_addr().unwrap().port();
   let (eof_sent, wait_for_eof) = mpsc::channel();
-  // The server half-closes at once, so the host's Eof closes the
-  // relay. It reads nothing until then, so the host's data backs up in the
-  // agent.
+  // The server half-closes at once, so the host's Eof closes the relay. It
+  // reads nothing until then, so the host's Data backs up in the agent.
   let server = std::thread::spawn(move || {
     let (mut stream, _) = listener.accept().unwrap();
     stream.shutdown(Shutdown::Write).unwrap();

@@ -257,7 +257,8 @@ impl<W: Write> Agent<W> {
       // itself once so the host starts a new one; frames still arriving
       // from the old session are then dropped.
       Err(Error::NoSession) if !self.announced => self.announce(),
-      // The frame crossed the channel's close in flight.
+      // A frame from the old session after the announcement, or one that
+      // crossed its channel's close in flight.
       Err(Error::NoSession | Error::UnknownChannel(_)) => Ok(()),
       Err(error) => {
         eprintln!("agent: refused a frame on channel {channel}: {error}");
@@ -387,9 +388,8 @@ impl<W: Write> Agent<W> {
     }
   }
 
-  /// Sends a message to the host. If the message closes the channel (Exited,
-  /// Error, or a relay's final Eof), the channel is forgotten, since its work
-  /// has finished.
+  /// Sends a message to the host. If it closes the channel (Exited, Error, or
+  /// the second Eof on a relay or listener), the channel is forgotten.
   fn send(&mut self, channel: u32, message: Message) -> io::Result<()> {
     match self.mux.send(channel, message) {
       Ok(frame) => self.write(&frame)?,

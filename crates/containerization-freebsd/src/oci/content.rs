@@ -5,9 +5,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Blobs stored by digest at `blobs/sha256/<hex>` under the root, as in an OCI
-/// image layout. A blob is written under `ingest/` first and moved into place
-/// only after its digest is verified.
+/// Blobs at `blobs/sha256/<hex>` under the root, as in an OCI image layout.
+/// Each is written under `ingest/` and renamed into place only once its
+/// digest is verified.
 #[derive(Clone, Debug)]
 pub struct ContentStore {
   root: PathBuf,
@@ -40,7 +40,6 @@ impl ContentStore {
     std::fs::read(&path).map_err(Error::io(format!("reading blob {digest}")))
   }
 
-  /// Reads the index or manifest that `descriptor` names.
   pub(crate) fn document(&self, descriptor: &Descriptor) -> Result<Document> {
     if descriptor.is_index() {
       let bytes = self.read(&descriptor.digest)?;
@@ -50,7 +49,6 @@ impl ContentStore {
     }
   }
 
-  /// Reads the manifest that `descriptor` names.
   pub(crate) fn manifest(&self, descriptor: &Descriptor) -> Result<Manifest> {
     parse(
       &self.read(&descriptor.digest)?,
@@ -58,7 +56,6 @@ impl ContentStore {
     )
   }
 
-  /// Reads `manifest`'s config.
   pub(crate) fn config(&self, manifest: &Manifest) -> Result<ImageConfig> {
     parse(
       &self.read(&manifest.config.digest)?,
@@ -76,9 +73,8 @@ impl ContentStore {
     Ok(digest)
   }
 
-  /// Moves the file at `partial`, a path from `partial()`, into the store as
-  /// `descriptor`'s blob. If the file's digest or size differs from the
-  /// descriptor's, the file is deleted instead.
+  /// Moves `partial`, a path from `partial()`, into the store as
+  /// `descriptor`'s blob, or deletes it if its digest or size differs.
   pub(crate) fn ingest_file(&self, partial: &Path, descriptor: &Descriptor) -> Result<()> {
     let (digest, size) = sha256_file(partial)?;
 
@@ -93,8 +89,8 @@ impl ContentStore {
     self.commit(partial, &digest)
   }
 
-  /// Stores the contents of `reader` as the blob `digest`, failing if the
-  /// contents have a different digest.
+  /// Stores `reader`'s contents as the blob `digest`, failing on a digest
+  /// mismatch.
   pub(crate) fn ingest_from(&self, reader: &mut impl Read, digest: &str) -> Result<()> {
     let partial = self.partial();
     let written = File::create(&partial).and_then(|mut file| io::copy(reader, &mut file));
@@ -119,7 +115,8 @@ impl ContentStore {
     }
   }
 
-  /// A unique path under `ingest/` to write a blob to before it is verified.
+  /// A unique path under `ingest/`, on the store's file system so that a
+  /// verified blob can be renamed into place.
   pub(crate) fn partial(&self) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -141,7 +138,6 @@ impl ContentStore {
     }
   }
 
-  /// The digests of all blobs in the store.
   pub fn digests(&self) -> Result<Vec<String>> {
     let directory = self.root.join("blobs/sha256");
     let listing = || format!("listing {}", directory.display());

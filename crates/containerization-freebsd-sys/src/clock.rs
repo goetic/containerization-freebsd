@@ -3,7 +3,8 @@
 use crate::check;
 use std::io;
 
-/// Sets the clock to `seconds` and `nanoseconds` past the Unix epoch.
+/// Sets CLOCK_REALTIME to `seconds` and `nanoseconds` past the Unix epoch,
+/// clamping `nanoseconds` to the range clock_settime(2) accepts.
 pub fn set_time(seconds: u64, nanoseconds: u32) -> io::Result<()> {
   let time = libc::timespec {
     tv_sec: seconds as libc::time_t,

@@ -1,4 +1,4 @@
-//! Manages FreeBSD jails in the guest through the guest agent.
+//! FreeBSD jails in the guest, managed through the guest agent.
 
 mod mount;
 mod network;
@@ -17,8 +17,8 @@ use std::path::Path;
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
-/// How long `scripts::GONE` may wait. Longer than TIME_WAIT, which is twice
-/// FreeBSD's default MSL of 30 seconds.
+/// How long `scripts::GONE` may wait: longer than TIME_WAIT, which is 2 × MSL
+/// (`net.inet.tcp.msl`, 30 s by default).
 const DYING: Duration = Duration::from_secs(90);
 
 pub struct Jail<'a> {
@@ -27,11 +27,10 @@ pub struct Jail<'a> {
 }
 
 impl<'a> Jail<'a> {
-  /// Starts a persistent jail named `name`, rooted at `path` in the guest.
-  /// The hostname is `name` unless `parameters` set one. `parameters` are
-  /// jail(8) parameters, as `key=value` or a bare flag such as `mount.devfs`.
-  /// A jail with a network gets the guest's resolver configuration if it has
-  /// none of its own.
+  /// Creates a persistent jail named `name`, rooted at guest path `path`.
+  /// `parameters` are jail(8) parameters, as `key=value` or a bare boolean
+  /// such as `mount.devfs`; `host.hostname` defaults to `name`. A jail with a
+  /// network gets a copy of the guest's resolv.conf unless its root has one.
   pub fn start(agent: &'a Agent, name: &str, path: &str, network: &Network, parameters: &[&str]) -> Result<Self> {
     let (name_parameter, path_parameter, hostname) = (
       format!("name={name}"),
@@ -96,7 +95,7 @@ impl<'a> Jail<'a> {
   }
 
   /// Connects to `port` on the jail's loopback, which is the guest's unless
-  /// the jail has its own network.
+  /// it is a VNET jail.
   pub fn connect(&self, port: u16) -> Result<Relay> {
     self.agent.relay(Connect {
       to: Address::Port(port),
@@ -117,9 +116,10 @@ impl<'a> Jail<'a> {
     self.agent.relay_socket_in(socket, Some(&self.name))
   }
 
-  /// Replaces the jail's limits with rctl(8). The jail's processes together
-  /// get `cpus` CPUs and `memory_in_bytes` of resident memory. Beyond those
-  /// limits they are slowed or paged out. `stop` lifts the limits.
+  /// Replaces the jail's rctl(8) rules with `pcpu` and `memoryuse` deny
+  /// limits on all its processes together: `cpus` CPUs and `memory_in_bytes`
+  /// resident. Over a limit, they're throttled or paged out. `stop` lifts the
+  /// rules.
   pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Result<()> {
     let rules = quota::rules(&self.name, cpus, memory_in_bytes);
     let mut args = vec![self.name.as_str()];
@@ -131,24 +131,23 @@ impl<'a> Jail<'a> {
       .map(|_| ())
   }
 
-  /// Copies `source`, a file or directory on the host, into the jail, like
-  /// Containerization's `copyIn`. The copy goes to `destination`, or into it
-  /// if it is a directory. A copied file gets `mode`. With `create_parents`,
-  /// missing parent directories are made. Paths resolve as the jail sees them.
+  /// Copies `source`, a host file or directory, into the jail, like
+  /// Containerization's `copyIn`: to `destination`, or into it if it is a
+  /// directory. A copied file gets `mode`. `create_parents` creates missing
+  /// parents. Paths resolve as the jail sees them.
   pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, create_parents: bool) -> Result<()> {
     copy::copy_in(self, source, destination, mode, create_parents)
   }
 
-  /// Copies `source`, a file or directory in the jail, to `destination` on
-  /// the host, like Containerization's `copyOut`. A file is written with mode
-  /// 0644; a directory's contents are copied into `destination`. With
-  /// `create_parents`, the destination's missing parents are made.
+  /// Copies `source`, a file or directory in the jail, to host path
+  /// `destination`, like Containerization's `copyOut`. A file is written 0644;
+  /// a directory's contents go into `destination`. `create_parents` creates
+  /// missing parents.
   pub fn copy_out(&self, source: &str, destination: &Path, create_parents: bool) -> Result<()> {
     copy::copy_out(self, source, destination, create_parents)
   }
 
-  /// Returns the jail's combined resource usage as rctl(8) accounts it, and
-  /// its network counters.
+  /// The jail's aggregate racct usage (`rctl -u`) and its interface counters.
   pub fn statistics(&self) -> Result<Statistics> {
     let ran = self
       .agent
@@ -182,11 +181,11 @@ impl<'a> Jail<'a> {
   }
 
   /// Stops the jail: kills its processes, drops the TCP connections they
-  /// left, and waits for the jail to disappear. A connection that cannot be
-  /// dropped delays this by about a minute. Then it runs `clean_up` and
-  /// destroys the jail's epair. By then the devices of the jail's interfaces
-  /// are back in the guest. Once the jail is removed, a failed step does not
-  /// skip the rest, and the first failure is returned.
+  /// left, removes it and waits for it to finish dying, about a minute longer
+  /// if a connection couldn't be dropped. Then runs `clean_up` and destroys
+  /// the jail's epair; by then the jail's interface devices are back in the
+  /// guest. After removal, a failed step doesn't skip the rest; the first
+  /// failure is returned.
   pub fn stop(self) -> Result<()> {
     let ran = self
       .agent
@@ -197,7 +196,8 @@ impl<'a> Jail<'a> {
       .rsplit_once(' ')
       .ok_or_else(|| Error::Guest(format!("jls described jail {}: {:?}", self.name, ran.stdout)))?;
     let mut steps = Steps::default();
-    // Only a VNET jail has interfaces of its own; other jails see the guest's.
+    // Only a VNET jail has its own interfaces. List its epairs while it can
+    // still be entered.
     let epairs = if vnet == "new" {
       steps
         .take(self.rescue(&["ifconfig", "-g", "epair"]))
@@ -217,8 +217,8 @@ impl<'a> Jail<'a> {
         .agent
         .check(&scripts::DROP.argv(&[&self.name, vnet]), QUICK),
     );
-    // If removal fails, the jail is still running, so stop returns early and a
-    // later `find` can stop it again.
+    // A failed removal leaves the jail running: return early so a later
+    // `find` can stop it again.
     if steps
       .take(self.agent.check(&["jail", "-r", &self.name], QUICK))
       .is_none()
@@ -228,8 +228,8 @@ impl<'a> Jail<'a> {
     steps.take(self.agent.check(&scripts::GONE.argv(&[&self.name]), DYING));
     steps.take(clean_up(self.agent, &self.name, path));
 
-    // Destroying one end of an epair destroys both. The outside end belongs
-    // to the guest even while the jail is dying.
+    // Destroy the outside (a) end, which stays in the guest's vnet even while
+    // the jail is dying; that destroys both ends.
     for inside in epairs {
       if let Some(unit) = inside.strip_suffix('b') {
         steps.take(
@@ -242,8 +242,8 @@ impl<'a> Jail<'a> {
     steps.finish()
   }
 
-  /// Like `check`, but runs the guest's `/rescue` tool that `argv` names, so
-  /// the jail does not need to have the tool.
+  /// Like `check`, but runs the guest's `/rescue` tool `argv` names, so the
+  /// jail needn't have it.
   fn rescue(&self, argv: &[&str]) -> Result<Ran> {
     let exec = Exec {
       argv: argv.iter().map(|arg| arg.to_string()).collect(),
@@ -262,12 +262,12 @@ impl<'a> Jail<'a> {
   }
 }
 
-/// Cleans up after the removed jail named `name`, rooted at `path`. It lifts
-/// the jail's limits, which rctl otherwise keeps by name for the next jail of
-/// that name. It also unmounts everything in the root except ZFS datasets.
-/// That includes devfs: jail(8) mounts it for `mount.devfs` but cannot unmount
-/// it, because the parameter belongs to jail(8), not the kernel, so a jail
-/// removed by name has no record of it.
+/// Cleans up after the removed jail `name`, rooted at `path`: removes its
+/// rctl rules, which rctl otherwise keeps by name for the next jail of that
+/// name, and unmounts everything under the root except ZFS datasets. That
+/// includes devfs: jail(8) mounts it for `mount.devfs`, but `jail -r <name>`
+/// can't unmount it, because the parameter lives in jail(8), not the kernel,
+/// so a jail removed by name has no record of it.
 pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   let mut steps = Steps::default();
 
@@ -276,8 +276,7 @@ pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   steps.finish()
 }
 
-/// Collects the first failure among steps that each run even if earlier ones
-/// failed.
+/// Keeps the first failure among steps that each run regardless.
 #[derive(Default)]
 struct Steps(Option<Error>);
 

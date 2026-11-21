@@ -1,9 +1,8 @@
 //! Copies files and directories between the host and a jail, like
-//! Containerization's `copyIn` and `copyOut`. Each step in the jail runs a
-//! tool from the guest's `/rescue`, so it works whatever the jail contains.
-//! The tools run inside the jail, so paths resolve as the jail sees them and
-//! no symbolic link leads out of it. A directory is sent as a tar archive,
-//! with the host's `tar` at the other end.
+//! Containerization's `copyIn` and `copyOut`. Jail-side steps run the guest's
+//! `/rescue` tools inside the jail, so they work whatever the jail contains,
+//! paths resolve as the jail sees them, and no symlink escapes it.
+//! Directories travel as tar streams, with the host's `tar` at the other end.
 
 use crate::agent::{Exec, Exit, Output, Process};
 use crate::error::{Error, Result};
@@ -15,8 +14,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread::{self, JoinHandle};
 
-/// Metadata the jail's tar leaves out because the other system cannot store
-/// it.
+/// Makes the jail's tar skip ACLs, file flags and xattrs, which don't carry
+/// over between FreeBSD and macOS.
 const PORTABLE: [&str; 3] = ["--no-acls", "--no-fflags", "--no-xattrs"];
 
 /// The type of file at a path in a jail.
@@ -26,8 +25,7 @@ enum Kind {
   Directory,
   /// A regular file.
   File,
-  /// A FIFO, device, or socket. Reading or writing one could block or never
-  /// end.
+  /// A FIFO, device or socket, where I/O could block or never end.
   Other,
 }
 
@@ -48,14 +46,13 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
   if !directory {
     let mut file = File::open(source).map_err(Error::io(format!("reading {}", source.display())))?;
     let argv = ["dd", &format!("of={target}"), "bs=64k", "status=none"];
-    // The umask keeps the file unreadable to the jail's users until chmod
-    // gives it its mode.
+    // The umask keeps the file private to its owner until chmod sets `mode`.
     let dd = jail.spawn(Exec {
       umask: Some(0o077),
       ..rescue_exec(&argv)
     })?;
     feed(dd, &argv, &mut file, &source.display().to_string())?;
-    // chmod(1) parses no options after the mode, so a `--` there would be
+    // No `--`: chmod(1) parses no options after the mode, so it would be
     // taken as a file name.
     return check(jail, &["chmod", &format!("{mode:o}"), &target]);
   }
@@ -194,12 +191,11 @@ fn kind(jail: &Jail, path: &str) -> Result<Kind> {
   })
 }
 
-/// Starts the `/rescue` tool that `argv` names in the jail.
+/// Starts the `/rescue` tool that `argv` names, in the jail.
 fn rescue(jail: &Jail, argv: &[&str]) -> Result<Process> {
   jail.spawn(rescue_exec(argv))
 }
 
-/// Builds an `Exec` that runs the `/rescue` tool `argv` names.
 fn rescue_exec(argv: &[&str]) -> Exec {
   Exec {
     argv: argv.iter().map(|arg| arg.to_string()).collect(),
@@ -212,9 +208,9 @@ fn check(jail: &Jail, argv: &[&str]) -> Result<()> {
   finish(&rescue(jail, argv)?, argv, &mut io::sink())
 }
 
-/// Writes everything read from `source` (described by `what`) to the
-/// process's stdin, then waits for the process to exit 0. If the process
-/// stops accepting input, the process's own failure is the error returned.
+/// Streams `source` (`what` in errors) to the process's stdin, then waits for
+/// it to exit 0. If the process stops reading, its own failure is the error
+/// returned.
 fn feed(process: Process, argv: &[&str], source: &mut impl Read, what: &str) -> Result<()> {
   let mut buffer = vec![0; 64 * 1024];
   let sent = loop {
@@ -256,8 +252,8 @@ fn wait(process: &Process, sink: &mut impl Write) -> Result<(Exit, String)> {
   }
 }
 
-/// The host's tar process. Its stderr is read while it runs so that a full
-/// pipe cannot stall it. Dropping this before `finish` kills the process.
+/// The host's tar. Its stderr is drained while it runs so a full pipe can't
+/// stall it. Dropping this before `finish` kills and reaps it.
 struct HostTar {
   child: Child,
   stderr: Option<JoinHandle<String>>,
@@ -265,8 +261,7 @@ struct HostTar {
 
 impl Drop for HostTar {
   fn drop(&mut self) {
-    // After `finish`, this does nothing: the child has been reaped, so `kill`
-    // sends no signal.
+    // A no-op after `finish`: the child is reaped, so `kill` sends no signal.
     let _ = self.child.kill();
     let _ = self.child.wait();
   }
@@ -274,7 +269,7 @@ impl Drop for HostTar {
 
 impl HostTar {
   fn start(command: &mut Command) -> Result<Self> {
-    // Without COPYFILE_DISABLE, macOS's tar archives extended attributes as
+    // Without COPYFILE_DISABLE, macOS's tar archives xattrs as AppleDouble
     // `._` files.
     let mut child = command
       .env("COPYFILE_DISABLE", "1")

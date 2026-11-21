@@ -3,9 +3,9 @@
 use containerization_freebsd::image;
 use std::path::PathBuf;
 
-/// The cache directory that holds FreeBSD's VM image, the guest bundle and
-/// the userland for jails. They are downloaded once and kept across runs,
-/// about 900 MB in all.
+/// The cache directory, kept across runs. It holds FreeBSD's VM image, the
+/// guest bundle and the userland for jails, downloaded once (about 900 MB in
+/// all), and the image store the OCI suite pulls into.
 pub fn cache() -> PathBuf {
   PathBuf::from(std::env::var_os("HOME").expect("HOME is set")).join(".cache/containerization-freebsd-tests")
 }

@@ -1,10 +1,10 @@
 #!/bin/sh
-# Ends the processes of the jail named $1 as `jail -r` would, with SIGTERM
-# and 10 seconds to exit. It then drops the TCP connections they left, which
-# would otherwise keep the removed jail dying through TIME_WAIT. A VNET jail
-# ($2 is `new`) has its own network stack, so only a tcpdrop run inside it, if
-# it has one, reaches its connections. A non-VNET jail's connections are in
-# the guest's stack, and netstat lists them.
+# Ends the processes of jail $1 as `jail -r` would: SIGTERM and 10 seconds to
+# exit. Then drops the TCP connections they left, which would otherwise keep
+# the removed jail dying through TIME_WAIT. A VNET jail ($2 is `new`) has its
+# own stack, so only a tcpdrop run inside it, if it has one, reaches them. A
+# non-VNET jail's connections are in the guest's stack, where netstat -j
+# lists them.
 jid=$(jls -j "$1" jid)
 pkill -j "$jid"
 tries=100

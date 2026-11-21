@@ -1,7 +1,7 @@
-//! The messages that frames carry. A message is encoded as a frame's kind and
-//! a payload of its fields in order, encoded as `codec` describes, with no
-//! trailing bytes. An enum's variant is a u8 tag before its fields. The
-//! payload of Data, Stderr and Error is the raw bytes alone.
+//! The messages that frames carry. A message is a frame's kind and a payload
+//! of its fields in order, encoded as `codec` describes, with no trailing
+//! bytes. An enum's variant is a u8 tag before its fields. The payload of
+//! Data, Stderr and Error is the raw bytes alone.
 
 use crate::codec::{Decode, Encode, Reader, Writer, encode};
 use crate::frame::Frame;
@@ -23,8 +23,8 @@ pub enum Message {
   /// Control, from the guest. The number of console bytes the agent has read
   /// since its last Received. Each report lets the host send that many more.
   Received(u32),
-  /// Control, from the host. The time since the Unix epoch, to which the
-  /// guest sets its clock.
+  /// Control, from the host. Sets the guest's clock to this time since the
+  /// Unix epoch.
   SetTime {
     seconds: u64,
     nanoseconds: u32,
@@ -64,18 +64,18 @@ pub struct Exec {
   pub env: Vec<(String, String)>,
   /// The working directory, as a path inside the jail if there is one.
   pub cwd: Option<String>,
-  /// Runs the process on a pseudo-terminal of this size, which merges stderr
-  /// into Data. `None` uses pipes.
+  /// Runs the process on a pty of this size, which merges stderr into Data.
+  /// `None` uses pipes.
   pub pty: Option<WindowSize>,
   /// The name of the jail to run in. `None` runs in the guest.
   pub jail: Option<String>,
   /// The user to run as. `None` runs as root, like the agent.
   pub user: Option<User>,
-  /// The file mode creation mask. `None` inherits the agent's.
+  /// `None` inherits the agent's.
   pub umask: Option<u16>,
   pub limits: Vec<Limit>,
-  /// Runs the tool in the guest's `/rescue` that `argv[0]` names. Those tools
-  /// are static binaries, so they need not exist inside the jail.
+  /// Runs the guest's `/rescue` tool that `argv[0]` names. The tools are
+  /// statically linked, so they need not exist inside the jail.
   pub rescue: bool,
 }
 
@@ -88,7 +88,7 @@ pub struct User {
   /// A group name or gid. If set, it replaces the user's primary group and
   /// the groups that list the user.
   pub group: Option<String>,
-  /// Additional groups, by name or gid.
+  /// Supplementary groups, by name or gid, added even if `group` is set.
   pub groups: Vec<String>,
 }
 
@@ -113,7 +113,7 @@ impl Resource {
   pub const FILE_SIZE: Self = Self(1);
   pub const DATA: Self = Self(2);
   pub const STACK: Self = Self(3);
-  /// The size of a core dump.
+  /// The largest core dump.
   pub const CORE: Self = Self(4);
   pub const RESIDENT: Self = Self(5);
   pub const LOCKED_MEMORY: Self = Self(6);
@@ -152,7 +152,7 @@ pub enum Address {
 /// from inside the jail, if there is one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Listen {
-  /// The socket's path. An existing socket at this path is replaced.
+  /// Replaces any socket already at this path.
   pub path: String,
   /// The name of the jail. `None` means the guest.
   pub jail: Option<String>,

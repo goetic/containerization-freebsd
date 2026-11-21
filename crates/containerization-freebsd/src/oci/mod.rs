@@ -1,5 +1,5 @@
-//! OCI image support on the host: image references, the documents defined by
-//! the OCI image spec, a registry client and a content store.
+//! Host-side OCI support: image references, image-spec documents, a
+//! distribution API client and a content-addressable store.
 
 mod content;
 mod curl;
@@ -32,11 +32,10 @@ pub mod media_type {
   pub const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 }
 
-/// The annotation that records the reference an index entry was pulled or
-/// tagged as.
+/// The index annotation naming the reference an entry was pulled or tagged
+/// as.
 pub const REF_NAME: &str = "org.opencontainers.image.ref.name";
 
-/// A reference to a blob, identified by its media type, digest and size.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
@@ -50,8 +49,7 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-  /// Whether the blob is an index or a Docker manifest list, rather than a
-  /// manifest.
+  /// Whether this names an image index or a Docker manifest list.
   pub fn is_index(&self) -> bool {
     matches!(
       self.media_type.as_str(),
@@ -69,7 +67,7 @@ pub struct Platform {
 }
 
 impl Default for Platform {
-  /// The guest platform: FreeBSD on arm64.
+  /// The guest's platform.
   fn default() -> Self {
     Self {
       architecture: "arm64".into(),
@@ -80,8 +78,8 @@ impl Default for Platform {
 }
 
 impl Platform {
-  /// Whether an image built for `other` runs on this platform. The OS and
-  /// architecture must match, and so must the variant if both name one.
+  /// Whether an image built for `other` runs on this platform. OS and
+  /// architecture must match; variants must match only if both are set.
   pub fn runs(&self, other: &Platform) -> bool {
     self.os == other.os
       && self.architecture == other.architecture
@@ -99,7 +97,7 @@ impl std::fmt::Display for Platform {
   }
 }
 
-/// An image index, which lists a manifest for each platform.
+/// An image index: one manifest descriptor per platform.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Index {
@@ -119,7 +117,7 @@ impl Default for Index {
   }
 }
 
-/// An image for one platform: its config and its layers, bottom layer first.
+/// An image manifest: one platform's config and layers, base layer first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -137,14 +135,13 @@ impl Manifest {
   }
 }
 
-/// The index or manifest a descriptor names, as its media type says.
+/// An index or manifest, chosen by the descriptor's media type.
 pub(crate) enum Document {
   Index(Index),
   Manifest(Manifest),
 }
 
-/// An image's configuration: the process it runs, and the digests of its
-/// uncompressed layers.
+/// An image config: the default process and the layers' diff IDs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageConfig {
   #[serde(default)]
@@ -158,10 +155,9 @@ pub struct ImageConfig {
   pub rootfs: RootFs,
 }
 
-/// The defaults for a container run from the image. The spec's keys are
-/// PascalCase, but Go tools match keys case-insensitively and FreeBSD's own
-/// images write `cmd`, so the lowercase and camelCase spellings are accepted
-/// too.
+/// The config's execution defaults. The spec's keys are PascalCase, but Go's
+/// encoding/json matches keys case-insensitively and FreeBSD's own images
+/// write `cmd`, so lowercase and camelCase spellings are accepted too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct RunConfig {
@@ -197,9 +193,9 @@ pub struct RootFs {
 }
 
 impl ImageConfig {
-  /// The process a container runs by default: the entrypoint followed by the
-  /// command, the environment, the working directory, and the user. The user
-  /// is `user` or `user:group`, where each part is a name or a number.
+  /// The container's default process: `Entrypoint` then `Cmd` as argv, with
+  /// `Env`, `WorkingDir` and `User`. `User` is `user` or `user:group`, each a
+  /// name or a numeric ID.
   pub fn process(&self) -> Exec {
     let run = self.config.clone().unwrap_or_default();
     let user = run
@@ -244,10 +240,10 @@ impl ImageConfig {
     }
   }
 
-  /// The chain id of each layer, as the OCI spec defines it. The first
-  /// layer's chain id is its diff id; each later one is the sha256 of the
-  /// previous chain id, a space, and the layer's diff id. A chain id thus
-  /// identifies a layer together with every layer beneath it.
+  /// Each layer's chain ID, per the image spec: the base layer's is its diff
+  /// ID, and each later one is the sha256 of `<parent chain ID> <diff ID>`.
+  /// A chain ID thus identifies a layer together with every layer beneath
+  /// it.
   pub fn chain_ids(&self) -> Vec<String> {
     let mut chain: Vec<String> = Vec::with_capacity(self.rootfs.diff_ids.len());
 
@@ -290,7 +286,8 @@ fn hex(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The hex part of `digest`, or `None` if it is not a valid sha256 digest.
+/// The hex part of `digest`, or `None` unless it is `sha256:` and 64
+/// lowercase hex digits.
 pub fn sha256_hex(digest: &str) -> Option<&str> {
   digest.strip_prefix("sha256:").filter(|hex| {
     hex.len() == 64
@@ -300,8 +297,7 @@ pub fn sha256_hex(digest: &str) -> Option<&str> {
   })
 }
 
-/// Parses an image document. On failure, the error names the document as
-/// `what`.
+/// Parses an image document; errors name it as `what`.
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
   serde_json::from_slice(bytes).map_err(|error| Error::Invalid(format!("{what} is not valid: {error}")))
 }

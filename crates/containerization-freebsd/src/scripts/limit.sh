@@ -1,7 +1,6 @@
 #!/bin/sh
-# Replaces the rctl rules of the jail named $1 with the remaining arguments.
-# Without kernel resource accounting, it fails if any rules are given and
-# otherwise does nothing.
+# Replaces the rctl rules of jail $1 with the remaining arguments. Without
+# kern.racct.enable, fails if any rules are given and otherwise does nothing.
 set -e
 jail=$1
 shift

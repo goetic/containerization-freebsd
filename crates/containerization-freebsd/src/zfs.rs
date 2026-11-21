@@ -1,5 +1,5 @@
-//! Manages ZFS pools, datasets, snapshots, and clones in the guest through
-//! the guest agent. Names are passed as arguments, never through a shell.
+//! ZFS pools, datasets, snapshots and clones in the guest, via the agent.
+//! Names are passed as argv, never through a shell.
 
 use crate::agent::Agent;
 use crate::error::Result;
@@ -18,8 +18,8 @@ impl<'a> Zfs<'a> {
     Self { agent }
   }
 
-  /// Creates a pool on `device`, mounted at `/<pool>`, with lz4 compression
-  /// and access times off.
+  /// Creates a pool on `device`, mounted at `/<pool>`, with `compression=lz4`
+  /// and `atime=off`.
   pub fn create_pool(&self, pool: &str, device: &str) -> Result<()> {
     self.check(
       &[
@@ -36,13 +36,13 @@ impl<'a> Zfs<'a> {
     )
   }
 
-  /// Imports a pool that another machine created or used, such as one on a
-  /// disk the caller keeps across machines.
+  /// Force-imports a pool, which may have been last imported by another
+  /// machine, such as one on a disk the caller keeps across machines.
   pub fn import_pool(&self, pool: &str) -> Result<()> {
     self.check(&["zpool", "import", "-f", pool], QUICK)
   }
 
-  /// Whether a pool is imported.
+  /// Whether `pool` is imported.
   pub fn has_pool(&self, pool: &str) -> Result<bool> {
     self.succeeds(&["zpool", "list", "-H", pool])
   }
@@ -57,10 +57,9 @@ impl<'a> Zfs<'a> {
     self.check(&["zfs", "create", "-p", dataset], QUICK)
   }
 
-  /// Creates `dataset` if it does not exist, and makes sure it is mounted.
-  /// If it would inherit no mountpoint, as datasets under the pool of
-  /// FreeBSD's VM image do, it is mounted at `/<dataset>`. Its children
-  /// inherit the mountpoint.
+  /// Creates `dataset` if needed and ensures ZFS mounts it. A dataset whose
+  /// mountpoint is `none` or `legacy`, as under the pool of FreeBSD's VM
+  /// image, gets `/<dataset>`, which its children inherit.
   pub fn create_mounted(&self, dataset: &str) -> Result<()> {
     if !self.exists(dataset)? {
       self.create(dataset)?;
@@ -71,24 +70,23 @@ impl<'a> Zfs<'a> {
     Ok(())
   }
 
-  /// Creates the snapshot `snapshot`, named `<dataset>@<name>`.
+  /// `snapshot` is `<dataset>@<name>`.
   pub fn snapshot(&self, snapshot: &str) -> Result<()> {
     self.check(&["zfs", "snapshot", snapshot], QUICK)
   }
 
-  /// Creates `dataset` as a writable clone of `snapshot` that shares its
-  /// blocks.
+  /// Clones `snapshot` to `dataset`, creating missing parents.
   pub fn clone(&self, snapshot: &str, dataset: &str) -> Result<()> {
     self.check(&["zfs", "clone", "-p", snapshot, dataset], QUICK)
   }
 
   /// Destroys a dataset and its descendants, or a snapshot. Fails if a clone
-  /// depends on what would be destroyed.
+  /// depends on it, since `-r` doesn't destroy dependents.
   pub fn destroy(&self, name: &str) -> Result<()> {
     self.check(&["zfs", "destroy", "-r", name], QUICK)
   }
 
-  /// The full names of the datasets directly under `dataset`.
+  /// The full names of the filesystems directly under `dataset`.
   pub fn children(&self, dataset: &str) -> Result<Vec<String>> {
     let ran = self.agent.check(
       &[
@@ -117,8 +115,7 @@ impl<'a> Zfs<'a> {
     )
   }
 
-  /// Returns `dataset`'s `mountpoint` property, which may be `none` or
-  /// `legacy`.
+  /// `dataset`'s `mountpoint` property, which may be `none` or `legacy`.
   pub fn mountpoint(&self, dataset: &str) -> Result<String> {
     let ran = self
       .agent
@@ -127,8 +124,8 @@ impl<'a> Zfs<'a> {
     Ok(ran.stdout.trim().to_string())
   }
 
-  /// Extracts `archive`, a path in the guest such as the userland on a
-  /// share, into `dataset`.
+  /// Extracts `archive`, a guest path such as the userland on a share, into
+  /// `dataset`'s mountpoint.
   pub fn extract(&self, archive: &str, dataset: &str) -> Result<()> {
     let mountpoint = self.mountpoint(dataset)?;
 
@@ -144,8 +141,7 @@ impl<'a> Zfs<'a> {
   }
 }
 
-/// Whether a `mountpoint` property value means ZFS does not mount the
-/// dataset.
+/// Whether a `mountpoint` value means ZFS doesn't mount the dataset.
 pub(crate) fn unmounted(mountpoint: &str) -> bool {
   matches!(mountpoint, "none" | "legacy")
 }

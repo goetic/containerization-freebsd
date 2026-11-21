@@ -1,7 +1,7 @@
 //! The console's window, and the thread that reads the console and reopens
 //! the window as the agent reports what it has read.
 
-use super::OPENING;
+use super::AGENT_TIMEOUT;
 use super::session::Event;
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{CONTROL, Decoder, Frame, Message, Skipped, WINDOW};
@@ -30,7 +30,9 @@ impl Credit {
     let window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
     let mut window = self
       .changed
-      .wait_timeout_while(window, OPENING, |window| !window.closed && window.unreceived >= WINDOW)
+      .wait_timeout_while(window, AGENT_TIMEOUT, |window| {
+        !window.closed && window.unreceived >= WINDOW
+      })
       .unwrap_or_else(PoisonError::into_inner)
       .0;
 
@@ -41,7 +43,7 @@ impl Credit {
       return Err(Error::Timeout(format!(
         "the guest agent read none of the console's last {} bytes within {}s",
         window.unreceived,
-        OPENING.as_secs()
+        AGENT_TIMEOUT.as_secs()
       )));
     }
     let room = (WINDOW - window.unreceived).min(wanted);

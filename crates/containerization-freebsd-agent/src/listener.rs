@@ -81,8 +81,8 @@ fn remove(jail: Option<libc::c_int>, path: &str) -> io::Result<()> {
 }
 
 /// Passes each connection to the session loop until `stopped` is readable.
-/// Returns true if a byte was written to `stopped`, meaning the socket's file
-/// was removed; returns false if its write end closed or accepting failed.
+/// Returns true if `Listening::remove` wrote to it, whether or not removing
+/// the file succeeded; false if its write end closed or accepting failed.
 fn accept(listener: &UnixListener, mut stopped: PipeReader, outbox: &Outbox) -> bool {
   loop {
     match sys::wait_for_connection(listener.as_fd(), stopped.as_fd()) {

@@ -1,5 +1,5 @@
-//! Keeps the guest's clock in step with the host's. Like Containerization's
-//! TimeSyncer, it syncs every 30 seconds while the machine is not paused.
+//! Syncs the guest's clock to the host's every 30 seconds while the machine
+//! isn't paused, like Containerization's TimeSyncer.
 
 use crate::agent::Agent;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 const INTERVAL: Duration = Duration::from_secs(30);
 
-/// Syncs the clock from a background thread, which stops when this is dropped.
+/// Owns the sync thread, which exits when this is dropped.
 pub(crate) struct ClockSync {
   paused: Arc<AtomicBool>,
   _stop: mpsc::Sender<()>,

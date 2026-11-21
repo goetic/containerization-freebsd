@@ -1,7 +1,7 @@
 //! Cached builds in the guest. Each step runs as root in a jail on a clone of
-//! the previous step's snapshot, and its result becomes a snapshot keyed by
-//! the sha256 of that snapshot's name and the step. A step that has already
-//! been built is not run again.
+//! the previous step's snapshot, and its result is snapshotted under a key
+//! hashed from that snapshot's name and the step, so a built step never runs
+//! again.
 
 use crate::agent::{Agent, Exec, Exit, Output};
 use crate::error::{Error, Result};
@@ -12,11 +12,10 @@ use crate::zfs::Zfs;
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
-/// The name of the snapshot taken of each step's dataset when the step
-/// finishes.
+/// The snapshot taken of each step's dataset once the step succeeds.
 const BUILT: &str = "built";
 
-/// A shell script run as root in the image with `/bin/sh -c`, from `/`.
+/// A script run as root with `/bin/sh -c`, from `/`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Step {
   pub script: String,
@@ -24,7 +23,7 @@ pub struct Step {
 }
 
 impl Step {
-  /// Creates a step that uses the guest's network (`Network::Inherit`).
+  /// A step on `Network::Inherit`.
   pub fn new(script: impl Into<String>) -> Self {
     Self {
       script: script.into(),
@@ -33,12 +32,11 @@ impl Step {
   }
 }
 
-/// The result of a build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Built {
   /// The last step's snapshot.
   pub snapshot: String,
-  /// The number of steps that ran, and the number that were already built.
+  /// Steps that ran, and steps already built.
   pub ran: usize,
   pub cached: usize,
 }
@@ -51,7 +49,7 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
   /// Builds into datasets under `store`, such as `images/builds`. `build`
-  /// makes the store, mounted, if it does not exist.
+  /// creates and mounts `store` if needed.
   pub fn new(agent: &'a Agent, store: &str) -> Self {
     Self {
       agent,
@@ -60,9 +58,9 @@ impl<'a> Builder<'a> {
     }
   }
 
-  /// Builds `steps` on the snapshot `from`, running only the steps not built
-  /// before. Their stdout and stderr go to `output`. Two builds into the same
-  /// store must not run concurrently.
+  /// Builds `steps` on the snapshot `from`, running only those not built
+  /// before, with their stdout and stderr to `output`. Builds into one store
+  /// must not run concurrently.
   pub fn build(&self, from: &str, steps: &[Step], output: &mut dyn FnMut(&[u8])) -> Result<Built> {
     self.zfs.create_mounted(&self.store)?;
     let mut built = Built {
@@ -90,11 +88,11 @@ impl<'a> Builder<'a> {
     Ok(built)
   }
 
-  /// Runs `step` in a jail on a fresh clone of `from` at `dataset`. If the
-  /// step fails, the clone is destroyed.
+  /// Runs `step` in a jail on a fresh clone of `from` at `dataset`,
+  /// destroying the clone if the step fails.
   fn run(&self, from: &str, dataset: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
-    // A dataset here was left by a step that failed without cleaning up,
-    // such as when the guest stopped.
+    // A step that failed without cleaning up, such as when the guest
+    // stopped, can leave the dataset behind.
     if self.zfs.exists(dataset)? {
       self.zfs.destroy(dataset)?;
     }
@@ -117,7 +115,7 @@ impl<'a> Builder<'a> {
     if step.network != Network::None {
       self
         .agent
-        .check(&scripts::UNRESOLVER.argv(&[&root]), QUICK)?;
+        .check(&scripts::REMOVE_RESOLV_CONF.argv(&[&root]), QUICK)?;
     }
 
     match exit? {
@@ -127,13 +125,13 @@ impl<'a> Builder<'a> {
   }
 }
 
-/// Returns the step's cache key: the sha256 of the name of the snapshot it
-/// starts from, its kind of network, and its script. Interface addresses are
-/// left out, so a step on re-leased interfaces keeps the same key.
+/// The step's cache key: the sha256 of its base snapshot's name, its network
+/// kind and its script. Interface addresses are left out, so a step on
+/// re-leased interfaces keeps its key.
 fn key(from: &str, step: &Step) -> String {
   let network = match step.network {
-    // These match the variants' Debug names, which existing cached steps
-    // were keyed by. Changing them invalidates those caches.
+    // The variants' Debug names, which existing cached steps were keyed by.
+    // Changing them invalidates those caches.
     Network::None => "None",
     Network::Inherit => "Inherit",
     Network::Nat => "Nat",

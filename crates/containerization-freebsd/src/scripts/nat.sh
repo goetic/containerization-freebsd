@@ -1,7 +1,7 @@
 #!/bin/sh
-# Sets up NAT for jails once per boot: creates the bridge, turns on
-# forwarding, and has pf translate 10.66/16 to the address of the guest's
-# default interface.
+# Sets up NAT for jails once per boot: creates bridge cfbsd0, enables IP
+# forwarding, and has pf NAT 10.66.0.0/16 to the default-route interface's
+# address. jail/network.rs hard-codes cfbsd0 and 10.66.0.1 too.
 set -e
 ifconfig cfbsd0 >/dev/null 2>&1 && exit 0
 external=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2 }')

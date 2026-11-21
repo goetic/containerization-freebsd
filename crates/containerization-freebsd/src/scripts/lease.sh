@@ -1,8 +1,7 @@
 #!/bin/sh
-# Prints, in dhclient.leases(5) format, the lease that the NAT's DHCP server
-# gives the guest's network device with MAC address $1. The device is not
-# configured with the lease: dhclient's script does nothing, and dhclient is
-# killed once bound.
+# Prints, in dhclient.leases(5) format, the lease the NAT's DHCP server gives
+# the guest's network device with MAC $1, without configuring the device:
+# dhclient's script is true(1), and dhclient is killed once bound.
 set -e
 for device in $(ifconfig -l ether); do
   if ifconfig "$device" ether | grep -qix "[[:space:]]*ether $1"; then

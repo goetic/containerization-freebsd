@@ -1,7 +1,6 @@
-//! The host's image store, kept as an OCI image layout: `index.json` names
-//! each image by its reference, and `blobs/sha256` holds the content. It
-//! mirrors Containerization's image store, and the caller chooses where it
-//! lives.
+//! The host's image store, an OCI image layout at a path the caller chooses.
+//! `index.json` names each image with a `REF_NAME` annotation. It mirrors
+//! Containerization's image store.
 
 mod layout;
 mod registry;
@@ -32,7 +31,7 @@ pub struct Image {
 }
 
 impl ImageStore {
-  /// Opens the store at `root`, creating it if needed.
+  /// Opens or creates the store at `root`.
   pub fn new(root: &Path) -> Result<Self> {
     let content = ContentStore::new(root)?;
     let layout = root.join("oci-layout");
@@ -50,10 +49,10 @@ impl ImageStore {
     &self.content
   }
 
-  /// The descriptor to push or save for `image` and `platform`. For an index,
-  /// this is a new index in the store holding only `platform`'s manifests,
-  /// unless they are all of them. Without `platform`, or for a manifest, it
-  /// is the image's own descriptor.
+  /// The descriptor to push or save for `image`, narrowed to `platform` if
+  /// given. An index narrows to a new index in the store of only
+  /// `platform`'s manifests, unless that is all of them. A manifest must run
+  /// on `platform` and is returned as is.
   fn for_platform(&self, image: &Image, platform: Option<&Platform>) -> Result<Descriptor> {
     let Some(platform) = platform else {
       return Ok(image.descriptor.clone());
@@ -94,7 +93,7 @@ impl ImageStore {
   }
 
   /// Names `descriptor`, an index or manifest in the store, as `reference`,
-  /// replacing any existing image of that name.
+  /// replacing any image of that name.
   pub fn create(&self, reference: &str, descriptor: Descriptor) -> Result<Image> {
     let reference = Reference::parse(reference)?.to_string();
     if !self.content.has(&descriptor.digest) {
@@ -113,7 +112,7 @@ impl ImageStore {
     self.update(|index| {
       index
         .manifests
-        .retain(|entry| name(entry) != Some(&reference));
+        .retain(|entry| ref_name(entry) != Some(&reference));
       index.manifests.push(descriptor.clone());
       Ok(())
     })?;
@@ -136,7 +135,7 @@ impl ImageStore {
         .read_index()?
         .manifests
         .into_iter()
-        .filter_map(|entry| Some(self.image(name(&entry)?.to_string(), entry)))
+        .filter_map(|entry| Some(self.image(ref_name(&entry)?.to_string(), entry)))
         .collect(),
     )
   }
@@ -148,8 +147,8 @@ impl ImageStore {
     self.create(new, image.descriptor)
   }
 
-  /// Removes the name `reference`, then deletes every blob that no remaining
-  /// image needs.
+  /// Removes the name `reference`, then garbage-collects every blob no
+  /// remaining image reaches.
   pub fn delete(&self, reference: &str) -> Result<()> {
     let reference = Reference::parse(reference)?.to_string();
 
@@ -157,7 +156,7 @@ impl ImageStore {
       let before = index.manifests.len();
       index
         .manifests
-        .retain(|entry| name(entry) != Some(&reference));
+        .retain(|entry| ref_name(entry) != Some(&reference));
       if index.manifests.len() == before {
         return Err(Error::Invalid(format!("the store has no image {reference}")));
       }
@@ -172,9 +171,8 @@ impl ImageStore {
     })
   }
 
-  /// Every blob the index's images need. Indexes and manifests the store
-  /// lacks are skipped, but configs and layers are included whether or not
-  /// the store has them.
+  /// Every blob reachable from `index`. Indexes and manifests the store
+  /// lacks are skipped, but configs and layers are included either way.
   fn reachable(&self, index: &Index) -> Result<BTreeSet<String>> {
     let mut needed = BTreeSet::new();
     let mut pending: Vec<Descriptor> = index.manifests.clone();
@@ -209,8 +207,8 @@ impl ImageStore {
     }
   }
 
-  /// Applies `change` to `index.json` under a file lock, so that stores in
-  /// other processes do not overwrite each other's changes.
+  /// Applies `change` to `index.json` under a file lock, so stores in other
+  /// processes don't lose each other's updates.
   fn update(&self, change: impl FnOnce(&mut Index) -> Result<()>) -> Result<()> {
     let lock_path = self.root.join("index.json.lock");
     let locking = || format!("locking {}", lock_path.display());
@@ -228,7 +226,8 @@ impl ImageStore {
 }
 
 impl Image {
-  /// The manifest for `platform`, with its descriptor.
+  /// The manifest for `platform` and its descriptor. A lone manifest is
+  /// returned whatever its platform.
   pub fn manifest(&self, platform: &Platform) -> Result<(Descriptor, Manifest)> {
     match self.content.document(&self.descriptor)? {
       Document::Index(index) => {
@@ -240,7 +239,6 @@ impl Image {
     }
   }
 
-  /// The config for `platform`.
   pub fn config(&self, platform: &Platform) -> Result<ImageConfig> {
     let (_, manifest) = self.manifest(platform)?;
 
@@ -279,7 +277,6 @@ fn choose(index: &Index, platform: &Platform, reference: &impl Display) -> Resul
   )))
 }
 
-/// Fails unless the image `reference`, with `config`, runs on `platform`.
 fn check_runs(config: &ImageConfig, platform: &Platform, reference: &impl Display) -> Result<()> {
   if platform.runs(&config.platform()) {
     Ok(())
@@ -291,7 +288,7 @@ fn check_runs(config: &ImageConfig, platform: &Platform, reference: &impl Displa
   }
 }
 
-fn name(entry: &Descriptor) -> Option<&String> {
+fn ref_name(entry: &Descriptor) -> Option<&String> {
   entry.annotations.get(REF_NAME)
 }
 

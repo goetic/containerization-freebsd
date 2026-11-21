@@ -1,5 +1,5 @@
 //! Sockets opened from a child process attached to a jail, so that paths and
-//! loopback are the jail's, and the descriptor passing that brings them back.
+//! loopback are the jail's, and passed back over SCM_RIGHTS.
 
 use crate::jail::attach;
 use crate::process::reap;
@@ -90,8 +90,8 @@ impl SocketAddress {
 /// Connects to the first of `addresses` that accepts, from a child process
 /// attached to jail `jid`, so paths and loopback are the jail's.
 pub fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::Result<OwnedFd> {
-  // SAFETY: the closure makes only system calls on data it borrows, and
-  // allocates nothing.
+  // SAFETY: the closure makes only async-signal-safe system calls on data it
+  // borrows, and allocates nothing.
   let connected = unsafe {
     in_jail(jid, || {
       let mut error = libc::EADDRNOTAVAIL;
@@ -119,6 +119,7 @@ pub fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::Result<O
 #[allow(clippy::unnecessary_cast)]
 pub fn listen_in(jid: libc::c_int, path: &CStr, mode: Option<u16>) -> io::Result<OwnedFd> {
   let address = SocketAddress::unix(path)?;
+  // bind(2) creates the socket file as 0777 & ~umask.
   let mask = mode.map(|mode| !mode & 0o777);
 
   // SAFETY: as in `connect_in`.
@@ -149,8 +150,8 @@ pub fn remove_socket_in(jid: libc::c_int, path: &CStr) -> io::Result<()> {
   Ok(())
 }
 
-/// Waits until `listener` has a connection or `stop` is readable. Returns
-/// true for a connection, false once `stop` is readable.
+/// Waits until `listener` has a connection or `stop` is ready. Returns false
+/// if `stop` is ready, even with a connection pending, and true otherwise.
 pub fn wait_for_connection(listener: BorrowedFd, stop: BorrowedFd) -> io::Result<bool> {
   let mut descriptors = [listener, stop].map(|fd| libc::pollfd {
     fd: fd.as_raw_fd(),
