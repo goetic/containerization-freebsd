@@ -1,0 +1,384 @@
+//! The host's image store, kept as an OCI image layout: `index.json` names
+//! each image by its reference, and `blobs/sha256` holds the content. It
+//! mirrors Containerization's image store, and the caller chooses where it
+//! lives.
+
+mod layout;
+mod registry;
+
+use crate::error::{Error, Result};
+use crate::oci::{
+  ContentStore, Descriptor, Document, ImageConfig, Index, Manifest, Platform, REF_NAME, Reference, parse,
+};
+use std::collections::BTreeSet;
+use std::fmt::Display;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+const LAYOUT: &str = r#"{"imageLayoutVersion":"1.0.0"}"#;
+
+pub struct ImageStore {
+  root: PathBuf,
+  content: ContentStore,
+}
+
+/// An index or manifest in the store, named by the reference it was pulled
+/// or tagged as.
+#[derive(Clone, Debug)]
+pub struct Image {
+  pub reference: String,
+  pub descriptor: Descriptor,
+  content: ContentStore,
+}
+
+impl ImageStore {
+  /// Opens the store at `root`, creating it if needed.
+  pub fn new(root: &Path) -> Result<Self> {
+    let content = ContentStore::new(root)?;
+    let layout = root.join("oci-layout");
+    if !layout.exists() {
+      std::fs::write(&layout, LAYOUT).map_err(Error::io(format!("writing {}", layout.display())))?;
+    }
+
+    Ok(Self {
+      root: root.to_path_buf(),
+      content,
+    })
+  }
+
+  pub fn content(&self) -> &ContentStore {
+    &self.content
+  }
+
+  /// The descriptor to push or save for `image` and `platform`. For an index,
+  /// this is a new index in the store holding only `platform`'s manifests,
+  /// unless they are all of them. Without `platform`, or for a manifest, it
+  /// is the image's own descriptor.
+  fn for_platform(&self, image: &Image, platform: Option<&Platform>) -> Result<Descriptor> {
+    let Some(platform) = platform else {
+      return Ok(image.descriptor.clone());
+    };
+    let mut index = match self.content.document(&image.descriptor)? {
+      Document::Index(index) => index,
+      Document::Manifest(manifest) => {
+        check_runs(&self.content.config(&manifest)?, platform, &image.reference)?;
+        return Ok(image.descriptor.clone());
+      }
+    };
+    let all = index.manifests.len();
+    index.manifests.retain(|manifest| {
+      manifest
+        .platform
+        .as_ref()
+        .is_some_and(|other| platform.runs(other))
+    });
+    if index.manifests.is_empty() {
+      return Err(Error::Invalid(format!(
+        "{} has no image for {platform}",
+        image.reference
+      )));
+    }
+    if index.manifests.len() == all {
+      return Ok(image.descriptor.clone());
+    }
+
+    let bytes =
+      serde_json::to_vec(&index).map_err(|error| Error::Invalid(format!("an index for {platform}: {error}")))?;
+    Ok(Descriptor {
+      media_type: image.descriptor.media_type.clone(),
+      digest: self.content.ingest(&bytes)?,
+      size: bytes.len() as u64,
+      platform: None,
+      annotations: image.descriptor.annotations.clone(),
+    })
+  }
+
+  /// Names `descriptor`, an index or manifest in the store, as `reference`,
+  /// replacing any existing image of that name.
+  pub fn create(&self, reference: &str, descriptor: Descriptor) -> Result<Image> {
+    let reference = Reference::parse(reference)?.to_string();
+    if !self.content.has(&descriptor.digest) {
+      return Err(Error::Invalid(format!(
+        "the store has no blob {} for {reference}",
+        descriptor.digest
+      )));
+    }
+
+    let mut descriptor = descriptor;
+    descriptor.platform = None;
+    descriptor.annotations.clear();
+    descriptor
+      .annotations
+      .insert(REF_NAME.to_string(), reference.clone());
+    self.update(|index| {
+      index
+        .manifests
+        .retain(|entry| name(entry) != Some(&reference));
+      index.manifests.push(descriptor.clone());
+      Ok(())
+    })?;
+    Ok(self.image(reference, descriptor))
+  }
+
+  pub fn get(&self, reference: &str) -> Result<Image> {
+    let reference = Reference::parse(reference)?.to_string();
+
+    self
+      .list()?
+      .into_iter()
+      .find(|image| image.reference == reference)
+      .ok_or_else(|| Error::Invalid(format!("the store has no image {reference}")))
+  }
+
+  pub fn list(&self) -> Result<Vec<Image>> {
+    Ok(
+      self
+        .read_index()?
+        .manifests
+        .into_iter()
+        .filter_map(|entry| Some(self.image(name(&entry)?.to_string(), entry)))
+        .collect(),
+    )
+  }
+
+  /// Adds the name `new` to the image named `existing`.
+  pub fn tag(&self, existing: &str, new: &str) -> Result<Image> {
+    let image = self.get(existing)?;
+
+    self.create(new, image.descriptor)
+  }
+
+  /// Removes the name `reference`, then deletes every blob that no remaining
+  /// image needs.
+  pub fn delete(&self, reference: &str) -> Result<()> {
+    let reference = Reference::parse(reference)?.to_string();
+
+    self.update(|index| {
+      let before = index.manifests.len();
+      index
+        .manifests
+        .retain(|entry| name(entry) != Some(&reference));
+      if index.manifests.len() == before {
+        return Err(Error::Invalid(format!("the store has no image {reference}")));
+      }
+
+      let needed = self.reachable(index)?;
+      for digest in self.content.digests()? {
+        if !needed.contains(&digest) {
+          self.content.delete(&digest)?;
+        }
+      }
+      Ok(())
+    })
+  }
+
+  /// Every blob the index's images need. Indexes and manifests the store
+  /// lacks are skipped, but configs and layers are included whether or not
+  /// the store has them.
+  fn reachable(&self, index: &Index) -> Result<BTreeSet<String>> {
+    let mut needed = BTreeSet::new();
+    let mut pending: Vec<Descriptor> = index.manifests.clone();
+
+    while let Some(descriptor) = pending.pop() {
+      if !self.content.has(&descriptor.digest) || !needed.insert(descriptor.digest.clone()) {
+        continue;
+      }
+      match self.content.document(&descriptor)? {
+        Document::Index(index) => pending.extend(index.manifests),
+        Document::Manifest(manifest) => needed.extend(manifest.blobs().map(|blob| blob.digest.clone())),
+      }
+    }
+    Ok(needed)
+  }
+
+  fn image(&self, reference: String, descriptor: Descriptor) -> Image {
+    Image {
+      reference,
+      descriptor,
+      content: self.content.clone(),
+    }
+  }
+
+  fn read_index(&self) -> Result<Index> {
+    let path = self.root.join("index.json");
+
+    match std::fs::read(&path) {
+      Ok(bytes) => parse(&bytes, &path.display().to_string()),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
+      Err(error) => Err(Error::io(format!("reading {}", path.display()))(error)),
+    }
+  }
+
+  /// Applies `change` to `index.json` under a file lock, so that stores in
+  /// other processes do not overwrite each other's changes.
+  fn update(&self, change: impl FnOnce(&mut Index) -> Result<()>) -> Result<()> {
+    let lock_path = self.root.join("index.json.lock");
+    let locking = || format!("locking {}", lock_path.display());
+    let lock = File::create(&lock_path).map_err(Error::io(locking()))?;
+    lock.lock().map_err(Error::io(locking()))?;
+
+    let mut index = self.read_index()?;
+    change(&mut index)?;
+    let bytes =
+      serde_json::to_vec_pretty(&index).map_err(|error| Error::Invalid(format!("the store's index: {error}")))?;
+    let partial = self.root.join("index.json.partial");
+    std::fs::write(&partial, bytes).map_err(Error::io(format!("writing {}", partial.display())))?;
+    std::fs::rename(&partial, self.root.join("index.json")).map_err(Error::io("replacing index.json"))
+  }
+}
+
+impl Image {
+  /// The manifest for `platform`, with its descriptor.
+  pub fn manifest(&self, platform: &Platform) -> Result<(Descriptor, Manifest)> {
+    match self.content.document(&self.descriptor)? {
+      Document::Index(index) => {
+        let descriptor = choose(&index, platform, &self.reference)?;
+        let manifest = self.content.manifest(&descriptor)?;
+        Ok((descriptor, manifest))
+      }
+      Document::Manifest(manifest) => Ok((self.descriptor.clone(), manifest)),
+    }
+  }
+
+  /// The config for `platform`.
+  pub fn config(&self, platform: &Platform) -> Result<ImageConfig> {
+    let (_, manifest) = self.manifest(platform)?;
+
+    self.content.config(&manifest)
+  }
+
+  pub(crate) fn content(&self) -> &ContentStore {
+    &self.content
+  }
+}
+
+/// The first manifest in `reference`'s index that runs on `platform`.
+fn choose(index: &Index, platform: &Platform, reference: &impl Display) -> Result<Descriptor> {
+  let runs = |entry: &&Descriptor| {
+    entry
+      .platform
+      .as_ref()
+      .is_some_and(|other| platform.runs(other))
+  };
+  if let Some(chosen) = index.manifests.iter().find(runs) {
+    return Ok(chosen.clone());
+  }
+
+  let names: Vec<String> = index
+    .manifests
+    .iter()
+    .filter_map(|entry| entry.platform.as_ref().map(Platform::to_string))
+    .collect();
+  let names = if names.is_empty() {
+    "none".to_string()
+  } else {
+    names.join(", ")
+  };
+  Err(Error::Invalid(format!(
+    "{reference} has no image for {platform}, only {names}"
+  )))
+}
+
+/// Fails unless the image `reference`, with `config`, runs on `platform`.
+fn check_runs(config: &ImageConfig, platform: &Platform, reference: &impl Display) -> Result<()> {
+  if platform.runs(&config.platform()) {
+    Ok(())
+  } else {
+    Err(Error::Invalid(format!(
+      "{reference} is an image for {}, not {platform}",
+      config.platform()
+    )))
+  }
+}
+
+fn name(entry: &Descriptor) -> Option<&String> {
+  entry.annotations.get(REF_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::oci::testing::FakeRegistry;
+  use crate::oci::{RootFs, RunConfig, media_type, sha256_digest};
+
+  pub(super) fn descriptor(media_type: &str, bytes: &[u8], platform: Option<Platform>) -> Descriptor {
+    Descriptor {
+      media_type: media_type.into(),
+      digest: sha256_digest(bytes),
+      size: bytes.len() as u64,
+      platform,
+      annotations: Default::default(),
+    }
+  }
+
+  pub(super) fn json(value: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap()
+  }
+
+  /// The layer, config and manifest of a one-layer arm64 FreeBSD image.
+  pub(super) fn documents() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let layer = b"layer".to_vec();
+    let config = json(&ImageConfig {
+      architecture: "arm64".into(),
+      os: "freebsd".into(),
+      config: Some(RunConfig {
+        cmd: Some(vec!["/bin/sh".into()]),
+        ..RunConfig::default()
+      }),
+      rootfs: RootFs {
+        kind: "layers".into(),
+        diff_ids: vec![sha256_digest(&layer)],
+      },
+      ..ImageConfig::default()
+    });
+    let manifest = json(&Manifest {
+      schema_version: 2,
+      media_type: Some(media_type::MANIFEST.into()),
+      config: descriptor(media_type::CONFIG, &config, None),
+      layers: vec![descriptor(media_type::LAYER_GZIP, &layer, None)],
+    });
+    (layer, config, manifest)
+  }
+
+  /// A loopback registry serving `test/image:1`: an index listing arm64 and
+  /// amd64 FreeBSD manifests, of which it has only arm64.
+  pub(super) fn registry() -> String {
+    let (layer, config, manifest) = documents();
+    let amd64 = Platform {
+      architecture: "amd64".into(),
+      ..Platform::default()
+    };
+    let index = json(&Index {
+      manifests: vec![
+        descriptor(media_type::MANIFEST, b"absent", Some(amd64)),
+        descriptor(media_type::MANIFEST, &manifest, Some(Platform::default())),
+      ],
+      ..Index::default()
+    });
+
+    FakeRegistry::default()
+      .manifest("test/image", "1", media_type::INDEX, &index)
+      .manifest("test/image", &sha256_digest(&manifest), media_type::MANIFEST, &manifest)
+      .blob(&config)
+      .blob(&layer)
+      .serve()
+  }
+
+  #[test]
+  fn deletes_the_blobs_no_image_needs() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ImageStore::new(root.path()).unwrap();
+    let reference = format!("{}/test/image:1", registry());
+    store.pull(&reference, &Platform::default(), None).unwrap();
+    let blobs = store.content().digests().unwrap().len();
+
+    store.tag(&reference, "ghcr.io/test/other:2").unwrap();
+    store.delete(&reference).unwrap();
+    assert_eq!(store.content().digests().unwrap().len(), blobs);
+
+    store.delete("ghcr.io/test/other:2").unwrap();
+    assert!(store.list().unwrap().is_empty());
+    assert!(store.content().digests().unwrap().is_empty());
+    assert!(store.delete("ghcr.io/test/other:2").is_err());
+  }
+}
