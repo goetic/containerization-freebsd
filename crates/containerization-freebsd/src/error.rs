@@ -16,6 +16,13 @@ pub enum Error {
     actual: String,
     expected: String,
   },
+  /// `error`, raised during the part of a larger operation that `context`
+  /// names, such as a build's step. `innermost` returns the error beneath
+  /// any contexts, for matching.
+  Context {
+    context: String,
+    error: Box<Error>,
+  },
   /// The guest, Virtualization, a host tool or a registry returned something
   /// unexpected.
   Guest(String),
@@ -37,6 +44,24 @@ pub enum Error {
 }
 
 impl Error {
+  /// The error beneath any `Context`s, such as the `Timeout` of a build's
+  /// step.
+  pub fn innermost(&self) -> &Self {
+    match self {
+      Self::Context { error, .. } => error.innermost(),
+      other => other,
+    }
+  }
+
+  /// Wraps the error in a `Context` naming the part of an operation that
+  /// raised it.
+  pub(crate) fn context(self, context: impl Into<String>) -> Self {
+    Self::Context {
+      context: context.into(),
+      error: Box::new(self),
+    }
+  }
+
   pub(crate) fn io(action: impl Into<String>) -> impl FnOnce(std::io::Error) -> Self {
     let action = action.into();
 
@@ -58,6 +83,7 @@ impl fmt::Display for Error {
       Self::Checksum { path, actual, expected } => {
         write!(formatter, "{} has sha256 {actual}, expected {expected}", path.display())
       }
+      Self::Context { context, error } => write!(formatter, "{context}: {error}"),
       Self::Guest(message) | Self::Invalid(message) | Self::Timeout(message) => formatter.write_str(message),
       Self::Io { action, error } => write!(formatter, "{action}: {error}"),
       Self::SessionEnded(what) => write!(formatter, "the guest agent's session ended while {what}"),
@@ -69,6 +95,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
   fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
     match self {
+      Self::Context { error, .. } => Some(error.as_ref()),
       Self::Io { error, .. } => Some(error),
       Self::Virtualization { error, .. } => Some(error),
       Self::Command { .. }
@@ -82,3 +109,23 @@ impl std::error::Error for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn keeps_the_error_beneath_a_context() {
+    let error = Error::Timeout("tar did not finish within 600s".into())
+      .context("layer 2 of 3")
+      .context("unpacking ghcr.io/test/image:1");
+
+    assert_eq!(
+      error.to_string(),
+      "unpacking ghcr.io/test/image:1: layer 2 of 3: tar did not finish within 600s"
+    );
+    assert!(matches!(error.innermost(), Error::Timeout(_)), "{error:?}");
+    let source = std::error::Error::source(&error).expect("a source");
+    assert_eq!(source.to_string(), "layer 2 of 3: tar did not finish within 600s");
+  }
+}

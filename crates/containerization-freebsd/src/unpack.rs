@@ -85,8 +85,8 @@ impl<'a> Unpacker<'a> {
         self
           .layer(image, layer, diff_id, below.as_deref(), &dataset, &staging)
           .map_err(|error| {
-            Error::Guest(format!(
-              "{} layer {} of {}: {error}",
+            error.context(format!(
+              "{} layer {} of {}",
               image.reference,
               index + 1,
               manifest.layers.len()

@@ -79,7 +79,7 @@ impl<'a> Builder<'a> {
       } else {
         self
           .run(&built.snapshot, &dataset, &key, step, output)
-          .map_err(|error| Error::Guest(format!("step {} of {}: {error}", index + 1, steps.len())))?;
+          .map_err(|error| error.context(format!("step {} of {}", index + 1, steps.len())))?;
         self.zfs.snapshot(&snapshot)?;
         built.ran += 1;
       }
