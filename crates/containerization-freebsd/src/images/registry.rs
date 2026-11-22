@@ -11,6 +11,7 @@ impl ImageStore {
   /// not.
   pub fn pull(&self, reference: &str, platform: &Platform, credentials: Option<Credentials>) -> Result<Image> {
     let reference = Reference::parse(reference)?;
+    let _blobs = self.using_blobs()?;
     let client = RegistryClient::new(credentials);
     let top = client.fetch_manifest(&reference, reference.target(), &self.content)?;
 
@@ -48,6 +49,7 @@ impl ImageStore {
   /// platform's manifests. Without it, the whole index is pushed, which needs
   /// every platform's manifest, and a pull fetches only one.
   pub fn push(&self, reference: &str, platform: Option<&Platform>, credentials: Option<Credentials>) -> Result<()> {
+    let _blobs = self.using_blobs()?;
     let image = self.get(reference)?;
     let descriptor = self.for_platform(&image, platform)?;
     let reference = Reference::parse(reference)?;
@@ -63,6 +65,7 @@ impl ImageStore {
   pub fn platforms(&self, reference: &str, credentials: Option<Credentials>) -> Result<Vec<Platform>> {
     let reference = Reference::parse(reference)?;
     let name = reference.to_string();
+    let _blobs = self.using_blobs()?;
     if let Some(image) = self
       .list()?
       .into_iter()

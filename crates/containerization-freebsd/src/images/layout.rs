@@ -19,6 +19,7 @@ impl ImageStore {
     let path = directory.join("index.json");
     let bytes = std::fs::read(&path).map_err(Error::io(format!("reading {}", path.display())))?;
     let index: Index = parse(&bytes, &path.display().to_string())?;
+    let _blobs = self.using_blobs()?;
 
     index
       .manifests
@@ -51,6 +52,7 @@ impl ImageStore {
   /// a new index of only that platform's manifests. `out` is created if
   /// needed, and any `index.json` there is replaced.
   pub fn save(&self, references: &[&str], out: &Path, platform: Option<&Platform>) -> Result<()> {
+    let _blobs = self.using_blobs()?;
     let manifests = references
       .iter()
       .map(|reference| self.for_platform(&self.get(reference)?, platform))

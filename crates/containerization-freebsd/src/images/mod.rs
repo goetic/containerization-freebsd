@@ -15,6 +15,12 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 const LAYOUT: &str = r#"{"imageLayoutVersion":"1.0.0"}"#;
+/// Locked while `index.json` is read and changed.
+const INDEX_LOCK: &str = "index.json.lock";
+/// Locked shared while an operation works with blobs that no entry in
+/// `index.json` may reference yet, and exclusively while `delete` collects
+/// garbage.
+const BLOBS_LOCK: &str = "blobs.lock";
 
 pub struct ImageStore {
   root: PathBuf,
@@ -93,16 +99,11 @@ impl ImageStore {
   }
 
   /// Names `descriptor`, an index or manifest in the store, as `reference`,
-  /// replacing any image of that name.
+  /// replacing any image of that name. Blobs written through `content` have
+  /// no protection from garbage collection: a `delete` in another process
+  /// can remove them before `create` adds an entry that references them.
   pub fn create(&self, reference: &str, descriptor: Descriptor) -> Result<Image> {
     let reference = Reference::parse(reference)?.to_string();
-    if !self.content.has(&descriptor.digest) {
-      return Err(Error::Invalid(format!(
-        "the store has no blob {} for {reference}",
-        descriptor.digest
-      )));
-    }
-
     let mut descriptor = descriptor;
     descriptor.platform = None;
     descriptor.annotations.clear();
@@ -110,6 +111,14 @@ impl ImageStore {
       .annotations
       .insert(REF_NAME.to_string(), reference.clone());
     self.update(|index| {
+      // Checked under the index lock, which garbage collection also holds, so
+      // the blob can't be removed between this check and the new entry.
+      if !self.content.has(&descriptor.digest) {
+        return Err(Error::Invalid(format!(
+          "the store has no blob {} for {reference}",
+          descriptor.digest
+        )));
+      }
       index
         .manifests
         .retain(|entry| ref_name(entry) != Some(&reference));
@@ -148,7 +157,8 @@ impl ImageStore {
   }
 
   /// Removes the name `reference`, then garbage-collects every blob no
-  /// remaining image reaches.
+  /// remaining image reaches. Collecting waits for pulls, loads, pushes,
+  /// saves, and platform queries in progress in any process.
   pub fn delete(&self, reference: &str) -> Result<()> {
     let reference = Reference::parse(reference)?.to_string();
 
@@ -160,15 +170,18 @@ impl ImageStore {
       if index.manifests.len() == before {
         return Err(Error::Invalid(format!("the store has no image {reference}")));
       }
-
-      let needed = self.reachable(index)?;
-      for digest in self.content.digests()? {
-        if !needed.contains(&digest) {
-          self.content.delete(&digest)?;
-        }
-      }
       Ok(())
-    })
+    })?;
+
+    let _collecting = self.lock(BLOBS_LOCK, File::lock)?;
+    let _index = self.lock(INDEX_LOCK, File::lock)?;
+    let needed = self.reachable(&self.read_index()?)?;
+    for digest in self.content.digests()? {
+      if !needed.contains(&digest) {
+        self.content.delete(&digest)?;
+      }
+    }
+    Ok(())
   }
 
   /// Every blob reachable from `index`. Indexes and manifests the store
@@ -207,14 +220,30 @@ impl ImageStore {
     }
   }
 
+  /// Protects blobs from garbage collection until the returned file is
+  /// dropped. Pulls and loads hold it until they have added their image to
+  /// `index.json`. Pushes, saves, and platform queries hold it while they
+  /// read blobs that no entry references, such as an index narrowed to one
+  /// platform.
+  fn using_blobs(&self) -> Result<File> {
+    self.lock(BLOBS_LOCK, File::lock_shared)
+  }
+
+  /// Opens the store's lock file `name` and locks it with `lock`, either
+  /// `File::lock` or `File::lock_shared`, which also exclude other processes.
+  /// Dropping the file unlocks it.
+  fn lock(&self, name: &str, lock: fn(&File) -> std::io::Result<()>) -> Result<File> {
+    let path = self.root.join(name);
+    let locking = || format!("locking {}", path.display());
+    let file = File::create(&path).map_err(Error::io(locking()))?;
+    lock(&file).map_err(Error::io(locking()))?;
+    Ok(file)
+  }
+
   /// Applies `change` to `index.json` under a file lock, so stores in other
   /// processes don't lose each other's updates.
   fn update(&self, change: impl FnOnce(&mut Index) -> Result<()>) -> Result<()> {
-    let lock_path = self.root.join("index.json.lock");
-    let locking = || format!("locking {}", lock_path.display());
-    let lock = File::create(&lock_path).map_err(Error::io(locking()))?;
-    lock.lock().map_err(Error::io(locking()))?;
-
+    let _index = self.lock(INDEX_LOCK, File::lock)?;
     let mut index = self.read_index()?;
     change(&mut index)?;
     let bytes =
@@ -297,6 +326,7 @@ mod tests {
   use super::*;
   use crate::oci::testing::FakeRegistry;
   use crate::oci::{RootFs, RunConfig, media_type, sha256_digest};
+  use std::time::Duration;
 
   pub(super) fn descriptor(media_type: &str, bytes: &[u8], platform: Option<Platform>) -> Descriptor {
     Descriptor {
@@ -377,5 +407,43 @@ mod tests {
     assert!(store.list().unwrap().is_empty());
     assert!(store.content().digests().unwrap().is_empty());
     assert!(store.delete("ghcr.io/test/other:2").is_err());
+  }
+
+  #[test]
+  fn collects_garbage_once_pulls_have_named_their_images() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ImageStore::new(root.path()).unwrap();
+    let reference = format!("{}/test/image:1", registry());
+    store.pull(&reference, &Platform::default(), None).unwrap();
+    // Simulate a pull in progress: take the shared blobs lock, then write a
+    // manifest blob that no entry in index.json references yet.
+    let pulling = store.using_blobs().unwrap();
+    let manifest = json(&Manifest {
+      schema_version: 2,
+      media_type: Some(media_type::MANIFEST.into()),
+      config: descriptor(media_type::CONFIG, b"{}", None),
+      layers: Vec::new(),
+    });
+    let fetched = store.content().ingest(&manifest).unwrap();
+
+    std::thread::scope(|scope| {
+      let deleting = scope.spawn(|| store.delete(&reference));
+      std::thread::sleep(Duration::from_millis(200));
+      assert!(!deleting.is_finished());
+      assert!(store.content().has(&fetched));
+      // delete has already removed the image's entry from index.json and
+      // released the index lock. It is waiting only for the blobs lock.
+      assert!(store.list().unwrap().is_empty());
+      store
+        .create(
+          "ghcr.io/test/pulled:1",
+          descriptor(media_type::MANIFEST, &manifest, None),
+        )
+        .unwrap();
+      drop(pulling);
+      deleting.join().unwrap().unwrap();
+    });
+
+    assert_eq!(store.content().digests().unwrap(), [fetched]);
   }
 }
