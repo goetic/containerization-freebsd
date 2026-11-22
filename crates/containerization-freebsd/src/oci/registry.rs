@@ -1,4 +1,4 @@
-use super::auth::{Auth, Credentials, Secret, TokenResponse, parse_challenge, token_url};
+use super::auth::{Access, Auth, Credentials, Secret, TokenResponse, parse_challenge, token_url};
 use super::curl::{self, Request, Response};
 use super::{ContentStore, Descriptor, Digest, Reference, media_type};
 use crate::error::{Error, Result};
@@ -15,9 +15,9 @@ const MAX_MANIFEST: u64 = 4 << 20;
 #[derive(Debug, Default)]
 pub struct RegistryClient {
   credentials: Option<Credentials>,
-  /// Bearer tokens, keyed by `<API host>/<repository>` and whether they
-  /// grant push.
-  tokens: Mutex<HashMap<(String, bool), Secret>>,
+  /// Bearer tokens, keyed by `<API host>/<repository>` and the access they
+  /// grant.
+  tokens: Mutex<HashMap<(String, Access), Secret>>,
 }
 
 impl RegistryClient {
@@ -94,14 +94,14 @@ impl RegistryClient {
   pub fn push_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
     let path = format!("blobs/{}", descriptor.digest);
     let head = Request::new("HEAD", url(reference, &path));
-    match self.send(reference, &head, true)?.status {
+    match self.send(reference, &head, Access::Push)?.status {
       200 => return Ok(()),
       404 => {}
       status => return Err(unexpected(&head, status, None)),
     }
 
     let post = Request::new("POST", url(reference, "blobs/uploads/"));
-    let started = self.send(reference, &post, true)?;
+    let started = self.send(reference, &post, Access::Push)?;
     let location = started
       .header("location")
       .filter(|_| started.status == 202)
@@ -125,7 +125,7 @@ impl RegistryClient {
     // Credentials go only to the registry, not to an upload location on
     // another origin such as a storage service.
     let response = if same_origin(&post.url, &put.url) {
-      self.send(reference, &put, true)?
+      self.send(reference, &put, Access::Push)?
     } else {
       curl::send(&put, &Auth::None)?
     };
@@ -152,7 +152,7 @@ impl RegistryClient {
     put.output = Some(&response_body);
 
     let result = self
-      .send(reference, &put, true)
+      .send(reference, &put, Access::Push)
       .and_then(|response| match response.status {
         201 => Ok(()),
         status => Err(unexpected(&put, status, Some(&response_body))),
@@ -175,7 +175,7 @@ impl RegistryClient {
     get.accept = accept;
     get.output = Some(body);
     get.max_size = max_size;
-    let response = self.send(reference, &get, false)?;
+    let response = self.send(reference, &get, Access::Pull)?;
 
     match response.status {
       200 => Ok(response),
@@ -184,10 +184,10 @@ impl RegistryClient {
   }
 
   /// Sends `request` with any cached token. On a 401, authenticates as the
-  /// WWW-Authenticate challenge asks and retries once. The token's scope is
-  /// pull, plus push if `push` is set.
-  fn send(&self, reference: &Reference, request: &Request, push: bool) -> Result<Response> {
-    let key = (format!("{}/{}", reference.api_host(), reference.repository), push);
+  /// WWW-Authenticate challenge asks and retries once. The token's scope
+  /// grants `access`.
+  fn send(&self, reference: &Reference, request: &Request, access: Access) -> Result<Response> {
+    let key = (format!("{}/{}", reference.api_host(), reference.repository), access);
     let cached = self
       .tokens
       .lock()
@@ -209,7 +209,7 @@ impl RegistryClient {
 
   /// The authorization a WWW-Authenticate challenge asks for: a bearer token
   /// from its realm, or basic auth with the credentials.
-  fn authorize(&self, reference: &Reference, key: &(String, bool), challenge: &str) -> Result<Auth> {
+  fn authorize(&self, reference: &Reference, key: &(String, Access), challenge: &str) -> Result<Auth> {
     let (scheme, parameters) = parse_challenge(challenge);
 
     match scheme.to_ascii_lowercase().as_str() {
@@ -231,7 +231,7 @@ impl RegistryClient {
 
   /// Fetches a bearer token from `url`, with basic auth if there are
   /// credentials, and caches it under `key`.
-  fn fetch_token(&self, reference: &Reference, key: &(String, bool), url: &url::Url) -> Result<Secret> {
+  fn fetch_token(&self, reference: &Reference, key: &(String, Access), url: &url::Url) -> Result<Secret> {
     let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
     let body = curl::tempfile_path();
     let mut get = Request::new("GET", url.to_string());
@@ -334,7 +334,7 @@ mod tests {
       .tokens
       .lock()
       .unwrap()
-      .insert(("ghcr.io/a/b".into(), true), "a-token".into());
+      .insert(("ghcr.io/a/b".into(), Access::Push), "a-token".into());
 
     let debugged = format!("{client:?}");
 

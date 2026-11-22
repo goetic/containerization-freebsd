@@ -7,8 +7,8 @@
 use containerization_freebsd::oci::{ContentStore, Descriptor, Digest, Platform, media_type};
 use containerization_freebsd::{
   Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
-  Jail, Limit, Mac, Machine, Mount, Network, Output, Process, Resource, Share, Spawn, Step, UnixSocket, Unpacker,
-  Upgrade, User, WindowSize, Zfs, release,
+  Jail, Limit, Mac, Machine, Mount, Network, Output, Parents, Process, Resource, Share, Spawn, Step, UnixSocket,
+  Unpacker, Upgrade, User, WindowSize, Zfs, release,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -1386,16 +1386,16 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
   let big: Vec<u8> = (0..1u32 << 20).map(|i| (i % 251) as u8).collect();
   std::fs::write(copies.join("big"), &big).expect("write a file to copy");
   hidden
-    .copy_in(&copies.join("big"), "/cfbsd/new/", 0o644, true)
+    .copy_in(&copies.join("big"), "/cfbsd/new/", 0o644, Parents::Create)
     .expect_err("copy a file into a missing directory");
   hidden
-    .copy_in(&copies.join("big"), "/cfbsd/new/big", 0o600, true)
+    .copy_in(&copies.join("big"), "/cfbsd/new/big", 0o600, Parents::Create)
     .expect("copy a file in");
   hidden
-    .copy_in(&tree, "/cfbsd", 0o644, true)
+    .copy_in(&tree, "/cfbsd", 0o644, Parents::Create)
     .expect("copy a directory into a directory");
   hidden
-    .copy_in(&tree, "/cfbsd/kept", 0o644, true)
+    .copy_in(&tree, "/cfbsd/kept", 0o644, Parents::Create)
     .expect_err("copy a directory over a file");
   let ran = hidden
     .check(
@@ -1406,7 +1406,7 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
   assert_eq!(ran.lines(), ["-rw------- 0", "-rw-r--r-- 0", "one"]);
   let out = copies.join("out");
   hidden
-    .copy_out("/cfbsd/new/big", &out.join("big"), true)
+    .copy_out("/cfbsd/new/big", &out.join("big"), Parents::Create)
     .expect("copy a file out");
   assert_eq!(std::fs::read(out.join("big")).expect("read the file copied out"), big);
   let mode = std::fs::metadata(out.join("big"))
@@ -1415,21 +1415,21 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
     .mode();
   assert_eq!(mode & 0o777, 0o644);
   hidden
-    .copy_out("/cfbsd/tree", &out.join("tree"), true)
+    .copy_out("/cfbsd/tree", &out.join("tree"), Parents::Create)
     .expect("copy a directory out");
   for (path, text) in [("one", "one\n"), ("sub/two", "two\n")] {
     let copied = std::fs::read_to_string(out.join("tree").join(path)).expect("read a file copied out");
     assert_eq!(copied, text);
   }
   hidden
-    .copy_out("/cfbsd/missing", &out.join("missing"), true)
+    .copy_out("/cfbsd/missing", &out.join("missing"), Parents::Create)
     .expect_err("copy out what is missing");
   // Copying refuses devices and FIFOs, which could block or never end.
   hidden
-    .copy_out("/dev/null", &out.join("null"), true)
+    .copy_out("/dev/null", &out.join("null"), Parents::Create)
     .expect_err("copy out a device");
   hidden
-    .copy_in(&copies.join("big"), "/dev/null", 0o644, true)
+    .copy_in(&copies.join("big"), "/dev/null", 0o644, Parents::Create)
     .expect_err("copy over a device");
   let fifo = copies.join("fifo");
   let made = std::process::Command::new("mkfifo")
@@ -1438,6 +1438,6 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
     .expect("run mkfifo");
   assert!(made.success(), "make a FIFO on the host");
   hidden
-    .copy_in(&fifo, "/cfbsd/fifo", 0o644, true)
+    .copy_in(&fifo, "/cfbsd/fifo", 0o644, Parents::Create)
     .expect_err("copy in a FIFO");
 }

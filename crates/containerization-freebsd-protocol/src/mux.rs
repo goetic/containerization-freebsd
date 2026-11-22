@@ -109,44 +109,64 @@ impl Kind {
   }
 }
 
+/// The role a message's sender has on its channel: the initiator opened the
+/// channel, and the responder runs the process, relay, or listener it asked
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+  Initiator,
+  Responder,
+}
+
+/// Whether a channel is still open after a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+  Open,
+  Closed,
+}
+
 #[derive(Debug)]
 struct Channel {
   kind: Kind,
-  opener: Side,
+  initiator: Side,
   opened: bool,
-  opener_eof: bool,
-  runner_eof: bool,
+  initiator_eof: bool,
+  responder_eof: bool,
 }
 
 impl Channel {
-  fn new(kind: Kind, opener: Side) -> Self {
+  fn new(kind: Kind, initiator: Side) -> Self {
     Self {
       kind,
-      opener,
+      initiator,
       opened: false,
-      opener_eof: false,
-      runner_eof: false,
+      initiator_eof: false,
+      responder_eof: false,
     }
   }
 
-  /// Applies `message` from the opener or the runner. Returns `None` if the
-  /// channel does not allow the message now, and otherwise whether the
-  /// message closed the channel.
-  fn step(&mut self, from_opener: bool, message: &Message) -> Option<bool> {
-    let runner = !from_opener;
+  /// Applies `message` from `sender`. Returns `None` if the channel does not
+  /// allow the message now, and otherwise whether the channel is still open.
+  fn step(&mut self, sender: Role, message: &Message) -> Option<Status> {
+    let (initiator, responder) = (sender == Role::Initiator, sender == Role::Responder);
     let process = matches!(self.kind, Kind::Exec { .. });
-    let ended = if from_opener { self.opener_eof } else { self.runner_eof };
-    // The opener may send stdin before the runner has started the process.
-    let started = from_opener || self.opened;
+    let ended = if initiator {
+      self.initiator_eof
+    } else {
+      self.responder_eof
+    };
+    // The initiator may send stdin before the responder has started the
+    // process.
+    let started = initiator || self.opened;
 
     let allowed = match message {
-      Message::Opened => runner && !self.opened,
+      Message::Opened => responder && !self.opened,
       Message::Data(_) => started && !ended && self.kind != Kind::Listener,
       Message::Eof => started && !ended,
-      Message::Stderr(_) => runner && self.opened && self.kind == Kind::Exec { pty: false },
-      Message::Resize(_) => from_opener && self.kind == Kind::Exec { pty: true },
-      Message::Signal(_) => from_opener && process,
-      Message::Exited(_) => runner && self.opened && process,
+      Message::Stderr(_) => responder && self.opened && self.kind == Kind::Exec { pty: false },
+      Message::Resize(_) => initiator && self.kind == Kind::Exec { pty: true },
+      Message::Signal(_) => initiator && process,
+      Message::Exited(_) => responder && self.opened && process,
       Message::Error(_) => true,
       _ => false,
     };
@@ -156,16 +176,17 @@ impl Channel {
 
     match message {
       Message::Opened => self.opened = true,
-      Message::Eof if from_opener => self.opener_eof = true,
-      Message::Eof => self.runner_eof = true,
+      Message::Eof if initiator => self.initiator_eof = true,
+      Message::Eof => self.responder_eof = true,
       _ => {}
     }
 
-    Some(match message {
+    let closed = match message {
       Message::Exited(_) | Message::Error(_) => true,
-      Message::Eof => !process && self.opener_eof && self.runner_eof,
+      Message::Eof => !process && self.initiator_eof && self.responder_eof,
       _ => false,
-    })
+    };
+    Some(if closed { Status::Closed } else { Status::Open })
   }
 }
 
@@ -347,11 +368,16 @@ impl Mux {
       .channels
       .get_mut(&channel)
       .ok_or(Error::UnknownChannel(channel))?;
-    let closed = state
-      .step(sender == state.opener, message)
+    let role = if sender == state.initiator {
+      Role::Initiator
+    } else {
+      Role::Responder
+    };
+    let status = state
+      .step(role, message)
       .ok_or_else(|| not_allowed(channel, message))?;
 
-    if closed {
+    if status == Status::Closed {
       self.channels.remove(&channel);
     }
     Ok(())

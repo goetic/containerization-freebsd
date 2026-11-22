@@ -192,7 +192,7 @@ fn keeps_interleaved_channels_apart() {
 }
 
 #[test]
-fn resizes_only_a_terminal_and_only_from_its_opener() {
+fn resizes_only_a_terminal_and_only_from_its_initiator() {
   let (mut host, mut guest) = session();
   let (pty, open_pty) = host.open(exec(&["sh"], Some(TERMINAL))).unwrap();
   let (plain, open_plain) = host.open(exec(&["make"], None)).unwrap();

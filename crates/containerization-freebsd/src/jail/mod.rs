@@ -7,7 +7,7 @@ pub use mount::Mount;
 pub use network::{Interface, Network};
 
 use crate::agent::{Agent, Exec, Process, QUICK, Ran, Relay, Spawn};
-use crate::copy;
+use crate::copy::{self, Parents};
 use crate::error::{Error, Result};
 use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
@@ -122,18 +122,18 @@ impl<'a> Jail<'a> {
 
   /// Copies `source`, a host file or directory, into the jail, like
   /// Containerization's `copyIn`: to `destination`, or into it if it is a
-  /// directory. A copied file gets `mode`. `create_parents` creates missing
-  /// parents. Paths resolve as the jail sees them.
-  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, create_parents: bool) -> Result<()> {
-    copy::copy_in(self, source, destination, mode, create_parents)
+  /// directory. A copied file gets `mode`. `parents` says whether to create
+  /// missing parent directories. Paths resolve as the jail sees them.
+  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, parents: Parents) -> Result<()> {
+    copy::copy_in(self, source, destination, mode, parents)
   }
 
   /// Copies `source`, a file or directory in the jail, to host path
   /// `destination`, like Containerization's `copyOut`. A file is written 0644;
-  /// a directory's contents go into `destination`. `create_parents` creates
-  /// missing parents.
-  pub fn copy_out(&self, source: &str, destination: &Path, create_parents: bool) -> Result<()> {
-    copy::copy_out(self, source, destination, create_parents)
+  /// a directory's contents go into `destination`. `parents` says whether to
+  /// create missing parent directories.
+  pub fn copy_out(&self, source: &str, destination: &Path, parents: Parents) -> Result<()> {
+    copy::copy_out(self, source, destination, parents)
   }
 
   /// The jail's aggregate racct usage (`rctl -u`) and its interface counters.

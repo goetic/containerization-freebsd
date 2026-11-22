@@ -41,10 +41,11 @@ pub enum Message {
   Accepted {
     listener: u32,
   },
-  /// The runner started the process, connected the relay, or is listening.
+  /// The responder started the process, connected the relay, or is
+  /// listening.
   Opened,
-  /// Stdin or relay bytes from the opener, or stdout or relay bytes from the
-  /// runner.
+  /// Stdin or relay bytes from the initiator, or stdout or relay bytes from
+  /// the responder.
   Data(Vec<u8>),
   Stderr(Vec<u8>),
   /// Ends the sender's Data. On a Listen channel, the host's Eof stops the

@@ -5,6 +5,7 @@
 //! container.
 
 use crate::agent::{Agent, Exec, Process, QUICK, Relay, Spawn};
+use crate::copy::Parents;
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
 use crate::scripts;
@@ -153,13 +154,13 @@ impl<'a> Container<'a> {
   }
 
   /// Like `Jail::copy_in`, into the container.
-  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, create_parents: bool) -> Result<()> {
-    self.jail.copy_in(source, destination, mode, create_parents)
+  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, parents: Parents) -> Result<()> {
+    self.jail.copy_in(source, destination, mode, parents)
   }
 
   /// Like `Jail::copy_out`, out of the container.
-  pub fn copy_out(&self, source: &str, destination: &Path, create_parents: bool) -> Result<()> {
-    self.jail.copy_out(source, destination, create_parents)
+  pub fn copy_out(&self, source: &str, destination: &Path, parents: Parents) -> Result<()> {
+    self.jail.copy_out(source, destination, parents)
   }
 
   /// `Jail::statistics`, plus the ZFS I/O counters of the container's

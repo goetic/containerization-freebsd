@@ -54,6 +54,24 @@ pub(super) enum Auth {
   Basic(Credentials),
 }
 
+/// What a request does to a repository, and so what its token must grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Access {
+  Pull,
+  /// Pushing also reads, as a HEAD that checks for a blob does.
+  Push,
+}
+
+impl Access {
+  /// The actions a token scope names for this access.
+  fn actions(self) -> &'static str {
+    match self {
+      Self::Pull => "pull",
+      Self::Push => "pull,push",
+    }
+  }
+}
+
 #[derive(serde::Deserialize)]
 pub(super) struct TokenResponse {
   pub(super) token: Option<String>,
@@ -62,18 +80,17 @@ pub(super) struct TokenResponse {
 
 /// The token request URL: a bearer challenge's `realm`, with its `service`
 /// and `scope` as query parameters. Without a challenge scope, the scope is
-/// `reference`'s repository with pull, plus push if `push` is set.
+/// `reference`'s repository with the actions `access` needs.
 pub(super) fn token_url(
   reference: &Reference,
-  push: bool,
+  access: Access,
   challenge: &str,
   parameters: &HashMap<String, String>,
 ) -> Result<url::Url> {
   let realm = parameters
     .get("realm")
     .ok_or_else(|| Error::Guest(format!("{} named no token realm: {challenge}", reference.domain)))?;
-  let actions = if push { "pull,push" } else { "pull" };
-  let scope = format!("repository:{}:{actions}", reference.repository);
+  let scope = format!("repository:{}:{}", reference.repository, access.actions());
   let mut url = url::Url::parse(realm)
     .map_err(|error| Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain)))?;
 
@@ -157,7 +174,7 @@ mod tests {
     let (_, parameters) = parse_challenge(r#"Bearer realm="https://ghcr.io/token",service="ghcr.io""#);
 
     assert_eq!(
-      token_url(&reference, true, "", &parameters)
+      token_url(&reference, Access::Push, "", &parameters)
         .unwrap()
         .as_str(),
       "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aa%2Fb%3Apull%2Cpush"
