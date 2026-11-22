@@ -153,7 +153,7 @@ impl<'a> Unpacker<'a> {
 /// A layer media type's compression, as `scripts::DECOMPRESS` names it.
 fn compression(media_type: &str) -> Result<&'static str> {
   match media_type {
-    media_type::LAYER | "application/vnd.docker.image.rootfs.diff.tar" => Ok("none"),
+    media_type::LAYER | media_type::DOCKER_LAYER => Ok("none"),
     media_type::LAYER_GZIP | media_type::DOCKER_LAYER_GZIP => Ok("gzip"),
     media_type::LAYER_ZSTD => Ok("zstd"),
     other => Err(Error::Invalid(format!("layers of type {other} aren't supported"))),
@@ -170,6 +170,7 @@ mod tests {
     assert_eq!(compression(media_type::DOCKER_LAYER_GZIP).unwrap(), "gzip");
     assert_eq!(compression(media_type::LAYER_ZSTD).unwrap(), "zstd");
     assert_eq!(compression(media_type::LAYER).unwrap(), "none");
+    assert_eq!(compression(media_type::DOCKER_LAYER).unwrap(), "none");
     assert!(compression("application/vnd.oci.image.layer.nondistributable.v1.tar+gzip").is_err());
   }
 }

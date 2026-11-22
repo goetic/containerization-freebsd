@@ -30,7 +30,12 @@ pub mod media_type {
   pub const LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
   pub const DOCKER_MANIFEST_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
   pub const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+  pub const DOCKER_LAYER: &str = "application/vnd.docker.image.rootfs.diff.tar";
   pub const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+
+  /// The index and manifest types a registry may answer a manifest request
+  /// with.
+  pub const MANIFESTS: [&str; 4] = [INDEX, MANIFEST, DOCKER_MANIFEST_LIST, DOCKER_MANIFEST];
 }
 
 /// The index annotation naming the reference an entry was pulled or tagged

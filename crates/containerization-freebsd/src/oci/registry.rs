@@ -9,10 +9,6 @@ use std::sync::{Mutex, PoisonError};
 /// 4 MiB: the distribution spec says registries should accept manifests at
 /// least this large.
 const MAX_MANIFEST: u64 = 4 << 20;
-const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, \
-                                application/vnd.oci.image.manifest.v1+json, \
-                                application/vnd.docker.distribution.manifest.list.v2+json, \
-                                application/vnd.docker.distribution.manifest.v2+json";
 
 /// A distribution API client over curl(1), which gets tokens and passwords
 /// on stdin rather than in its arguments.
@@ -41,7 +37,7 @@ impl RegistryClient {
       let response = self.get(
         reference,
         &format!("manifests/{target}"),
-        Some(ACCEPT_MANIFESTS),
+        Some(&media_type::MANIFESTS.join(", ")),
         &partial,
         Some(MAX_MANIFEST),
       )?;
@@ -302,14 +298,8 @@ fn snippet(bytes: &[u8]) -> String {
 /// else the document's `mediaType`, else an index if it has `manifests` and
 /// a manifest if not.
 fn media_type_of(content_type: Option<&str>, bytes: &[u8]) -> String {
-  let known = [
-    media_type::INDEX,
-    media_type::MANIFEST,
-    media_type::DOCKER_MANIFEST_LIST,
-    media_type::DOCKER_MANIFEST,
-  ];
   let header = content_type.map(|value| value.split(';').next().unwrap_or_default().trim());
-  if let Some(header) = header.filter(|header| known.contains(header)) {
+  if let Some(header) = header.filter(|header| media_type::MANIFESTS.contains(header)) {
     return header.to_string();
   }
 
