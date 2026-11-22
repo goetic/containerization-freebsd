@@ -56,6 +56,95 @@ impl Ran {
   }
 }
 
+/// Starts processes in one place: the guest, a jail, or a container. `run`
+/// and `check` build on `spawn`.
+pub trait Spawn {
+  /// Starts the process `exec` describes. The process inherits the agent's
+  /// environment plus `exec.env`. With `pty`, it runs on a terminal of that
+  /// size. With a user, `HOME` is set to the user's home directory unless
+  /// `exec.env` sets it.
+  fn spawn(&self, exec: Exec) -> Result<Process>;
+
+  /// Runs `argv` with no input and collects its output. If the command is
+  /// still running after `timeout`, it is killed.
+  fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
+    self.run_exec(Exec::new(argv), timeout)
+  }
+
+  /// Like `run`, for the process `exec` describes.
+  fn run_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
+    let started = Instant::now();
+    let what = described(&exec);
+    let process = self.spawn(exec)?;
+    process.close_input()?;
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+
+    loop {
+      let left = timeout.saturating_sub(started.elapsed());
+
+      match process.recv_timeout(left)? {
+        Some(Output::Stdout(bytes)) => stdout.extend(bytes),
+        Some(Output::Stderr(bytes)) => stderr.extend(bytes),
+        Some(Output::Exited(exit)) => {
+          return Ok(Ran {
+            exit,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            seconds: started.elapsed().as_secs_f64(),
+          });
+        }
+        // Dropping the process kills it.
+        None => {
+          return Err(Error::Timeout(format!(
+            "{what} did not finish within {}s",
+            timeout.as_secs()
+          )));
+        }
+      }
+    }
+  }
+
+  /// Like `run`, but fails unless the command exits with status 0.
+  fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
+    self.check_exec(Exec::new(argv), timeout)
+  }
+
+  /// Like `check`, for the process `exec` describes.
+  fn check_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
+    let what = described(&exec);
+    let ran = self.run_exec(exec, timeout)?;
+
+    match ran.exit {
+      Exit::Code(0) => Ok(ran),
+      exit => {
+        let lines: Vec<&str> = ran.stderr.lines().collect();
+        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+
+        Err(Error::Guest(format!(
+          "{what} exited {exit:?} after {:.1}s: {tail}",
+          ran.seconds
+        )))
+      }
+    }
+  }
+}
+
+impl Spawn for Agent {
+  fn spawn(&self, exec: Exec) -> Result<Process> {
+    let what = described(&exec);
+
+    self.open(Message::Exec(exec), what, None).map(Process::new)
+  }
+}
+
+/// `exec`'s argv, and its jail if it has one, for error messages.
+fn described(exec: &Exec) -> String {
+  match &exec.jail {
+    Some(jail) => format!("{:?} in jail {jail}", exec.argv),
+    None => format!("{:?}", exec.argv),
+  }
+}
+
 impl Agent {
   pub(crate) fn new(output: PipeReader, input: PipeWriter) -> Self {
     Self {
@@ -110,16 +199,6 @@ impl Agent {
     }
   }
 
-  /// Starts the process `exec` describes, in the guest or its jail. The
-  /// process inherits the agent's environment plus `exec.env`. With `pty`,
-  /// it runs on a terminal of that size. With a user, `HOME` is set to the
-  /// user's home directory unless `exec.env` sets it.
-  pub fn spawn(&self, exec: Exec) -> Result<Process> {
-    let what = format!("{:?}", exec.argv);
-
-    self.open(Message::Exec(exec), what, None).map(Process::new)
-  }
-
   /// Connects to `port` on the guest's loopback.
   pub fn connect(&self, port: u16) -> Result<Relay> {
     self.relay(Connect {
@@ -155,69 +234,6 @@ impl Agent {
     self
       .open(Message::Listen(listen), what, Some(host))
       .map(Listener::new)
-  }
-
-  /// Runs `argv` in the guest with no input and collects its output. If the
-  /// command is still running after `timeout`, it is killed.
-  pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.run_exec(Exec::new(argv), timeout)
-  }
-
-  /// Like `run`, for the process `exec` describes.
-  pub(crate) fn run_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
-    let started = Instant::now();
-    let argv = exec.argv.clone();
-    let process = self.spawn(exec)?;
-    process.close_input()?;
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-
-    loop {
-      let left = timeout.saturating_sub(started.elapsed());
-
-      match process.recv_timeout(left)? {
-        Some(Output::Stdout(bytes)) => stdout.extend(bytes),
-        Some(Output::Stderr(bytes)) => stderr.extend(bytes),
-        Some(Output::Exited(exit)) => {
-          return Ok(Ran {
-            exit,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            seconds: started.elapsed().as_secs_f64(),
-          });
-        }
-        // Dropping the process kills it.
-        None => {
-          return Err(Error::Timeout(format!(
-            "{argv:?} did not finish within {}s",
-            timeout.as_secs()
-          )));
-        }
-      }
-    }
-  }
-
-  /// Like `run`, but fails unless the command exits with status 0.
-  pub fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.check_exec(Exec::new(argv), timeout)
-  }
-
-  /// Like `check`, for the process `exec` describes.
-  pub(crate) fn check_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
-    let argv = exec.argv.clone();
-    let ran = self.run_exec(exec, timeout)?;
-
-    match ran.exit {
-      Exit::Code(0) => Ok(ran),
-      exit => {
-        let lines: Vec<&str> = ran.stderr.lines().collect();
-        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
-
-        Err(Error::Guest(format!(
-          "{argv:?} exited {exit:?} after {:.1}s: {tail}",
-          ran.seconds
-        )))
-      }
-    }
   }
 
   /// Sets the guest's clock to the host's, if there is a session. The clock

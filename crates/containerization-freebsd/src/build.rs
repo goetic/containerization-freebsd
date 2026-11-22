@@ -3,7 +3,7 @@
 //! hashed from that snapshot's name and the step, so a built step never runs
 //! again.
 
-use crate::agent::{Agent, Exec, Exit, Output, QUICK};
+use crate::agent::{Agent, Exec, Exit, Output, QUICK, Spawn};
 use crate::digest::sha256;
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};

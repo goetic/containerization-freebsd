@@ -1,7 +1,7 @@
 //! ZFS pools, datasets, snapshots and clones in the guest, via the agent.
 //! Names are passed as argv, never through a shell.
 
-use crate::agent::{Agent, QUICK};
+use crate::agent::{Agent, QUICK, Spawn};
 use crate::error::{Error, Result};
 use std::time::Duration;
 

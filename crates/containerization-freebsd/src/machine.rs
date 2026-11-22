@@ -1,7 +1,7 @@
 //! A guest's Virtualization.framework configuration and VM lifecycle: start,
 //! pause, save, restore and shutdown.
 
-use crate::agent::{Agent, QUICK};
+use crate::agent::{Agent, QUICK, Spawn};
 use crate::clock::ClockSync;
 use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]

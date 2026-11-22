@@ -1,7 +1,7 @@
 //! File systems mounted into jails.
 
 use super::Jail;
-use crate::agent::QUICK;
+use crate::agent::{QUICK, Spawn};
 use crate::error::Result;
 use crate::scripts;
 

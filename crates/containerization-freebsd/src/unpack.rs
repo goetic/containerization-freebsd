@@ -3,7 +3,7 @@
 //! so a layer stack shared by several images is unpacked once. The top
 //! layer's snapshot is what a container's root is cloned from.
 
-use crate::agent::{Agent, Exec, QUICK};
+use crate::agent::{Agent, Exec, QUICK, Spawn};
 use crate::error::{Error, Result};
 use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type, sha256_hex};

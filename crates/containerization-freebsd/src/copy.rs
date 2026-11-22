@@ -4,7 +4,7 @@
 //! paths resolve as the jail sees them, and no symlink escapes it.
 //! Directories travel as tar streams, with the host's `tar` at the other end.
 
-use crate::agent::{Exec, Exit, Output, Process};
+use crate::agent::{Exec, Exit, Output, Process, Spawn};
 use crate::error::{Error, Result};
 use crate::jail::Jail;
 use std::fs::{self, File, OpenOptions};

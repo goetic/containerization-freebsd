@@ -25,7 +25,7 @@ pub mod statistics;
 pub mod unpack;
 pub mod zfs;
 
-pub use agent::{Agent, Exec, Exit, Limit, Output, Process, Ran, Relay, Resource, User, WindowSize};
+pub use agent::{Agent, Exec, Exit, Limit, Output, Process, Ran, Relay, Resource, Spawn, User, WindowSize};
 pub use build::{Builder, Built, Step};
 pub use container::{Configuration, Container, Containers, Dns, Host};
 pub use error::{Error, Result};

@@ -2,7 +2,7 @@
 //! bridge, or VNET on dedicated Virtualization NAT devices.
 
 use super::Jail;
-use crate::agent::{Agent, QUICK};
+use crate::agent::{Agent, QUICK, Spawn};
 use crate::error::{Error, Result};
 use crate::scripts;
 use std::net::Ipv4Addr;

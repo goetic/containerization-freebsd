@@ -2,6 +2,7 @@
 //! later machines clone or restore.
 
 use crate::Machine;
+use crate::agent::Spawn;
 use crate::error::{Error, Result};
 use crate::host::run;
 use crate::machine::Layout;

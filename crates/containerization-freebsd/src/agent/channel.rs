@@ -369,6 +369,7 @@ impl Drop for Stream {
 mod tests {
   use super::*;
   use crate::agent::Exec;
+  use crate::agent::Spawn;
   use crate::agent::tests::started;
 
   #[test]

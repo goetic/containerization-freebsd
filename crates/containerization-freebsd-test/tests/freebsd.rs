@@ -7,8 +7,8 @@
 use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
 use containerization_freebsd::{
   Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
-  Jail, Limit, Machine, Mount, Network, Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User,
-  WindowSize, Zfs, release,
+  Jail, Limit, Machine, Mount, Network, Output, Process, Resource, Share, Spawn, Step, UnixSocket, Unpacker, Upgrade,
+  User, WindowSize, Zfs, release,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};

@@ -6,7 +6,7 @@ mod network;
 pub use mount::Mount;
 pub use network::{Interface, Network};
 
-use crate::agent::{Agent, Exec, Exit, Process, QUICK, Ran, Relay};
+use crate::agent::{Agent, Exec, Exit, Process, QUICK, Ran, Relay, Spawn};
 use crate::copy;
 use crate::error::{Error, Result};
 use crate::scripts;
@@ -81,16 +81,6 @@ impl<'a> Jail<'a> {
 
   pub fn name(&self) -> &str {
     &self.name
-  }
-
-  /// Starts `exec`'s process in the jail, as `Agent::spawn` does in the
-  /// guest. The working directory is a path in the jail, and the user is
-  /// looked up in the jail's `/etc/passwd` and `/etc/group`.
-  pub fn spawn(&self, exec: Exec) -> Result<Process> {
-    self.agent.spawn(Exec {
-      jail: Some(self.name.clone()),
-      ..exec
-    })
   }
 
   /// Connects to `port` on the jail's loopback, which is the guest's unless
@@ -169,16 +159,6 @@ impl<'a> Jail<'a> {
     Ok(ran.stdout.trim_end_matches('\n').to_string())
   }
 
-  /// Like `Agent::run`, in the jail.
-  pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.agent.run(&self.jexec(argv), timeout)
-  }
-
-  /// Like `Agent::check`, in the jail.
-  pub fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.agent.check(&self.jexec(argv), timeout)
-  }
-
   /// Stops the jail: kills its processes, drops the TCP connections they
   /// left, removes it and waits for it to finish dying, about a minute longer
   /// if a connection couldn't be dropped. Then runs `clean_up` and destroys
@@ -245,18 +225,23 @@ impl<'a> Jail<'a> {
   /// jail needn't have it.
   fn rescue(&self, argv: &[&str]) -> Result<Ran> {
     let exec = Exec {
-      jail: Some(self.name.clone()),
       rescue: true,
       ..Exec::new(argv)
     };
 
-    self.agent.check_exec(exec, QUICK)
+    self.check_exec(exec, QUICK)
   }
+}
 
-  fn jexec<'b>(&'b self, argv: &[&'b str]) -> Vec<&'b str> {
-    let mut all = vec!["jexec", self.name.as_str()];
-    all.extend_from_slice(argv);
-    all
+impl Spawn for Jail<'_> {
+  /// Starts `exec`'s process in the jail, as `Agent::spawn` does in the
+  /// guest. The working directory is a path in the jail, `/` by default, and
+  /// the user is looked up in the jail's `/etc/passwd` and `/etc/group`.
+  fn spawn(&self, exec: Exec) -> Result<Process> {
+    self.agent.spawn(Exec {
+      jail: Some(self.name.clone()),
+      ..exec
+    })
   }
 }
 

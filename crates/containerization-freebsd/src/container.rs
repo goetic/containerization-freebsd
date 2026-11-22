@@ -4,7 +4,7 @@
 //! container, these share one machine; for a VM each, create a machine per
 //! container.
 
-use crate::agent::{Agent, Exec, Process, QUICK, Ran, Relay};
+use crate::agent::{Agent, Exec, Process, QUICK, Relay, Spawn};
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
 use crate::scripts;
@@ -14,7 +14,6 @@ use crate::zfs::Zfs;
 use std::mem;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
 
 /// The settings a container is created with.
 #[derive(Clone, Debug, Default)]
@@ -137,19 +136,10 @@ impl<'a> Container<'a> {
     self.main.as_ref()
   }
 
-  /// Starts another process in the container, like `Jail::spawn`.
+  /// Starts another process in the container. This is `spawn` under the name
+  /// Containerization gives it.
   pub fn exec(&self, exec: Exec) -> Result<Process> {
-    self.jail.spawn(exec)
-  }
-
-  /// Like `Agent::run`, in the container.
-  pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.jail.run(argv, timeout)
-  }
-
-  /// Like `Agent::check`, in the container.
-  pub fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.jail.check(argv, timeout)
+    self.spawn(exec)
   }
 
   /// Like `Jail::connect`, in the container.
@@ -202,6 +192,13 @@ impl<'a> Container<'a> {
     let relays = mem::take(&mut *self.relays.lock().unwrap_or_else(PoisonError::into_inner));
 
     relays.into_iter().try_for_each(SocketRelay::close)
+  }
+}
+
+impl Spawn for Container<'_> {
+  /// Starts a process in the container, like `Jail::spawn`.
+  fn spawn(&self, exec: Exec) -> Result<Process> {
+    self.jail.spawn(exec)
   }
 }
 
