@@ -6,7 +6,7 @@ mod network;
 pub use mount::Mount;
 pub use network::{Interface, Network};
 
-use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
+use crate::agent::{Agent, Exec, Exit, Process, QUICK, Ran, Relay};
 use crate::copy;
 use crate::error::{Error, Result};
 use crate::scripts;
@@ -16,7 +16,6 @@ use containerization_freebsd_protocol::{Address, Connect};
 use std::path::Path;
 use std::time::Duration;
 
-const QUICK: Duration = Duration::from_secs(60);
 /// How long `scripts::GONE` may wait: longer than TIME_WAIT, which is 2 × MSL
 /// (`net.inet.tcp.msl`, 30 s by default).
 const DYING: Duration = Duration::from_secs(90);

@@ -3,15 +3,12 @@
 //! hashed from that snapshot's name and the step, so a built step never runs
 //! again.
 
-use crate::agent::{Agent, Exec, Exit, Output};
+use crate::agent::{Agent, Exec, Exit, Output, QUICK};
 use crate::digest::sha256;
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
 use crate::scripts;
 use crate::zfs::Zfs;
-use std::time::Duration;
-
-const QUICK: Duration = Duration::from_secs(60);
 /// The snapshot taken of each step's dataset once the step succeeds.
 const BUILT: &str = "built";
 

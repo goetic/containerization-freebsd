@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 /// How long the agent has to open or close a channel, or to drain a full
 /// window.
 const AGENT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a quick guest command, such as one zfs(8) or ifconfig(8) call,
+/// may take.
+pub(crate) const QUICK: Duration = Duration::from_secs(60);
 
 pub struct Agent {
   shared: Arc<Shared>,

@@ -1,17 +1,21 @@
 //! Jail networking: none, the guest's stack, VNET behind pf NAT on a guest
 //! bridge, or VNET on dedicated Virtualization NAT devices.
 
-use super::{Jail, QUICK};
-use crate::agent::Agent;
+use super::Jail;
+use crate::agent::{Agent, QUICK};
 use crate::error::{Error, Result};
 use crate::scripts;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-/// The bridge NAT jails' epairs join, and its address, the jails' default
-/// gateway. `scripts/nat.sh` hard-codes both too.
+/// The bridge that NAT jails' epairs join.
 const BRIDGE: &str = "cfbsd0";
-const GATEWAY: &str = "10.66.0.1";
+/// The subnet of NAT jails, which pf translates to the guest's address. The
+/// bridge holds `GATEWAY`, the jails' default route; each jail holds an
+/// address after it.
+const SUBNET: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 0);
+const PREFIX: u32 = 16;
+const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 1);
 
 /// How a jail reaches the network.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -112,10 +116,10 @@ impl Jail<'_> {
   /// networked jail.
   pub(super) fn configure(&self, path: &str, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
-      let (inside, address) = (format!("{}b", epair.name), format!("{}/16", epair.address));
+      let (inside, address) = (format!("{}b", epair.name), format!("{}/{PREFIX}", epair.address));
       self.rescue(&["ifconfig", "lo0", "inet", "127.0.0.1/8", "up"])?;
       self.rescue(&["ifconfig", &inside, "inet", &address, "up"])?;
-      self.rescue(&["route", "-q", "add", "default", GATEWAY])?;
+      self.rescue(&["route", "-q", "add", "default", &GATEWAY.to_string()])?;
     }
     if let Network::Interfaces(interfaces) = network {
       self.rescue(&["ifconfig", "lo0", "inet", "127.0.0.1/8", "up"])?;
@@ -144,7 +148,7 @@ impl Jail<'_> {
 pub(super) struct Epair {
   /// The name without the end's letter, such as `epair3`.
   name: String,
-  address: String,
+  address: Ipv4Addr,
 }
 
 impl Epair {
@@ -157,7 +161,10 @@ impl Epair {
 }
 
 fn epair(agent: &Agent) -> Result<Epair> {
-  agent.check(&scripts::NAT.argv(&[]), QUICK)?;
+  agent.check(
+    &scripts::NAT.argv(&[BRIDGE, &format!("{GATEWAY}/{PREFIX}"), &format!("{SUBNET}/{PREFIX}")]),
+    QUICK,
+  )?;
   let created = agent.check(&["ifconfig", "epair", "create"], QUICK)?;
   let outside = created.stdout.trim().to_string();
   let name = outside
@@ -171,13 +178,18 @@ fn epair(agent: &Agent) -> Result<Epair> {
   Ok(Epair { name, address })
 }
 
-/// The address for the jail on `epair<unit>`: 10.66.0.0/16 at offset unit + 2,
-/// so addresses start after `GATEWAY`. FreeBSD never gives two live epairs
-/// the same unit, so no two NAT jails share an address.
-fn address(epair: &str) -> Option<String> {
-  let index = epair.strip_prefix("epair")?.parse::<u32>().ok()? + 2;
+/// The address for the jail on `epair<unit>`: `SUBNET` at offset unit + 2, so
+/// addresses start after `GATEWAY`, and end before the broadcast address.
+/// FreeBSD never gives two live epairs the same unit, so no two NAT jails
+/// share an address.
+fn address(epair: &str) -> Option<Ipv4Addr> {
+  let index = epair
+    .strip_prefix("epair")?
+    .parse::<u32>()
+    .ok()?
+    .checked_add(2)?;
 
-  (index < 0xffff).then(|| format!("10.66.{}.{}", index >> 8, index & 0xff))
+  (index < (1 << (32 - PREFIX)) - 1).then(|| Ipv4Addr::from(u32::from(SUBNET) + index))
 }
 
 #[cfg(test)]
@@ -211,11 +223,13 @@ mod tests {
 
   #[test]
   fn gives_each_epair_unit_its_own_address_after_the_gateway() {
-    assert_eq!(address("epair0").as_deref(), Some("10.66.0.2"));
-    assert_eq!(address("epair253").as_deref(), Some("10.66.0.255"));
-    assert_eq!(address("epair254").as_deref(), Some("10.66.1.0"));
-    assert_ne!(address("epair0").as_deref(), Some(GATEWAY));
+    assert_eq!(address("epair0"), Some(Ipv4Addr::new(10, 66, 0, 2)));
+    assert_eq!(address("epair253"), Some(Ipv4Addr::new(10, 66, 0, 255)));
+    assert_eq!(address("epair254"), Some(Ipv4Addr::new(10, 66, 1, 0)));
+    assert_ne!(address("epair0"), Some(GATEWAY));
+    assert_eq!(address("epair65532"), Some(Ipv4Addr::new(10, 66, 255, 254)));
     assert_eq!(address("epair65533"), None);
+    assert_eq!(address("epair4294967295"), None);
     assert_eq!(address("bridge0"), None);
   }
 }

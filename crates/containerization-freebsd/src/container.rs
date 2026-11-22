@@ -4,7 +4,7 @@
 //! container, these share one machine; for a VM each, create a machine per
 //! container.
 
-use crate::agent::{Agent, Exec, Process, Ran, Relay};
+use crate::agent::{Agent, Exec, Process, QUICK, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
 use crate::scripts;
@@ -15,8 +15,6 @@ use std::mem;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
-
-const QUICK: Duration = Duration::from_secs(60);
 
 /// The settings a container is created with.
 #[derive(Clone, Debug, Default)]

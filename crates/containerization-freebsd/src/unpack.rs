@@ -3,7 +3,7 @@
 //! so a layer stack shared by several images is unpacked once. The top
 //! layer's snapshot is what a container's root is cloned from.
 
-use crate::agent::{Agent, Exec};
+use crate::agent::{Agent, Exec, QUICK};
 use crate::error::{Error, Result};
 use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type, sha256_hex};
@@ -12,7 +12,6 @@ use crate::zfs::Zfs;
 use std::io::Read;
 use std::time::Duration;
 
-const QUICK: Duration = Duration::from_secs(60);
 /// Extracting a userland-sized layer takes about a minute.
 const UNPACKING: Duration = Duration::from_secs(600);
 /// The snapshot taken of each layer's dataset once the layer is applied.

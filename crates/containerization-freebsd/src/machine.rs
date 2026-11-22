@@ -1,7 +1,7 @@
 //! A guest's Virtualization.framework configuration and VM lifecycle: start,
 //! pause, save, restore and shutdown.
 
-use crate::agent::Agent;
+use crate::agent::{Agent, QUICK};
 use crate::clock::ClockSync;
 use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]
@@ -424,7 +424,7 @@ impl Machine {
 
     self
       .agent
-      .check(&["umount", "-A", "-t", "virtiofs"], Duration::from_secs(60))?;
+      .check(&["umount", "-A", "-t", "virtiofs"], QUICK)?;
     self.pause()?;
     self.completed("save the machine's state", |machine, done| {
       machine.save_machine_state_to(&url, done)
@@ -438,7 +438,7 @@ impl Machine {
   pub fn disk_device(&self, identifier: &str) -> Result<String> {
     let ran = self
       .agent
-      .check(&scripts::DISK_DEVICE.argv(&[identifier]), Duration::from_secs(60))?;
+      .check(&scripts::DISK_DEVICE.argv(&[identifier]), QUICK)?;
 
     match ran.lines().as_slice() {
       [device] => Ok(device.to_string()),
@@ -453,7 +453,7 @@ impl Machine {
   pub fn mount_share(&self, tag: &str, path: &str) -> Result<()> {
     self
       .agent
-      .check(&scripts::MOUNT_SHARE.argv(&[tag, path]), Duration::from_secs(60))
+      .check(&scripts::MOUNT_SHARE.argv(&[tag, path]), QUICK)
       .map(|_| ())
   }
 

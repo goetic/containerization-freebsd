@@ -1,11 +1,10 @@
 //! ZFS pools, datasets, snapshots and clones in the guest, via the agent.
 //! Names are passed as argv, never through a shell.
 
-use crate::agent::Agent;
+use crate::agent::{Agent, QUICK};
 use crate::error::{Error, Result};
 use std::time::Duration;
 
-const QUICK: Duration = Duration::from_secs(60);
 /// Extracting a base system from a share takes about a minute.
 const EXTRACTING: Duration = Duration::from_secs(600);
 
