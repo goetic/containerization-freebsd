@@ -2,7 +2,7 @@
 //! Names are passed as argv, never through a shell.
 
 use crate::agent::Agent;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
@@ -64,7 +64,7 @@ impl<'a> Zfs<'a> {
     if !self.exists(dataset)? {
       self.create(dataset)?;
     }
-    if unmounted(&self.mountpoint(dataset)?) {
+    if unmounted(&self.mountpoint_property(dataset)?) {
       self.check(&["zfs", "set", &format!("mountpoint=/{dataset}"), dataset], QUICK)?;
     }
     Ok(())
@@ -115,8 +115,14 @@ impl<'a> Zfs<'a> {
     )
   }
 
-  /// `dataset`'s `mountpoint` property, which may be `none` or `legacy`.
+  /// The directory that `dataset`'s `mountpoint` property names. Fails if
+  /// the property is `none` or `legacy`, since ZFS then doesn't mount the
+  /// dataset.
   pub fn mountpoint(&self, dataset: &str) -> Result<String> {
+    mounted_at(dataset, &self.mountpoint_property(dataset)?)
+  }
+
+  fn mountpoint_property(&self, dataset: &str) -> Result<String> {
     let ran = self
       .agent
       .check(&["zfs", "get", "-H", "-o", "value", "mountpoint", dataset], QUICK)?;
@@ -141,7 +147,36 @@ impl<'a> Zfs<'a> {
   }
 }
 
+/// The directory `dataset` is mounted at, given its `mountpoint` property
+/// `value`.
+fn mounted_at(dataset: &str, value: &str) -> Result<String> {
+  if unmounted(value) {
+    return Err(Error::Invalid(format!(
+      "{dataset} has mountpoint={value}, so ZFS doesn't mount it: give it, or a dataset it is under, a mountpoint"
+    )));
+  }
+  Ok(value.to_string())
+}
+
 /// Whether a `mountpoint` value means ZFS doesn't mount the dataset.
-pub(crate) fn unmounted(mountpoint: &str) -> bool {
-  matches!(mountpoint, "none" | "legacy")
+fn unmounted(value: &str) -> bool {
+  matches!(value, "none" | "legacy")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn refuses_a_mountpoint_zfs_does_not_mount() {
+    for value in ["none", "legacy"] {
+      let result = mounted_at("zroot/cfbsd", value);
+
+      assert!(
+        matches!(&result, Err(Error::Invalid(message)) if message.starts_with(&format!("zroot/cfbsd has mountpoint={value},"))),
+        "{result:?}"
+      );
+    }
+    assert_eq!(mounted_at("images/jails", "/images/jails").unwrap(), "/images/jails");
+  }
 }

@@ -10,7 +10,7 @@ use crate::jail::{self, Jail, Mount, Network};
 use crate::quota::{self, Statistics};
 use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
-use crate::zfs::{Zfs, unmounted};
+use crate::zfs::Zfs;
 use std::mem;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
@@ -307,11 +307,6 @@ fn check_id(id: &str) -> Result<()> {
 /// mounts, and writes its files.
 fn set_up<'a>(agent: &'a Agent, id: &str, dataset: &str, configuration: &Configuration) -> Result<Jail<'a>> {
   let root = Zfs::new(agent).mountpoint(dataset)?;
-  if unmounted(&root) {
-    return Err(Error::Invalid(format!(
-      "{dataset} isn't mounted: give it, or a dataset it is under, a mountpoint"
-    )));
-  }
   let hostname = format!("host.hostname={}", configuration.hostname.as_deref().unwrap_or(id));
   let mut parameters = vec!["mount.devfs", hostname.as_str()];
   parameters.extend(configuration.parameters.iter().map(String::as_str));
