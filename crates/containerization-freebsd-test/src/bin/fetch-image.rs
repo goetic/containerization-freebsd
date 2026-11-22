@@ -2,7 +2,7 @@
 //! bundle, and the userland for jails into the suites' cache. Run it through
 //! `bin/dev/fetch-image`.
 
-use containerization_freebsd::image;
+use containerization_freebsd::release;
 use containerization_freebsd_test::cache;
 use std::process::ExitCode;
 
@@ -11,12 +11,12 @@ fn main() -> ExitCode {
 
   eprintln!(
     "fetching {}, {} and {} into {}",
-    image::IMAGE,
-    image::BUNDLE,
-    image::USERLAND,
+    release::IMAGE,
+    release::BUNDLE,
+    release::USERLAND,
     cache.display()
   );
-  let fetched = [image::base_disk, image::bundle, image::userland]
+  let fetched = [release::base_disk, release::bundle, release::userland]
     .iter()
     .map(|fetch| fetch(&cache))
     .collect::<Result<Vec<_>, _>>();

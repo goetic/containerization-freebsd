@@ -1,6 +1,6 @@
 //! Paths shared by the integration suites.
 
-use containerization_freebsd::image;
+use containerization_freebsd::release;
 use std::path::PathBuf;
 
 /// The cache directory, kept across runs. It holds FreeBSD's VM image, the
@@ -13,7 +13,7 @@ pub fn cache() -> PathBuf {
 /// The cached base disk. The suites never download it; `bin/dev/fetch-image`
 /// does.
 pub fn base_disk() -> PathBuf {
-  cached(image::BASE_DISK)
+  cached(release::BASE_DISK)
 }
 
 /// The guest bundle built from the working tree. nextest runs
@@ -34,7 +34,7 @@ pub fn bundle() -> PathBuf {
 /// The cached userland for jails, `base.txz`, which `bin/dev/fetch-image`
 /// also downloads.
 pub fn userland() -> PathBuf {
-  cached(image::USERLAND)
+  cached(release::USERLAND)
 }
 
 fn cached(name: &str) -> PathBuf {

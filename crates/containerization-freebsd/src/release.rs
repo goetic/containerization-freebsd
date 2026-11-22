@@ -1,7 +1,9 @@
-//! Downloads of the FreeBSD VM image, userland and guest bundle, and the
-//! disks and volumes the host makes from them.
+//! The pinned FreeBSD release: downloads of its VM image, userland, and the
+//! guest bundle built for it, each verified against a published or pinned
+//! sha256.
 
 use crate::error::{Error, Result};
+use crate::host::run;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,27 +23,6 @@ const BUNDLE_SHA256: &str = "eddf74f52ad2d18dfcea136dfa98d41809f7324085682b27d15
 pub const USERLAND: &str = "FreeBSD-15.1-RELEASE-arm64-base.txz";
 const USERLAND_URL: &str = "https://download.freebsd.org/releases/arm64/aarch64/15.1-RELEASE/base.txz";
 const USERLAND_SHA256: &str = "5b7a46a0abfbe23a1d4454b5600e2efcfce16b705bc7e9c851c37470c035ef98";
-
-fn run(command: &mut Command) -> Result<String> {
-  let description = format!("{command:?}");
-  let failed = |failure: String| Error::Command {
-    command: description.clone(),
-    failure,
-  };
-  let output = command
-    .output()
-    .map_err(|error| failed(error.to_string()))?;
-
-  if !output.status.success() {
-    return Err(failed(format!(
-      "exited {}: {}",
-      output.status,
-      String::from_utf8_lossy(&output.stderr)
-    )));
-  }
-
-  Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
 
 fn fetch(url: &str, destination: &Path) -> Result<()> {
   if destination.exists() {
@@ -144,19 +125,6 @@ fn pinned(cache: &Path, name: &str, url: &str, sha256: &str) -> Result<PathBuf> 
   Ok(path)
 }
 
-/// Creates a sparse raw disk of `size` bytes at `path`, failing if `path`
-/// exists.
-pub fn create_disk(path: &Path, size: u64) -> Result<()> {
-  let creating = || format!("creating {}", path.display());
-
-  File::options()
-    .write(true)
-    .create_new(true)
-    .open(path)
-    .and_then(|file| file.set_len(size))
-    .map_err(Error::io(creating()))
-}
-
 /// The sha256 that `CHECKSUM.SHA256`'s `sums` lists for `name`, on a line
 /// `SHA256 (name) = …`.
 fn published_sha256<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
@@ -203,100 +171,6 @@ fn decompress_sparse(source: &Path, destination: &Path) -> Result<()> {
   }
 
   output.set_len(length).map_err(Error::io(decompressing()))
-}
-
-/// Makes `destination` an APFS clone of `base` (`clonefile(2)` via `cp -c`),
-/// grown to at least `size` bytes for the guest to expand into.
-pub fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
-  let _ = std::fs::remove_file(destination);
-  run(Command::new("cp").arg("-c").arg(base).arg(destination))?;
-
-  let growing = || format!("growing {}", destination.display());
-  let file = File::options()
-    .write(true)
-    .open(destination)
-    .map_err(Error::io(growing()))?;
-  if file.metadata().map_err(Error::io(growing()))?.len() < size {
-    file.set_len(size).map_err(Error::io(growing()))?;
-  }
-
-  Ok(())
-}
-
-/// Writes `/efi/freebsd/loader.env` on the disk's ESP. loader.efi(8) sets
-/// these variables before reading `loader.conf` and passes them to the
-/// kernel as tunables. The ESP is FAT, so macOS can mount it without root.
-pub fn write_loader_env(disk: &Path, mount_point: &Path, contents: &str) -> Result<()> {
-  let attached = run(
-    Command::new("hdiutil")
-      .args(["attach", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage"])
-      .arg(disk),
-  )?;
-  let whole = attached
-    .split_whitespace()
-    .next()
-    .ok_or_else(|| Error::Guest(format!("hdiutil attached nothing of {}", disk.display())))?
-    .to_string();
-
-  let written = (|| {
-    let partition = attached
-      .lines()
-      .find(|line| line.split_whitespace().nth(1) == Some("EFI"))
-      .and_then(|line| line.split_whitespace().next())
-      .ok_or_else(|| Error::Guest(format!("no EFI partition among:\n{attached}")))?;
-
-    std::fs::create_dir_all(mount_point).map_err(Error::io(format!("making {}", mount_point.display())))?;
-    run(
-      Command::new("diskutil")
-        .args(["mount", "-mountPoint"])
-        .arg(mount_point)
-        .arg(partition),
-    )?;
-
-    let directory = mount_point.join("efi/freebsd");
-    let result = std::fs::create_dir_all(&directory)
-      .and_then(|()| std::fs::write(directory.join("loader.env"), contents))
-      .map_err(Error::io("writing loader.env"));
-
-    run(Command::new("diskutil").arg("unmount").arg(mount_point))?;
-    result
-  })();
-
-  run(Command::new("hdiutil").arg("detach").arg(&whole))?;
-  written
-}
-
-/// Builds the cloud-init NoCloud seed volume `iso`, labelled `cidata`, via
-/// the staging `directory`. `files` maps names on the volume to host files.
-pub fn seed(directory: &Path, iso: &Path, files: &[(&str, &Path)]) -> Result<()> {
-  let _ = std::fs::remove_dir_all(directory);
-  let _ = std::fs::remove_file(iso);
-  std::fs::create_dir_all(directory).map_err(Error::io(format!("making {}", directory.display())))?;
-
-  for (name, source) in files {
-    let target = directory.join(name);
-
-    std::fs::hard_link(source, &target)
-      .or_else(|_| std::fs::copy(source, &target).map(|_| ()))
-      .map_err(Error::io(format!("putting {} on the seed volume", source.display())))?;
-  }
-
-  run(
-    Command::new("hdiutil")
-      .args([
-        "makehybrid",
-        "-quiet",
-        "-iso",
-        "-joliet",
-        "-default-volume-name",
-        "cidata",
-        "-o",
-      ])
-      .arg(iso)
-      .arg(directory),
-  )?;
-
-  Ok(())
 }
 
 #[cfg(test)]

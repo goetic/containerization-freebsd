@@ -1,8 +1,8 @@
 //! Per-jail resource limits and usage through rctl(8), standing in for
 //! Containerization's per-container `cpus` and memory, which size its VMs,
 //! and its statistics. rctl needs the `kern.racct.enable` tunable, which
-//! `machine::LOADER_ENV` sets. Network counters come from netstat(1), and a
-//! container's block IO from ZFS kstats.
+//! `prepare` writes to the disk's `loader.env`. Network counters come from
+//! netstat(1), and a container's block IO from ZFS kstats.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;

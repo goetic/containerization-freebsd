@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::memory::Memory;
 use crate::scripts;
 use dispatch2::{DispatchQueue, DispatchRetained};
+use std::fs::File;
 use std::io::{PipeReader, PipeWriter};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -22,13 +23,6 @@ use virtualization::{
   VirtioBlockDeviceConfiguration, VirtioConsoleDeviceSerialPortConfiguration, VirtioFileSystemDeviceConfiguration,
   VirtioNetworkDeviceConfiguration, VirtualMachine, VirtualMachineConfiguration, VirtualMachineState,
 };
-
-/// Tunables for `/efi/freebsd/loader.env`. Apple's virtio-net rejects the
-/// checksum offload and multiqueue features vtnet(4) negotiates, and vtnet then
-/// fails to attach ("desired features were not accepted"); the first two
-/// tunables stop it requesting them. `kern.racct.enable` turns on the resource
-/// accounting that rctl limits and jail statistics need.
-pub const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\nkern.racct.enable=1\n";
 
 /// A host directory exported over virtio-fs and mounted in the guest with
 /// `Machine::mount_share`.
@@ -52,6 +46,26 @@ pub struct Disk {
   /// most 20 ASCII bytes.
   pub identifier: String,
   pub read_only: bool,
+}
+
+impl Disk {
+  /// Creates a sparse raw disk of `size` bytes at `path`, failing if `path`
+  /// exists, and returns it to attach read-write as `identifier`.
+  pub fn create(path: impl Into<PathBuf>, identifier: impl Into<String>, size: u64) -> Result<Self> {
+    let path = path.into();
+    File::options()
+      .write(true)
+      .create_new(true)
+      .open(&path)
+      .and_then(|file| file.set_len(size))
+      .map_err(Error::io(format!("creating {}", path.display())))?;
+
+    Ok(Self {
+      path,
+      identifier: identifier.into(),
+      read_only: false,
+    })
+  }
 }
 
 /// The configuration that every boot of one guest must reuse.

@@ -8,7 +8,7 @@ use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_ty
 use containerization_freebsd::{
   Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
   Jail, Limit, Machine, Mount, Network, Output, Process, Resource, Share, Step, UnixSocket, Unpacker, Upgrade, User,
-  WindowSize, Zfs, image,
+  WindowSize, Zfs, release,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -381,12 +381,7 @@ fn boot_for_jails(work: &Path) -> Machine {
   let mut layout = containerization_freebsd::prepare(&base_disk(), work, DISK_SIZE, Upgrade::None, &bundle())
     .expect("prepare the base");
 
-  let images = Disk {
-    path: work.join("images.raw"),
-    identifier: "images".into(),
-    read_only: false,
-  };
-  image::create_disk(&images.path, 8 << 30).expect("make the images disk");
+  let images = Disk::create(work.join("images.raw"), "images", 8 << 30).expect("make the images disk");
   layout.disks.push(images);
   layout.nat = true;
   layout.interfaces.push(SPARE);
@@ -447,7 +442,7 @@ fn pool_the_userland(machine: &Machine) {
     .create("images/userland")
     .expect("make the userland's dataset");
   zfs
-    .extract(&format!("/mnt/userland/{}", image::USERLAND), "images/userland")
+    .extract(&format!("/mnt/userland/{}", release::USERLAND), "images/userland")
     .expect("extract the userland");
   zfs
     .snapshot("images/userland@base")
@@ -744,7 +739,7 @@ fn uses_its_mounts(web: &Container) {
   let script = format!(
     "set -e; test -f /mnt/userland/{}; cat /var/data/greeting; \
      touch /var/data/x 2>/dev/null || echo read-only; echo kept > /scratch/x; cat /scratch/x",
-    image::USERLAND
+    release::USERLAND
   );
   let ran = web.check(&sh(&script), TIMEOUT).expect("use its mounts");
   assert_eq!(ran.lines(), ["hello", "read-only", "kept"]);
@@ -1119,7 +1114,7 @@ fn runs_a_build_sized_workload_on_a_share() {
     "mkdir /mnt/shared/tree && tar -xf /mnt/userland/{} -C /mnt/shared/tree \
      --exclude ./usr/share/man --exclude ./usr/share/openssl/man --exclude ./usr/bin/CC --exclude ./usr/bin/mail \
      && find /mnt/shared/tree | wc -l",
-    image::USERLAND
+    release::USERLAND
   );
   let ran = machine
     .agent
