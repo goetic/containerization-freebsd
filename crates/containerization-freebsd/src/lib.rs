@@ -31,7 +31,7 @@ pub use container::{Configuration, Container, Containers, Dns, Host};
 pub use error::{Error, Result};
 pub use images::{Image, ImageStore};
 pub use jail::{Interface, Jail, Mount, Network};
-pub use machine::{Disk, Layout, Machine, Share};
+pub use machine::{Disk, Layout, Mac, Machine, Share};
 pub use prepare::{Upgrade, prepare};
 pub use socket::{Direction, SocketRelay, UnixSocket};
 pub use statistics::{DatasetIo, NetworkStatistics, Statistics};

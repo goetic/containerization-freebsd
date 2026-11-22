@@ -8,10 +8,12 @@ use crate::error::{Error, Result};
 use crate::kernel_messages::Memory;
 use crate::scripts;
 use dispatch2::{DispatchQueue, DispatchRetained};
+use std::fmt;
 use std::fs::File;
 use std::io::{PipeReader, PipeWriter};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -35,6 +37,47 @@ pub struct Share {
   pub tag: String,
   pub path: PathBuf,
   pub read_only: bool,
+}
+
+/// A network device's MAC address. It displays and parses as ifconfig(8)
+/// prints it, such as `02:00:5e:10:00:01`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Mac(pub [u8; 6]);
+
+impl From<[u8; 6]> for Mac {
+  fn from(octets: [u8; 6]) -> Self {
+    Self(octets)
+  }
+}
+
+impl fmt::Display for Mac {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let [a, b, c, d, e, f] = self.0;
+    write!(formatter, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+  }
+}
+
+impl FromStr for Mac {
+  type Err = Error;
+
+  /// Parses six pairs of hex digits separated by colons.
+  fn from_str(text: &str) -> Result<Self> {
+    let invalid = || Error::Invalid(format!("{text:?} is not a MAC address"));
+    let mut octets = [0; 6];
+    let mut parts = text.split(':');
+
+    for octet in &mut octets {
+      *octet = parts
+        .next()
+        .filter(|part| part.len() == 2)
+        .and_then(|part| u8::from_str_radix(part, 16).ok())
+        .ok_or_else(invalid)?;
+    }
+    if parts.next().is_some() {
+      return Err(invalid());
+    }
+    Ok(Self(octets))
+  }
 }
 
 /// A raw disk image attached after the root disk, such as one holding a ZFS
@@ -83,13 +126,13 @@ pub struct Layout {
   pub shares: Vec<Share>,
   pub variables: PathBuf,
   pub identifier: Vec<u8>,
-  pub mac: [u8; 6],
+  pub mac: Mac,
   /// MACs of extra NAT network devices for jails' interfaces
   /// (`Network::Interfaces`); each moves into the VNET jail that names it.
   /// They're declared up front because Virtualization can't hot-add devices.
   /// The guest runs DHCP only on `vtnet0`: the `nat` device, or the first of
   /// these when `nat` is off.
-  pub interfaces: Vec<[u8; 6]>,
+  pub interfaces: Vec<Mac>,
 }
 
 pub struct Machine {
@@ -139,9 +182,11 @@ impl Layout {
       identifier: GenericMachineIdentifier::new()
         .map_err(Error::virtualization("make a machine identifier"))?
         .data_representation(),
-      mac: MACAddress::random_locally_administered()
-        .map_err(Error::virtualization("make a MAC address"))?
-        .ethernet_address(),
+      mac: Mac(
+        MACAddress::random_locally_administered()
+          .map_err(Error::virtualization("make a MAC address"))?
+          .ethernet_address(),
+      ),
       interfaces: Vec::new(),
     })
   }
@@ -247,7 +292,7 @@ impl Layout {
       .map(|mac| {
         let network = VirtioNetworkDeviceConfiguration::new().map_err(failed("make a network device"))?;
         network.set_attachment(Some(&NATNetworkDeviceAttachment::new().map_err(failed("make NAT"))?));
-        network.set_mac_address(&MACAddress::new(mac).map_err(failed("set a MAC address"))?);
+        network.set_mac_address(&MACAddress::new(mac.0).map_err(failed("set a MAC address"))?);
         Ok(network)
       })
       .collect()
@@ -537,6 +582,25 @@ impl Machine {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn writes_and_reads_a_mac_as_ifconfig_does() {
+    let mac = Mac([0x02, 0x00, 0x5e, 0x10, 0x0a, 0xff]);
+
+    assert_eq!(mac.to_string(), "02:00:5e:10:0a:ff");
+    assert_eq!("02:00:5e:10:0a:ff".parse::<Mac>().unwrap(), mac);
+    assert_eq!("02:00:5E:10:0A:FF".parse::<Mac>().unwrap(), mac);
+    for text in [
+      "",
+      "02:00:5e:10:0a",
+      "02:00:5e:10:0a:ff:00",
+      "2:0:5e:10:a:ff",
+      "02-00-5e-10-0a-ff",
+      "zz:00:5e:10:0a:ff",
+    ] {
+      assert!(matches!(text.parse::<Mac>(), Err(Error::Invalid(_))), "{text:?}");
+    }
+  }
 
   #[test]
   fn refuses_a_relative_path() {

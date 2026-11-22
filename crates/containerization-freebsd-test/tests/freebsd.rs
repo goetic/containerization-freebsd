@@ -7,8 +7,8 @@
 use containerization_freebsd::oci::{ContentStore, Descriptor, Digest, Platform, media_type};
 use containerization_freebsd::{
   Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
-  Jail, Limit, Machine, Mount, Network, Output, Process, Resource, Share, Spawn, Step, UnixSocket, Unpacker, Upgrade,
-  User, WindowSize, Zfs, release,
+  Jail, Limit, Mac, Machine, Mount, Network, Output, Process, Resource, Share, Spawn, Step, UnixSocket, Unpacker,
+  Upgrade, User, WindowSize, Zfs, release,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -319,7 +319,7 @@ fn runs_a_command_in_a_terminal(restored: &Machine) {
 
 /// The MAC address of the guest's spare NAT device, which a container claims
 /// as its own interface.
-const SPARE: [u8; 6] = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01];
+const SPARE: Mac = Mac([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]);
 
 /// A script that succeeds if the spare device has no IPv4 address.
 const UNCONFIGURED: &str = "for device in $(ifconfig -l ether); do \
@@ -409,7 +409,7 @@ fn boot_for_jails(work: &Path) -> Machine {
     .agent
     .check(&sh("until pgrep -qx devd; do sleep 0.5; done"), TIMEOUT)
     .expect("rc configures the network");
-  let mac = layout.mac.map(|byte| format!("{byte:02x}")).join(":");
+  let mac = layout.mac;
   machine
     .agent
     .check(

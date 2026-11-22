@@ -156,6 +156,7 @@ fn run_script(jail: &Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> Resul
 mod tests {
   use super::*;
   use crate::jail::Interface;
+  use crate::machine::Mac;
 
   const FROM: &str = "images/userland@base";
 
@@ -168,7 +169,7 @@ mod tests {
 
   fn leased(address: &str) -> Network {
     Network::Interfaces(vec![Interface {
-      mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+      mac: Mac([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]),
       address: address.into(),
       gateway: Some("192.168.64.1".into()),
     }])

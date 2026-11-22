@@ -4,6 +4,7 @@
 use super::Jail;
 use crate::agent::{Agent, QUICK, Spawn};
 use crate::error::{Error, Result};
+use crate::machine::Mac;
 use crate::scripts;
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -38,7 +39,7 @@ pub enum Network {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Interface {
   /// The device's MAC address.
-  pub mac: [u8; 6],
+  pub mac: Mac,
   /// IPv4 address and prefix length, such as `192.168.64.3/24`. The NAT's
   /// DHCP server leases from the same subnet, so pick an address it hasn't
   /// leased, or get a leased one from `Interface::leased`.
@@ -70,11 +71,10 @@ impl Interface {
   /// The server gives that address to no other machine while the lease lasts.
   /// Nothing renews the lease, but the server leases the same address to the
   /// same MAC again. Call this before a jail claims the device.
-  pub fn leased(agent: &Agent, mac: [u8; 6]) -> Result<Self> {
-    let colons = colons(mac);
-    let ran = agent.check(&scripts::LEASE.argv(&[&colons]), LEASING)?;
+  pub fn leased(agent: &Agent, mac: Mac) -> Result<Self> {
+    let ran = agent.check(&scripts::LEASE.argv(&[&mac.to_string()]), LEASING)?;
     let (address, gateway) =
-      lease(&ran.stdout).ok_or_else(|| Error::Guest(format!("the NAT's DHCP server leased {colons} no address")))?;
+      lease(&ran.stdout).ok_or_else(|| Error::Guest(format!("the NAT's DHCP server leased {mac} no address")))?;
 
     Ok(Self { mac, address, gateway })
   }
@@ -82,11 +82,6 @@ impl Interface {
 
 /// dhclient's 30-second timeout in `scripts::LEASE`, plus a margin.
 const LEASING: Duration = Duration::from_secs(45);
-
-/// `mac` as ifconfig prints it.
-fn colons(mac: [u8; 6]) -> String {
-  mac.map(|byte| format!("{byte:02x}")).join(":")
-}
 
 /// Returns the address, with its prefix length, and the first router of the
 /// last lease in `leases`, a dhclient.leases(5) file.
@@ -126,7 +121,7 @@ impl Jail<'_> {
       for interface in interfaces {
         let claimed = self
           .agent
-          .check(&scripts::CLAIM.argv(&[&self.name, &colons(interface.mac)]), QUICK)?;
+          .check(&scripts::CLAIM.argv(&[&self.name, &interface.mac.to_string()]), QUICK)?;
         let device = claimed.stdout.trim();
         self.rescue(&["ifconfig", device, "inet", &interface.address, "up"])?;
         if let Some(gateway) = &interface.gateway {
