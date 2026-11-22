@@ -376,12 +376,11 @@ mod tests {
     let agent = started();
     // Writes to stderr every 100ms for 5s, then exits 0.
     let process = agent
-      .spawn(Exec {
-        argv: ["sh", "-c", "for i in $(seq 50); do echo $i >&2; sleep 0.1; done"]
-          .map(String::from)
-          .to_vec(),
-        ..Exec::default()
-      })
+      .spawn(Exec::new([
+        "sh",
+        "-c",
+        "for i in $(seq 50); do echo $i >&2; sleep 0.1; done",
+      ]))
       .unwrap();
     let started = Instant::now();
 
@@ -395,12 +394,7 @@ mod tests {
   fn finish_reports_a_failure_with_its_stderr() {
     let agent = started();
     let process = agent
-      .spawn(Exec {
-        argv: ["sh", "-c", "echo out; echo broken >&2; exit 3"]
-          .map(String::from)
-          .to_vec(),
-        ..Exec::default()
-      })
+      .spawn(Exec::new(["sh", "-c", "echo out; echo broken >&2; exit 3"]))
       .unwrap();
 
     let result = process.finish("writing", Duration::from_secs(10));

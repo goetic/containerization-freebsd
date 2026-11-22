@@ -49,7 +49,8 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
     // The umask keeps the file private to its owner until chmod sets `mode`.
     let dd = jail.spawn(Exec {
       umask: Some(0o077),
-      ..rescue_exec(&argv)
+      rescue: true,
+      ..Exec::new(argv)
     })?;
     feed(dd, &argv, &mut file, &source.display().to_string())?;
     // No `--`: chmod(1) parses no options after the mode, so it would be
@@ -193,15 +194,10 @@ fn kind(jail: &Jail, path: &str) -> Result<Kind> {
 
 /// Starts the `/rescue` tool that `argv` names, in the jail.
 fn rescue(jail: &Jail, argv: &[&str]) -> Result<Process> {
-  jail.spawn(rescue_exec(argv))
-}
-
-fn rescue_exec(argv: &[&str]) -> Exec {
-  Exec {
-    argv: argv.iter().map(|arg| arg.to_string()).collect(),
+  jail.spawn(Exec {
     rescue: true,
-    ..Exec::default()
-  }
+    ..Exec::new(argv)
+  })
 }
 
 fn check(jail: &Jail, argv: &[&str]) -> Result<()> {

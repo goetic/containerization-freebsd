@@ -139,9 +139,8 @@ fn key(from: &str, step: &Step) -> String {
 
 fn run_script(jail: &Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> Result<Exit> {
   let process = jail.spawn(Exec {
-    argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
     cwd: Some("/".into()),
-    ..Exec::default()
+    ..Exec::new(["/bin/sh", "-c", script])
   })?;
   process.close_input()?;
 

@@ -168,10 +168,7 @@ fn streams_input_across_windows(cold: &Machine, work: &Path) {
   std::fs::write(work.join("input"), &input).expect("write the input");
   let checksum = cold
     .agent
-    .spawn(Exec {
-      argv: vec!["sha256".into(), "-q".into()],
-      ..Exec::default()
-    })
+    .spawn(Exec::new(["sha256", "-q"]))
     .expect("start a checksum");
   checksum.write(&input).expect("stream the input");
   checksum.close_input().expect("end the input");
@@ -293,9 +290,8 @@ fn runs_a_command_in_a_terminal(restored: &Machine) {
   let terminal = restored
     .agent
     .spawn(Exec {
-      argv: sh("tty; read line").map(String::from).to_vec(),
       pty: Some(WindowSize { rows: 24, columns: 80 }),
-      ..Exec::default()
+      ..Exec::new(sh("tty; read line"))
     })
     .expect("run a command in a terminal");
   let mut output = Vec::new();
@@ -466,9 +462,8 @@ fn runs_commands_in_a_jail(machine: &Machine, root: &str) {
   // Files the jail writes stay in its clone.
   let process = jail
     .spawn(Exec {
-      argv: vec!["sh".into(), "-c".into(), "pwd; echo jailed > mark".into()],
       cwd: Some("/root".into()),
-      ..Exec::default()
+      ..Exec::new(sh("pwd; echo jailed > mark"))
     })
     .expect("spawn in the jail");
   process.close_input().expect("close its input");
@@ -671,14 +666,9 @@ fn runs_a_container(machine: &Machine, containers: &Containers) {
 /// `host_socket` inside it and its own socket at `web_socket` on the host.
 fn web_configuration(host_socket: &Path, web_socket: &Path) -> Configuration {
   Configuration {
-    process: Exec {
-      argv: vec![
-        "sh".into(),
-        "-c".into(),
-        "trap 'echo stopping; exit 3' TERM; echo started; while :; do sleep 0.1; done".into(),
-      ],
-      ..Exec::default()
-    },
+    process: Exec::new(sh(
+      "trap 'echo stopping; exit 3' TERM; echo started; while :; do sleep 0.1; done",
+    )),
     hostname: Some("web.test".into()),
     network: Network::Nat,
     // The container's own loopback, where nothing answers. getent looks up
@@ -753,7 +743,6 @@ fn runs_processes_as_its_users(web: &Container) {
   let (stdout, exit) = finish(
     &web
       .exec(Exec {
-        argv: sh(script).map(String::from).to_vec(),
         cwd: Some("/var/empty".into()),
         user: Some(User {
           name: "nobody".into(),
@@ -766,7 +755,7 @@ fn runs_processes_as_its_users(web: &Container) {
           soft: 100,
           hard: 100,
         }],
-        ..Exec::default()
+        ..Exec::new(sh(script))
       })
       .expect("run a process as nobody"),
   );
@@ -781,14 +770,11 @@ fn runs_processes_as_its_users(web: &Container) {
   let (stdout, exit) = finish(
     &web
       .exec(Exec {
-        argv: sh("id -u; id -g; echo \"$HOME\"")
-          .map(String::from)
-          .to_vec(),
         user: Some(User {
           name: "4242".into(),
           ..User::default()
         }),
-        ..Exec::default()
+        ..Exec::new(sh("id -u; id -g; echo \"$HOME\""))
       })
       .expect("run a process as an unlisted uid"),
   );
@@ -802,14 +788,13 @@ fn relays_its_sockets(web: &Container, web_socket: &Path) {
   let (stdout, exit) = finish(
     &web
       .exec(Exec {
-        argv: sh("stat -f %Lp /var/run/host.sock; echo hello | nc -N -U /var/run/host.sock")
-          .map(String::from)
-          .to_vec(),
         user: Some(User {
           name: "nobody".into(),
           ..User::default()
         }),
-        ..Exec::default()
+        ..Exec::new(sh(
+          "stat -f %Lp /var/run/host.sock; echo hello | nc -N -U /var/run/host.sock",
+        ))
       })
       .expect("use the host's socket"),
   );
@@ -821,10 +806,7 @@ fn relays_its_sockets(web: &Container, web_socket: &Path) {
   assert_eq!(mode & 0o777, 0o600);
   let serve = |script: &str| {
     web
-      .exec(Exec {
-        argv: sh(script).map(String::from).to_vec(),
-        ..Exec::default()
-      })
+      .exec(Exec::new(sh(script)))
       .expect("serve in the container")
   };
   let server = serve("echo pong | nc -N -lU /var/run/web.sock");
@@ -896,10 +878,7 @@ fn limits_a_container(machine: &Machine, containers: &Containers) {
     ["jail:limited:memoryuse:deny=67108864", "jail:limited:pcpu:deny=100"]
   );
   let sleeper = limited
-    .exec(Exec {
-      argv: vec!["sleep".into(), "30".into()],
-      ..Exec::default()
-    })
+    .exec(Exec::new(["sleep", "30"]))
     .expect("start a process in it");
   let statistics =
     eventually(|| Some(limited.statistics().expect("its statistics")).filter(|statistics| statistics.memory > 0));
@@ -941,12 +920,7 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
     )
     .expect("create a container with an interface");
   let server = reachable
-    .exec(Exec {
-      argv: sh("echo reached | nc -N -l 8080")
-        .map(String::from)
-        .to_vec(),
-      ..Exec::default()
-    })
+    .exec(Exec::new(sh("echo reached | nc -N -l 8080")))
     .expect("serve in the container");
   let address: std::net::SocketAddr = format!("{address}:8080").parse().expect("its address");
   let mut stream = eventually(|| std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok());

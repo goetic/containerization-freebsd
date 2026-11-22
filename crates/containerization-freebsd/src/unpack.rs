@@ -144,14 +144,9 @@ impl<'a> Unpacker<'a> {
     let path = image.content().path(&layer.digest)?;
     let reading = || format!("reading {}", path.display());
     let mut blob = std::fs::File::open(&path).map_err(Error::io(reading()))?;
-    let process = self.agent.spawn(Exec {
-      argv: scripts::DECOMPRESS
-        .argv(&[compression, staging])
-        .into_iter()
-        .map(String::from)
-        .collect(),
-      ..Exec::default()
-    })?;
+    let process = self
+      .agent
+      .spawn(Exec::new(scripts::DECOMPRESS.argv(&[compression, staging])))?;
 
     let written = (|| {
       let mut buffer = vec![0; 1 << 20];

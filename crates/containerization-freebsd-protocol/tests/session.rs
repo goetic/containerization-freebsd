@@ -40,11 +40,7 @@ fn session() -> (Mux, Mux) {
 }
 
 fn exec(argv: &[&str], pty: Option<WindowSize>) -> Message {
-  Message::Exec(Exec {
-    argv: argv.iter().map(|arg| arg.to_string()).collect(),
-    pty,
-    ..Exec::default()
-  })
+  Message::Exec(Exec { pty, ..Exec::new(argv) })
 }
 
 fn connect(port: u16) -> Message {

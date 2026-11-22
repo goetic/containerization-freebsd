@@ -245,10 +245,9 @@ impl<'a> Jail<'a> {
   /// jail needn't have it.
   fn rescue(&self, argv: &[&str]) -> Result<Ran> {
     let exec = Exec {
-      argv: argv.iter().map(|arg| arg.to_string()).collect(),
       jail: Some(self.name.clone()),
       rescue: true,
-      ..Exec::default()
+      ..Exec::new(argv)
     };
 
     self.agent.check_exec(exec, QUICK)

@@ -186,17 +186,10 @@ fn announcement() -> Message {
   }
 }
 
-fn command(argv: &[&str]) -> Exec {
-  Exec {
-    argv: argv.iter().map(|arg| arg.to_string()).collect(),
-    ..Exec::default()
-  }
-}
-
 fn in_terminal(argv: &[&str]) -> Exec {
   Exec {
     pty: Some(TERMINAL),
-    ..command(argv)
+    ..Exec::new(argv)
   }
 }
 
@@ -239,7 +232,7 @@ fn announces_itself_and_answers_pings() {
 fn runs_a_process_on_pipes() {
   let mut host = Host::start();
 
-  let channel = host.exec(command(&["sh", "-c", "printf out; printf err >&2; exit 3"]));
+  let channel = host.exec(Exec::new(["sh", "-c", "printf out; printf err >&2; exit 3"]));
   let finished = host.finish(channel);
 
   assert_eq!(finished.output, "out");
@@ -255,7 +248,7 @@ fn passes_the_environment_and_working_directory() {
   let channel = host.exec(Exec {
     env: vec![("GREETING".into(), "hello".into())],
     cwd: Some("/".into()),
-    ..command(&["sh", "-c", "echo \"$GREETING\"; pwd"])
+    ..Exec::new(["sh", "-c", "echo \"$GREETING\"; pwd"])
   });
 
   assert_eq!(host.finish(channel).output, "hello\n/\n");
@@ -280,7 +273,7 @@ fn sets_the_umask_and_resource_limits() {
       },
     ],
     cwd: Some("/".into()),
-    ..command(&["sh", "-c", "umask; ulimit -Sn; ulimit -Hn; ulimit -Sc; ulimit -Hc; pwd"])
+    ..Exec::new(["sh", "-c", "umask; ulimit -Sn; ulimit -Hn; ulimit -Sc; ulimit -Hc; pwd"])
   });
   let finished = host.finish(channel);
 
@@ -297,7 +290,7 @@ fn refuses_a_user_its_root_does_not_list() {
       name: "cfbsd-nobody-at-all".into(),
       ..User::default()
     }),
-    ..command(&["true"])
+    ..Exec::new(["true"])
   }));
 
   assert!(
@@ -311,7 +304,7 @@ fn refuses_a_jail_it_cannot_find() {
 
   let channel = host.open(Message::Exec(Exec {
     jail: Some("cfbsd-no-such-jail".into()),
-    ..command(&["true"])
+    ..Exec::new(["true"])
   }));
 
   assert!(
@@ -323,7 +316,7 @@ fn refuses_a_jail_it_cannot_find() {
 fn feeds_stdin_until_eof() {
   let mut host = Host::start();
 
-  let channel = host.exec(command(&["cat"]));
+  let channel = host.exec(Exec::new(["cat"]));
   host.send(channel, Message::Data(b"one\n".to_vec()));
   host.send(channel, Message::Data(b"two\n".to_vec()));
   host.send(channel, Message::Eof);
@@ -337,7 +330,7 @@ fn feeds_stdin_until_eof() {
 fn says_it_received_every_byte_it_read() {
   let mut host = Host::start();
 
-  let channel = host.exec(command(&["cat"]));
+  let channel = host.exec(Exec::new(["cat"]));
   host.send(channel, Message::Data(vec![b'x'; 100_000]));
   host.send(channel, Message::Eof);
   host.finish(channel);
@@ -351,7 +344,7 @@ fn says_it_received_every_byte_it_read() {
 fn signals_a_process() {
   let mut host = Host::start();
 
-  let channel = host.exec(command(&["sleep", "30"]));
+  let channel = host.exec(Exec::new(["sleep", "30"]));
   host.send(channel, Message::Signal(SIGTERM));
 
   assert_eq!(host.finish(channel).exit, Some(Exit::Signal(SIGTERM)));
@@ -361,7 +354,7 @@ fn signals_a_process() {
 fn refuses_a_command_that_does_not_exist() {
   let mut host = Host::start();
 
-  let channel = host.open(Message::Exec(command(&["/nonexistent/command"])));
+  let channel = host.open(Message::Exec(Exec::new(["/nonexistent/command"])));
   let (from, message) = host.next();
 
   assert_eq!(from, channel);
@@ -378,7 +371,7 @@ fn says_a_missing_working_directory_failed_not_the_command() {
 
   let channel = host.open(Message::Exec(Exec {
     cwd: Some("/nonexistent/directory".into()),
-    ..command(&["true"])
+    ..Exec::new(["true"])
   }));
   let (from, message) = host.next();
 
@@ -402,7 +395,7 @@ fn says_a_user_it_cannot_become_failed_not_the_command() {
       name: "0".into(),
       ..User::default()
     }),
-    ..command(&["true"])
+    ..Exec::new(["true"])
   }));
   let (from, message) = host.next();
 
@@ -569,7 +562,7 @@ fn listens_on_a_unix_socket_and_relays_each_connection() {
 #[test]
 fn a_new_session_kills_the_old_ones_processes() {
   let mut host = Host::start();
-  let channel = host.exec(command(&["sh", "-c", "echo $$; exec sleep 30"]));
+  let channel = host.exec(Exec::new(["sh", "-c", "echo $$; exec sleep 30"]));
   let pid = host.read_until(channel, "\n").trim().to_string();
   assert!(running(&pid));
 

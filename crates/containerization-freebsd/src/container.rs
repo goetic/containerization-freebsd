@@ -344,10 +344,7 @@ fn write_files(jail: &Jail, configuration: &Configuration) -> Result<()> {
 /// the jail's root resolve within it.
 fn write(jail: &Jail, path: &str, text: &str, append: bool) -> Result<()> {
   let script = if append { r#"cat >> "$0""# } else { r#"cat > "$0""# };
-  let process = jail.spawn(Exec {
-    argv: vec!["/bin/sh".into(), "-c".into(), script.into(), path.into()],
-    ..Exec::default()
-  })?;
+  let process = jail.spawn(Exec::new(["/bin/sh", "-c", script, path]))?;
   process.write(text.as_bytes())?;
   process.close_input()?;
   process.finish(&format!("writing {path} in jail {}", jail.name()), QUICK)

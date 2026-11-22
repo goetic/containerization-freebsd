@@ -78,6 +78,20 @@ pub struct Exec {
   pub rescue: bool,
 }
 
+impl Exec {
+  /// Runs `argv` with every other field at its default: on pipes, in the
+  /// guest, as root.
+  pub fn new(argv: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+    Self {
+      argv: argv
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect(),
+      ..Self::default()
+    }
+  }
+}
+
 /// The user a process runs as. Names are looked up in the `/etc/passwd` and
 /// `/etc/group` of the process's root: its jail's, or the guest's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -434,6 +448,21 @@ impl Decode for Exit {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn makes_an_exec_from_borrowed_or_owned_strings() {
+    let owned = vec!["sh".to_string(), "-c".to_string()];
+    let borrowed: &[&str] = &["sh", "-c"];
+
+    assert_eq!(
+      Exec::new(["sh", "-c"]),
+      Exec {
+        argv: owned.clone(),
+        ..Exec::default()
+      }
+    );
+    assert_eq!(Exec::new(&owned), Exec::new(borrowed));
+  }
 
   #[test]
   fn decodes_every_message_it_encodes() {

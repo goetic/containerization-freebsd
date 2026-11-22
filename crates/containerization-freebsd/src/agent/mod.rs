@@ -160,7 +160,7 @@ impl Agent {
   /// Runs `argv` in the guest with no input and collects its output. If the
   /// command is still running after `timeout`, it is killed.
   pub fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.run_exec(command(argv), timeout)
+    self.run_exec(Exec::new(argv), timeout)
   }
 
   /// Like `run`, for the process `exec` describes.
@@ -198,7 +198,7 @@ impl Agent {
 
   /// Like `run`, but fails unless the command exits with status 0.
   pub fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.check_exec(command(argv), timeout)
+    self.check_exec(Exec::new(argv), timeout)
   }
 
   /// Like `check`, for the process `exec` describes.
@@ -235,7 +235,7 @@ impl Agent {
 
     let (channel, frame) = state
       .mux
-      .open(Message::Exec(command(argv)))
+      .open(Message::Exec(Exec::new(argv)))
       .map_err(protocol)?;
     state.write(&frame)?;
     let eof = state.mux.send(channel, Message::Eof).map_err(protocol)?;
@@ -261,13 +261,6 @@ impl Agent {
     };
 
     Stream::new(channel, self.shared.clone(), receiver, what).opened()
-  }
-}
-
-fn command(argv: &[&str]) -> Exec {
-  Exec {
-    argv: argv.iter().map(|arg| arg.to_string()).collect(),
-    ..Exec::default()
   }
 }
 
@@ -411,7 +404,7 @@ pub(crate) mod tests {
     let agent = started();
 
     let error = agent
-      .spawn(command(&["/nonexistent/command"]))
+      .spawn(Exec::new(["/nonexistent/command"]))
       .err()
       .unwrap();
 
@@ -422,7 +415,7 @@ pub(crate) mod tests {
   fn feeds_a_process_its_input() {
     let agent = started();
 
-    let process = agent.spawn(command(&["cat"])).unwrap();
+    let process = agent.spawn(Exec::new(["cat"])).unwrap();
     process.write(b"fed\n").unwrap();
     process.close_input().unwrap();
 
@@ -433,7 +426,7 @@ pub(crate) mod tests {
   fn closing_the_input_of_a_process_that_exited_does_nothing() {
     let agent = started();
 
-    let process = agent.spawn(command(&["true"])).unwrap();
+    let process = agent.spawn(Exec::new(["true"])).unwrap();
     assert_eq!(finish(&process), (String::new(), Exit::Code(0)));
 
     process.close_input().unwrap();
@@ -444,7 +437,7 @@ pub(crate) mod tests {
     let agent = started();
     let input = vec![b'x'; 300 * WINDOW + 1];
 
-    let process = agent.spawn(command(&["wc", "-c"])).unwrap();
+    let process = agent.spawn(Exec::new(["wc", "-c"])).unwrap();
     process.write(&input).unwrap();
     process.close_input().unwrap();
 
@@ -466,7 +459,7 @@ pub(crate) mod tests {
   fn signals_a_process() {
     let agent = started();
 
-    let process = agent.spawn(command(&["sleep", "30"])).unwrap();
+    let process = agent.spawn(Exec::new(["sleep", "30"])).unwrap();
     process.signal(SIGTERM).unwrap();
 
     assert_eq!(finish(&process).1, Exit::Signal(SIGTERM));
@@ -479,7 +472,7 @@ pub(crate) mod tests {
     let process = agent
       .spawn(Exec {
         pty: Some(TERMINAL),
-        ..command(&["sh", "-c", "stty size; read line; stty size"])
+        ..Exec::new(["sh", "-c", "stty size; read line; stty size"])
       })
       .unwrap();
     read_until(&process, "24 80");
@@ -497,7 +490,7 @@ pub(crate) mod tests {
   fn dropping_a_process_kills_it() {
     let agent = started();
     let process = agent
-      .spawn(command(&["sh", "-c", "echo $$; exec sleep 30"]))
+      .spawn(Exec::new(["sh", "-c", "echo $$; exec sleep 30"]))
       .unwrap();
     let pid = read_until(&process, "\n").trim().to_string();
 
