@@ -102,17 +102,29 @@ impl fmt::Display for Digest {
 
 /// The lowercase hex sha256 of `bytes`.
 pub(crate) fn sha256(bytes: &[u8]) -> String {
-  format!("{:x}", Sha256::digest(bytes))
+  hex(&Sha256::digest(bytes))
 }
 
 /// The lowercase hex sha256 of the file at `path`, and the file's length.
 pub(crate) fn sha256_file(path: &Path) -> Result<(String, u64)> {
   let reading = || format!("reading {}", path.display());
   let mut file = File::open(path).map_err(Error::io(reading()))?;
-  let mut hasher = Sha256::new();
-  let length = io::copy(&mut file, &mut hasher).map_err(Error::io(reading()))?;
+  let mut hashing = Hashing::new(io::sink());
+  let length = io::copy(&mut file, &mut hashing).map_err(Error::io(reading()))?;
 
-  Ok((format!("{:x}", hasher.finalize()), length))
+  Ok((hashing.finish(), length))
+}
+
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+  use std::fmt::Write as _;
+
+  bytes
+    .iter()
+    .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
+      let _ = write!(hex, "{byte:02x}");
+      hex
+    })
 }
 
 /// Writes through to `inner`, hashing what it writes, so that a copy is
@@ -132,7 +144,7 @@ impl<W: Write> Hashing<W> {
 
   /// The lowercase hex sha256 of everything written.
   pub(crate) fn finish(self) -> String {
-    format!("{:x}", self.hasher.finalize())
+    hex(&self.hasher.finalize())
   }
 }
 
