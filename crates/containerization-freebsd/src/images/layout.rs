@@ -2,10 +2,10 @@
 
 use super::{Image, ImageStore, LAYOUT};
 use crate::error::{Error, Result};
-use crate::oci::{Descriptor, Document, Index, Platform, REF_NAME, parse, sha256_hex};
+use crate::oci::{BLOBS, Descriptor, Document, Index, Platform, REF_NAME, blob_path, parse};
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 impl ImageStore {
   /// Loads the images in the OCI image layout at `directory`, like
@@ -67,10 +67,10 @@ impl ImageStore {
       )));
     }
 
-    let blobs = out.join("blobs/sha256");
+    let blobs = out.join(BLOBS);
     std::fs::create_dir_all(&blobs).map_err(Error::io(format!("making {}", blobs.display())))?;
     for digest in self.reachable(&index)? {
-      let saved = layout_blob(out, &digest)?;
+      let saved = blob_path(out, &digest)?;
       if !saved.exists() {
         std::fs::copy(self.content.path(&digest)?, &saved)
           .map_err(Error::io(format!("writing {}", saved.display())))?;
@@ -112,7 +112,7 @@ impl ImageStore {
     if self.content.has(digest) {
       return Ok(true);
     }
-    let path = layout_blob(directory, digest)?;
+    let path = blob_path(directory, digest)?;
 
     match File::open(&path) {
       Ok(mut file) => self.content.ingest_from(&mut file, digest).map(|()| true),
@@ -133,18 +133,12 @@ impl ImageStore {
   }
 }
 
-/// The path of the blob `digest` in the layout at `root`.
-fn layout_blob(root: &Path, digest: &str) -> Result<PathBuf> {
-  let hex = sha256_hex(digest).ok_or_else(|| Error::Invalid(format!("{digest:?} is not a sha256 digest")))?;
-
-  Ok(root.join("blobs/sha256").join(hex))
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::images::tests::{descriptor, documents, json, registry};
   use crate::oci::{media_type, sha256_digest};
+  use std::path::PathBuf;
 
   #[test]
   fn saves_images_as_a_layout_that_loads_them_again() {
@@ -214,10 +208,10 @@ mod tests {
       manifests: vec![entry],
       ..Index::default()
     });
-    std::fs::create_dir_all(root.join("blobs/sha256")).unwrap();
+    std::fs::create_dir_all(root.join(BLOBS)).unwrap();
     std::fs::write(root.join("index.json"), index).unwrap();
     for file in files {
-      std::fs::write(layout_blob(root, &sha256_digest(file)).unwrap(), file).unwrap();
+      std::fs::write(blob_path(root, &sha256_digest(file)).unwrap(), file).unwrap();
     }
     root.to_path_buf()
   }
@@ -261,7 +255,7 @@ mod tests {
     // The previous load left the manifest and config in the store, but not
     // the layer.
     let forged = layout(&work.path().join("forged"), name, &manifest, &[]);
-    std::fs::write(layout_blob(&forged, &sha256_digest(&layer)).unwrap(), "something else").unwrap();
+    std::fs::write(blob_path(&forged, &sha256_digest(&layer)).unwrap(), "something else").unwrap();
     assert!(matches!(store.load(&forged).unwrap_err(), Error::Checksum { .. }));
     assert!(store.list().unwrap().is_empty());
   }

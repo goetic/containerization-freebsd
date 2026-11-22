@@ -1,9 +1,21 @@
-use super::{Descriptor, Document, ImageConfig, Manifest, parse, sha256_digest, sha256_file, sha256_hex};
+use super::{Descriptor, Document, ImageConfig, Manifest, parse};
+use crate::digest::{Hashing, sha256_digest, sha256_file, sha256_hex};
 use crate::error::{Error, Result};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Where an OCI image layout keeps its blobs, relative to its root.
+pub(crate) const BLOBS: &str = "blobs/sha256";
+
+/// The path of the blob `digest` in the OCI image layout at `root`, whether
+/// or not the layout holds it.
+pub(crate) fn blob_path(root: &Path, digest: &str) -> Result<PathBuf> {
+  let hex = sha256_hex(digest).ok_or_else(|| Error::Invalid(format!("{digest:?} is not a sha256 digest")))?;
+
+  Ok(root.join(BLOBS).join(hex))
+}
 
 /// Blobs at `blobs/sha256/<hex>` under the root, as in an OCI image layout.
 /// Each is written under `ingest/` and renamed into place only once its
@@ -15,7 +27,7 @@ pub struct ContentStore {
 
 impl ContentStore {
   pub fn new(root: &Path) -> Result<Self> {
-    for directory in [root.join("blobs/sha256"), root.join("ingest")] {
+    for directory in [root.join(BLOBS), root.join("ingest")] {
       std::fs::create_dir_all(&directory).map_err(Error::io(format!("making {}", directory.display())))?;
     }
     Ok(Self {
@@ -25,9 +37,7 @@ impl ContentStore {
 
   /// The path of the blob `digest`, whether or not the store holds it.
   pub fn path(&self, digest: &str) -> Result<PathBuf> {
-    let hex = sha256_hex(digest).ok_or_else(|| Error::Invalid(format!("{digest:?} is not a sha256 digest")))?;
-
-    Ok(self.root.join("blobs/sha256").join(hex))
+    blob_path(&self.root, digest)
   }
 
   pub fn has(&self, digest: &str) -> bool {
@@ -76,7 +86,8 @@ impl ContentStore {
   /// Moves `partial`, a path from `partial()`, into the store as
   /// `descriptor`'s blob, or deletes it if its digest or size differs.
   pub(crate) fn ingest_file(&self, partial: &Path, descriptor: &Descriptor) -> Result<()> {
-    let (digest, size) = sha256_file(partial)?;
+    let (hex, size) = sha256_file(partial)?;
+    let digest = format!("sha256:{hex}");
 
     if digest != descriptor.digest || size != descriptor.size {
       let _ = std::fs::remove_file(partial);
@@ -89,18 +100,21 @@ impl ContentStore {
     self.commit(partial, &digest)
   }
 
-  /// Stores `reader`'s contents as the blob `digest`, failing on a digest
-  /// mismatch.
+  /// Stores `reader`'s contents as the blob `digest`, hashing them as they
+  /// are written, and fails on a digest mismatch.
   pub(crate) fn ingest_from(&self, reader: &mut impl Read, digest: &str) -> Result<()> {
     let partial = self.partial();
-    let written = File::create(&partial).and_then(|mut file| io::copy(reader, &mut file));
-    let checked = written
-      .map_err(Error::io(format!("writing {}", partial.display())))
-      .and_then(|_| sha256_file(&partial));
+    let written = File::create(&partial)
+      .and_then(|file| {
+        let mut hashing = Hashing::new(file);
+        io::copy(reader, &mut hashing)?;
+        Ok(format!("sha256:{}", hashing.finish()))
+      })
+      .map_err(Error::io(format!("writing {}", partial.display())));
 
-    match checked {
-      Ok((actual, _)) if actual == digest => self.commit(&partial, digest),
-      Ok((actual, _)) => {
+    match written {
+      Ok(actual) if actual == digest => self.commit(&partial, digest),
+      Ok(actual) => {
         let _ = std::fs::remove_file(&partial);
         Err(Error::Checksum {
           path: partial,
@@ -139,7 +153,7 @@ impl ContentStore {
   }
 
   pub fn digests(&self) -> Result<Vec<String>> {
-    let directory = self.root.join("blobs/sha256");
+    let directory = self.root.join(BLOBS);
     let listing = || format!("listing {}", directory.display());
 
     std::fs::read_dir(&directory)

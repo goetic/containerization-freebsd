@@ -8,6 +8,7 @@ pub mod build;
 mod clock;
 pub mod container;
 mod copy;
+mod digest;
 mod error;
 mod host;
 pub mod images;

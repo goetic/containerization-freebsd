@@ -2,6 +2,7 @@
 //! guest bundle built for it, each verified against a published or pinned
 //! sha256.
 
+use crate::digest::sha256_file;
 use crate::error::{Error, Result};
 use crate::host::run;
 use std::fs::File;
@@ -39,20 +40,8 @@ fn fetch(url: &str, destination: &Path) -> Result<()> {
   std::fs::rename(&partial, destination).map_err(Error::io(format!("moving {} into place", destination.display())))
 }
 
-fn sha256(path: &Path) -> Result<String> {
-  let output = run(Command::new("shasum").args(["-a", "256"]).arg(path))?;
-
-  Ok(
-    output
-      .split_whitespace()
-      .next()
-      .unwrap_or_default()
-      .to_string(),
-  )
-}
-
 fn verify(path: &Path, expected: &str) -> Result<()> {
-  let actual = sha256(path)?;
+  let (actual, _) = sha256_file(path)?;
 
   if actual == expected {
     Ok(())
@@ -214,7 +203,7 @@ mod tests {
 
     let sha256 = match listed {
       Some(listed) => listed.to_string(),
-      None => sha256(&directory.join(IMAGE)).unwrap(),
+      None => sha256_file(&directory.join(IMAGE)).unwrap().0,
     };
     std::fs::write(
       directory.join("CHECKSUM.SHA256"),

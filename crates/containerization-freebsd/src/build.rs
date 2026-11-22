@@ -4,9 +4,9 @@
 //! again.
 
 use crate::agent::{Agent, Exec, Exit, Output};
+use crate::digest::sha256;
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
-use crate::oci::sha256_digest;
 use crate::scripts;
 use crate::zfs::Zfs;
 use std::time::Duration;
@@ -137,9 +137,7 @@ fn key(from: &str, step: &Step) -> String {
     Network::Nat => "Nat",
     Network::Interfaces(_) => "Interfaces",
   };
-  let digest = sha256_digest(format!("{from}\n{network}\n{}", step.script).as_bytes());
-
-  digest.trim_start_matches("sha256:").to_string()
+  sha256(format!("{from}\n{network}\n{}", step.script).as_bytes())
 }
 
 fn run_script(jail: &Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> Result<Exit> {

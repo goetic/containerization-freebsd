@@ -8,17 +8,16 @@ mod registry;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use crate::digest::{sha256_digest, sha256_hex};
 pub use content::ContentStore;
+pub(crate) use content::{BLOBS, blob_path};
 pub use reference::Reference;
 pub use registry::{Credentials, RegistryClient, Secret};
 
 use crate::agent::{Exec, User};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::path::Path;
 
 pub mod media_type {
   pub const INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -258,45 +257,6 @@ impl ImageConfig {
   }
 }
 
-/// The `sha256:<hex>` digest of `bytes`.
-pub fn sha256_digest(bytes: &[u8]) -> String {
-  format!("sha256:{}", hex(&Sha256::digest(bytes)))
-}
-
-/// The `sha256:<hex>` digest of the file at `path`, and the file's length.
-pub(crate) fn sha256_file(path: &Path) -> Result<(String, u64)> {
-  let reading = || format!("reading {}", path.display());
-  let mut file = std::fs::File::open(path).map_err(Error::io(reading()))?;
-  let mut hasher = Sha256::new();
-  let mut buffer = vec![0; 1 << 20];
-  let mut length = 0;
-
-  loop {
-    let read = file.read(&mut buffer).map_err(Error::io(reading()))?;
-    if read == 0 {
-      break;
-    }
-    hasher.update(&buffer[..read]);
-    length += read as u64;
-  }
-  Ok((format!("sha256:{}", hex(&hasher.finalize())), length))
-}
-
-fn hex(bytes: &[u8]) -> String {
-  bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// The hex part of `digest`, or `None` unless it is `sha256:` and 64
-/// lowercase hex digits.
-pub fn sha256_hex(digest: &str) -> Option<&str> {
-  digest.strip_prefix("sha256:").filter(|hex| {
-    hex.len() == 64
-      && hex
-        .bytes()
-        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-  })
-}
-
 /// Parses an image document; errors name it as `what`.
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
   serde_json::from_slice(bytes).map_err(|error| Error::Invalid(format!("{what} is not valid: {error}")))
@@ -415,17 +375,5 @@ mod tests {
     assert_eq!(config.platform(), Platform::default());
     assert_eq!(config.config.unwrap().cmd, Some(vec!["/bin/sh".to_string()]));
     assert_eq!(config.rootfs.diff_ids.len(), 1);
-  }
-
-  #[test]
-  fn knows_a_sha256_digest() {
-    let digest = sha256_digest(b"");
-
-    assert_eq!(
-      sha256_hex(&digest),
-      Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-    );
-    assert_eq!(sha256_hex("sha256:E3B0"), None);
-    assert_eq!(sha256_hex("sha512:00"), None);
   }
 }
