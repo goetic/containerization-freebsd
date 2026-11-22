@@ -1,21 +1,17 @@
 //! Relays Unix sockets between the host and the guest or a jail, like
 //! Containerization's `UnixSocketConfiguration`.
 
-use crate::agent::{Agent, Listener, Relay};
+use crate::agent::{Agent, Listener};
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{Address, Connect, Listen};
 use std::fs;
-use std::io::{self, Read, Write};
-use std::net::Shutdown;
+use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-
-/// The most a relay reads from the host at once.
-const READ: usize = 64 << 10;
 
 /// A Unix socket relayed between the host and the guest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,7 +129,7 @@ impl HostListener {
         // If the guest refuses the connection, dropping `local` closes it.
         thread::spawn(move || {
           if let Ok(relay) = agent.relay(connect) {
-            pump(relay, local);
+            relay.splice(local);
           }
         });
       }
@@ -162,55 +158,12 @@ fn remove_socket(path: &Path) -> io::Result<()> {
   }
 }
 
-/// Relays between `relay` and `local`, a host connection, until both
-/// directions finish.
-pub(crate) fn pump(relay: Relay, local: UnixStream) {
-  let Ok(mut to_local) = local.try_clone() else {
-    return;
-  };
-  let relay = Arc::new(relay);
-  let back = {
-    let relay = relay.clone();
-    thread::spawn(move || {
-      loop {
-        match relay.read() {
-          Ok(Some(bytes)) if to_local.write_all(&bytes).is_ok() => {}
-          Ok(None) => {
-            let _ = to_local.shutdown(Shutdown::Write);
-            return;
-          }
-          // If either end failed, shut down the other one too.
-          _ => {
-            let _ = to_local.shutdown(Shutdown::Both);
-            return;
-          }
-        }
-      }
-    })
-  };
-
-  let mut from_local = local;
-  let mut buffer = vec![0; READ];
-  loop {
-    match from_local.read(&mut buffer) {
-      Ok(0) => break,
-      Ok(read) => {
-        if relay.write(&buffer[..read]).is_err() {
-          break;
-        }
-      }
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-      Err(_) => break,
-    }
-  }
-  let _ = relay.close_write();
-  let _ = back.join();
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::agent::tests::started;
+  use std::io::{Read, Write};
+  use std::net::Shutdown;
 
   fn socket(host: PathBuf, guest: &Path, direction: Direction, mode: Option<u16>) -> UnixSocket {
     UnixSocket {

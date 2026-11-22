@@ -1,7 +1,7 @@
 //! HTTP over curl(1). Options, credentials included, go to curl as a config
 //! file on stdin, so they never appear in the process's arguments.
 
-use super::registry::{Credentials, Secret};
+use super::auth::Auth;
 use crate::error::{Error, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,13 +9,6 @@ use std::process::{Command, Stdio};
 
 /// curl's exit status when a response body is over `max-filesize`.
 const TOO_LARGE: i32 = 63;
-
-#[derive(Clone, Debug)]
-pub(super) enum Auth {
-  None,
-  Bearer(Secret),
-  Basic(Credentials),
-}
 
 pub(super) struct Request<'a> {
   pub(super) method: &'a str,

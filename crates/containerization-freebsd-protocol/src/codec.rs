@@ -2,7 +2,32 @@
 //! 0 or 1, a string or list as a u32 length followed by its bytes or items,
 //! and an option as a bool followed by the value, if any.
 
-use crate::message::DecodeError;
+use std::fmt;
+
+/// Why a frame's payload isn't a valid message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+  UnknownKind(u8),
+  Truncated,
+  /// The payload has bytes after the message's last field.
+  TooLong,
+  NotUtf8,
+  UnknownTag(u8),
+}
+
+impl fmt::Display for DecodeError {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::UnknownKind(kind) => write!(formatter, "unknown message kind {kind:#04x}"),
+      Self::Truncated => formatter.write_str("the payload ends early"),
+      Self::TooLong => formatter.write_str("the payload goes on after the message"),
+      Self::NotUtf8 => formatter.write_str("a string is not UTF-8"),
+      Self::UnknownTag(tag) => write!(formatter, "unknown tag {tag}"),
+    }
+  }
+}
+
+impl std::error::Error for DecodeError {}
 
 pub(crate) trait Encode {
   fn encode(&self, out: &mut Writer);

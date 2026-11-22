@@ -5,16 +5,21 @@ use super::AGENT_TIMEOUT;
 use super::session::Shared;
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{Exit, Message, WINDOW, WindowSize};
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// The largest Data payload the host sends, so that channels take turns on
 /// the console.
 const CHUNK: usize = WINDOW / 2;
+/// The most `Relay::splice` reads from the host connection at once.
+const READ: usize = 64 << 10;
 
 /// A process the agent runs. Dropping it before it exits kills it.
 pub struct Process {
@@ -181,6 +186,51 @@ impl Relay {
       }
     }
   }
+
+  /// Relays between the connection and `local`, a host connection, until
+  /// both directions finish.
+  pub(crate) fn splice(self, local: UnixStream) {
+    let Ok(mut to_local) = local.try_clone() else {
+      return;
+    };
+    let relay = Arc::new(self);
+    let back = {
+      let relay = relay.clone();
+      thread::spawn(move || {
+        loop {
+          match relay.read() {
+            Ok(Some(bytes)) if to_local.write_all(&bytes).is_ok() => {}
+            Ok(None) => {
+              let _ = to_local.shutdown(Shutdown::Write);
+              return;
+            }
+            // If either end failed, shut down the other one too.
+            _ => {
+              let _ = to_local.shutdown(Shutdown::Both);
+              return;
+            }
+          }
+        }
+      })
+    };
+
+    let mut from_local = local;
+    let mut buffer = vec![0; READ];
+    loop {
+      match from_local.read(&mut buffer) {
+        Ok(0) => break,
+        Ok(read) => {
+          if relay.write(&buffer[..read]).is_err() {
+            break;
+          }
+        }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+        Err(_) => break,
+      }
+    }
+    let _ = relay.close_write();
+    let _ = back.join();
+  }
 }
 
 impl Listener {
@@ -216,7 +266,7 @@ pub(super) fn relay_accepted(stream: Stream, host: &Path) {
   match UnixStream::connect(host) {
     Ok(local) => {
       if stream.send(Message::Opened).is_ok() {
-        crate::socket::pump(Relay::new(stream), local);
+        Relay::new(stream).splice(local);
       }
     }
     Err(error) => {

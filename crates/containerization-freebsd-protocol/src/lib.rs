@@ -42,6 +42,7 @@ pub mod frame;
 pub mod message;
 pub mod mux;
 
+pub use codec::DecodeError;
 pub use frame::{Decoder, Frame, MAGIC, MAX_PAYLOAD, Skipped};
-pub use message::{Address, Connect, DecodeError, Exec, Exit, Limit, Listen, Message, Resource, User, WindowSize};
+pub use message::{Address, Connect, Exec, Exit, Limit, Listen, Message, Resource, User, WindowSize};
 pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch, WINDOW};

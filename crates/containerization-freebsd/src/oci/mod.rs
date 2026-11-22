@@ -1,6 +1,7 @@
 //! Host-side OCI support: image references, image-spec documents, a
 //! distribution API client and a content-addressable store.
 
+mod auth;
 mod content;
 mod curl;
 mod reference;
@@ -9,10 +10,11 @@ mod registry;
 pub(crate) mod testing;
 
 pub use crate::digest::{sha256_digest, sha256_hex};
+pub use auth::{Credentials, Secret};
 pub use content::ContentStore;
 pub(crate) use content::{BLOBS, blob_path};
 pub use reference::Reference;
-pub use registry::{Credentials, RegistryClient, Secret};
+pub use registry::RegistryClient;
 
 use crate::agent::{Exec, User};
 use crate::error::{Error, Result};

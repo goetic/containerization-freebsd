@@ -5,8 +5,9 @@
 //! and the guest opens odd-numbered ones, so the guest can open a channel for
 //! each connection to a socket it listens on without asking the host first.
 
+use crate::codec::DecodeError;
 use crate::frame::{Frame, MAX_PAYLOAD};
-use crate::message::{DecodeError, Message};
+use crate::message::Message;
 use std::collections::HashMap;
 use std::{fmt, mem};
 

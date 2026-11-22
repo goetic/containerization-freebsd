@@ -3,9 +3,8 @@
 //! bytes. An enum's variant is a u8 tag before its fields. The payload of
 //! Data, Stderr and Error is the raw bytes alone.
 
-use crate::codec::{Decode, Encode, Reader, Writer, encode};
+use crate::codec::{Decode, DecodeError, Encode, Reader, Writer, encode};
 use crate::frame::Frame;
-use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
@@ -170,16 +169,6 @@ pub struct WindowSize {
 pub enum Exit {
   Code(i32),
   Signal(i32),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeError {
-  UnknownKind(u8),
-  Truncated,
-  /// The payload has bytes after the message's last field.
-  TooLong,
-  NotUtf8,
-  UnknownTag(u8),
 }
 
 mod kind {
@@ -441,20 +430,6 @@ impl Decode for Exit {
     }
   }
 }
-
-impl fmt::Display for DecodeError {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self {
-      Self::UnknownKind(kind) => write!(formatter, "unknown message kind {kind:#04x}"),
-      Self::Truncated => formatter.write_str("the payload ends early"),
-      Self::TooLong => formatter.write_str("the payload goes on after the message"),
-      Self::NotUtf8 => formatter.write_str("a string is not UTF-8"),
-      Self::UnknownTag(tag) => write!(formatter, "unknown tag {tag}"),
-    }
-  }
-}
-
-impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {

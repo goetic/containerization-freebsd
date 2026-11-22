@@ -226,7 +226,7 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
 }
 
 /// CRC-32 (IEEE 802.3), as zlib computes it.
-pub(crate) fn crc32(bytes: &[u8]) -> u32 {
+fn crc32(bytes: &[u8]) -> u32 {
   const TABLE: [u32; 256] = {
     let mut table = [0; 256];
     let mut index = 0;
