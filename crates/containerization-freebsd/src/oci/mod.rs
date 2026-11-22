@@ -9,7 +9,7 @@ mod registry;
 #[cfg(test)]
 pub(crate) mod testing;
 
-pub use crate::digest::{sha256_digest, sha256_hex};
+pub use crate::digest::Digest;
 pub use auth::{Credentials, Secret};
 pub use content::ContentStore;
 pub(crate) use content::{BLOBS, blob_path};
@@ -41,7 +41,7 @@ pub const REF_NAME: &str = "org.opencontainers.image.ref.name";
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
   pub media_type: String,
-  pub digest: String,
+  pub digest: Digest,
   pub size: u64,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub platform: Option<Platform>,
@@ -190,7 +190,7 @@ pub struct RunConfig {
 pub struct RootFs {
   #[serde(rename = "type")]
   pub kind: String,
-  pub diff_ids: Vec<String>,
+  pub diff_ids: Vec<Digest>,
 }
 
 impl ImageConfig {
@@ -245,12 +245,12 @@ impl ImageConfig {
   /// ID, and each later one is the sha256 of `<parent chain ID> <diff ID>`.
   /// A chain ID thus identifies a layer together with every layer beneath
   /// it.
-  pub fn chain_ids(&self) -> Vec<String> {
-    let mut chain: Vec<String> = Vec::with_capacity(self.rootfs.diff_ids.len());
+  pub fn chain_ids(&self) -> Vec<Digest> {
+    let mut chain: Vec<Digest> = Vec::with_capacity(self.rootfs.diff_ids.len());
 
     for diff_id in &self.rootfs.diff_ids {
       let next = match chain.last() {
-        Some(below) => sha256_digest(format!("{below} {diff_id}").as_bytes()),
+        Some(below) => Digest::of(format!("{below} {diff_id}").as_bytes()),
         None => diff_id.clone(),
       };
       chain.push(next);
@@ -269,11 +269,22 @@ mod tests {
   use super::*;
 
   #[test]
+  fn reads_an_index_with_a_digest_it_cannot_use() {
+    let index: Index = parse(
+      br#"{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha512:00ff","size":1}]}"#,
+      "an index",
+    )
+    .unwrap();
+
+    assert_eq!(index.manifests[0].digest.sha256_hex(), None);
+  }
+
+  #[test]
   fn chains_each_layer_to_those_beneath_it() {
     let config = ImageConfig {
       rootfs: RootFs {
         kind: "layers".into(),
-        diff_ids: vec![sha256_digest(b"one"), sha256_digest(b"two")],
+        diff_ids: vec![Digest::of(b"one"), Digest::of(b"two")],
       },
       ..ImageConfig::default()
     };
@@ -283,7 +294,7 @@ mod tests {
     assert_eq!(chain[0], config.rootfs.diff_ids[0]);
     assert_eq!(
       chain[1],
-      sha256_digest(format!("{} {}", chain[0], config.rootfs.diff_ids[1]).as_bytes())
+      Digest::of(format!("{} {}", chain[0], config.rootfs.diff_ids[1]).as_bytes())
     );
   }
 

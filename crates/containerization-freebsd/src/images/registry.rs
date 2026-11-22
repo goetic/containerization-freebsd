@@ -19,7 +19,7 @@ impl ImageStore {
       Document::Index(index) => {
         let chosen = choose(&index, platform, &reference)?;
         if !self.content.has(&chosen.digest) {
-          client.fetch_manifest(&reference, &chosen.digest, &self.content)?;
+          client.fetch_manifest(&reference, chosen.digest.as_str(), &self.content)?;
         }
         self.content.manifest(&chosen)?
       }
@@ -123,13 +123,13 @@ impl ImageStore {
         let platform = child
           .platform
           .as_ref()
-          .map_or_else(|| child.digest.clone(), Platform::to_string);
+          .map_or_else(|| child.digest.to_string(), Platform::to_string);
         return Err(Error::Invalid(format!(
           "the store lacks {reference}'s manifest for {platform}: push the platforms it has, one at a time"
         )));
       }
       self.push_children(client, reference, child)?;
-      client.push_manifest(reference, &child.digest, child, &self.content)?;
+      client.push_manifest(reference, child.digest.as_str(), child, &self.content)?;
     }
     Ok(())
   }

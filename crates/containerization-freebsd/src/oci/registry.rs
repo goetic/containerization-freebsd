@@ -1,6 +1,6 @@
 use super::auth::{Auth, Credentials, Secret, TokenResponse, parse_challenge, token_url};
 use super::curl::{self, Request, Response};
-use super::{ContentStore, Descriptor, Reference, media_type, sha256_digest, sha256_hex};
+use super::{ContentStore, Descriptor, Digest, Reference, media_type};
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,11 +56,13 @@ impl RegistryClient {
         )));
       }
       let bytes = std::fs::read(&partial).map_err(Error::io("reading a manifest"))?;
-      let digest = sha256_digest(&bytes);
-      if sha256_hex(target).is_some() && digest != target {
+      let digest = Digest::of(&bytes);
+      if let Ok(expected) = target.parse::<Digest>()
+        && digest != expected
+      {
         return Err(Error::Checksum {
           path: partial.clone(),
-          actual: digest,
+          actual: digest.to_string(),
           expected: target.to_string(),
         });
       }
@@ -118,7 +120,7 @@ impl RegistryClient {
       })?;
     upload
       .query_pairs_mut()
-      .append_pair("digest", &descriptor.digest);
+      .append_pair("digest", descriptor.digest.as_str());
 
     let blob = store.path(&descriptor.digest)?;
     let mut put = Request::new("PUT", upload.to_string());
@@ -409,7 +411,7 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let store = ContentStore::new(root.path()).unwrap();
     let index = br#"{"schemaVersion":2,"manifests":[]}"#;
-    let wrong = sha256_digest(b"something else");
+    let wrong = Digest::of(b"something else").to_string();
     let registry = FakeRegistry::default()
       .manifest("test/image", "1", media_type::INDEX, index)
       .manifest("test/image", &wrong, media_type::INDEX, index)

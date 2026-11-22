@@ -2,7 +2,7 @@
 
 use super::{Image, ImageStore, LAYOUT};
 use crate::error::{Error, Result};
-use crate::oci::{BLOBS, Descriptor, Document, Index, Platform, REF_NAME, blob_path, parse};
+use crate::oci::{BLOBS, Descriptor, Digest, Document, Index, Platform, REF_NAME, blob_path, parse};
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -108,7 +108,7 @@ impl ImageStore {
 
   /// Copies the blob `digest` from the layout at `directory` unless the
   /// store has it. Returns whether the store has it afterwards.
-  fn copy_in(&self, directory: &Path, digest: &str) -> Result<bool> {
+  fn copy_in(&self, directory: &Path, digest: &Digest) -> Result<bool> {
     if self.content.has(digest) {
       return Ok(true);
     }
@@ -123,7 +123,7 @@ impl ImageStore {
 
   /// A blob reachable from `index` that the store lacks. Missing manifests
   /// aren't reported, since a pull fetches only one platform's manifest.
-  fn missing(&self, index: &Index) -> Result<Option<String>> {
+  fn missing(&self, index: &Index) -> Result<Option<Digest>> {
     Ok(
       self
         .reachable(index)?
@@ -137,7 +137,7 @@ impl ImageStore {
 mod tests {
   use super::*;
   use crate::images::tests::{descriptor, documents, json, registry};
-  use crate::oci::{media_type, sha256_digest};
+  use crate::oci::media_type;
   use std::path::PathBuf;
 
   #[test]
@@ -211,7 +211,7 @@ mod tests {
     std::fs::create_dir_all(root.join(BLOBS)).unwrap();
     std::fs::write(root.join("index.json"), index).unwrap();
     for file in files {
-      std::fs::write(blob_path(root, &sha256_digest(file)).unwrap(), file).unwrap();
+      std::fs::write(blob_path(root, &Digest::of(file)).unwrap(), file).unwrap();
     }
     root.to_path_buf()
   }
@@ -234,7 +234,7 @@ mod tests {
       images[0].reference,
       "docker.io/library/freebsd-static:15.1-RELEASE-aarch64"
     );
-    assert!(store.content().has(&sha256_digest(&layer)));
+    assert!(store.content().has(&Digest::of(&layer)));
   }
 
   #[test]
@@ -246,16 +246,16 @@ mod tests {
 
     let empty = layout(&work.path().join("empty"), name, &manifest, &[]);
     let error = store.load(&empty).unwrap_err();
-    assert!(error.to_string().contains(&sha256_digest(&manifest)), "{error}");
+    assert!(error.to_string().contains(Digest::of(&manifest).as_str()), "{error}");
 
     let lacking = layout(&work.path().join("lacking"), name, &manifest, &[&manifest, &config]);
     let error = store.load(&lacking).unwrap_err();
-    assert!(error.to_string().contains(&sha256_digest(&layer)), "{error}");
+    assert!(error.to_string().contains(Digest::of(&layer).as_str()), "{error}");
 
     // The previous load left the manifest and config in the store, but not
     // the layer.
     let forged = layout(&work.path().join("forged"), name, &manifest, &[]);
-    std::fs::write(blob_path(&forged, &sha256_digest(&layer)).unwrap(), "something else").unwrap();
+    std::fs::write(blob_path(&forged, &Digest::of(&layer)).unwrap(), "something else").unwrap();
     assert!(matches!(store.load(&forged).unwrap_err(), Error::Checksum { .. }));
     assert!(store.list().unwrap().is_empty());
   }

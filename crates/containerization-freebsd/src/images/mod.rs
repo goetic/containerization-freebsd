@@ -7,7 +7,7 @@ mod registry;
 
 use crate::error::{Error, Result};
 use crate::oci::{
-  ContentStore, Descriptor, Document, ImageConfig, Index, Manifest, Platform, REF_NAME, Reference, parse,
+  ContentStore, Descriptor, Digest, Document, ImageConfig, Index, Manifest, Platform, REF_NAME, Reference, parse,
 };
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -186,7 +186,7 @@ impl ImageStore {
 
   /// Every blob reachable from `index`. Indexes and manifests the store
   /// lacks are skipped, but configs and layers are included either way.
-  fn reachable(&self, index: &Index) -> Result<BTreeSet<String>> {
+  fn reachable(&self, index: &Index) -> Result<BTreeSet<Digest>> {
     let mut needed = BTreeSet::new();
     let mut pending: Vec<Descriptor> = index.manifests.clone();
 
@@ -325,13 +325,13 @@ fn ref_name(entry: &Descriptor) -> Option<&String> {
 mod tests {
   use super::*;
   use crate::oci::testing::FakeRegistry;
-  use crate::oci::{RootFs, RunConfig, media_type, sha256_digest};
+  use crate::oci::{RootFs, RunConfig, media_type};
   use std::time::Duration;
 
   pub(super) fn descriptor(media_type: &str, bytes: &[u8], platform: Option<Platform>) -> Descriptor {
     Descriptor {
       media_type: media_type.into(),
-      digest: sha256_digest(bytes),
+      digest: Digest::of(bytes),
       size: bytes.len() as u64,
       platform,
       annotations: Default::default(),
@@ -354,7 +354,7 @@ mod tests {
       }),
       rootfs: RootFs {
         kind: "layers".into(),
-        diff_ids: vec![sha256_digest(&layer)],
+        diff_ids: vec![Digest::of(&layer)],
       },
       ..ImageConfig::default()
     });
@@ -385,7 +385,12 @@ mod tests {
 
     FakeRegistry::default()
       .manifest("test/image", "1", media_type::INDEX, &index)
-      .manifest("test/image", &sha256_digest(&manifest), media_type::MANIFEST, &manifest)
+      .manifest(
+        "test/image",
+        Digest::of(&manifest).as_str(),
+        media_type::MANIFEST,
+        &manifest,
+      )
       .blob(&config)
       .blob(&layer)
       .serve()

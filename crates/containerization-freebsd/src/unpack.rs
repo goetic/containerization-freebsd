@@ -6,7 +6,7 @@
 use crate::agent::{Agent, Exec, QUICK, Spawn};
 use crate::error::{Error, Result};
 use crate::images::Image;
-use crate::oci::{Descriptor, Platform, media_type, sha256_hex};
+use crate::oci::{Descriptor, Platform, media_type};
 use crate::scripts;
 use crate::zfs::Zfs;
 use std::time::Duration;
@@ -70,15 +70,14 @@ impl<'a> Unpacker<'a> {
     let mut below: Option<String> = None;
 
     for (index, (layer, chain_id)) in manifest.layers.iter().zip(config.chain_ids()).enumerate() {
-      let hex = sha256_hex(&chain_id).ok_or_else(|| Error::Invalid(format!("{chain_id:?} is not a sha256 digest")))?;
+      let hex = chain_id.require_sha256()?;
       let dataset = format!("{}/{hex}", self.store);
       let snapshot = format!("{dataset}@{UNPACKED}");
 
       if self.zfs.exists(&snapshot)? {
         unpacked.cached += 1;
       } else {
-        let diff_id = sha256_hex(&diff_ids[index])
-          .ok_or_else(|| Error::Invalid(format!("{:?} is not a sha256 digest", diff_ids[index])))?;
+        let diff_id = diff_ids[index].require_sha256()?;
         let staging = format!("{directory}/.{hex}.tar");
         self
           .layer(image, layer, diff_id, below.as_deref(), &dataset, &staging)

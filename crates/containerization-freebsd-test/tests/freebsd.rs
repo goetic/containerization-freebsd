@@ -4,7 +4,7 @@
 //! images pulled, unpacked into ZFS and run; and a build-sized workload on a
 //! share. Run them through `bin/dev/test-integration`, which signs them.
 
-use containerization_freebsd::oci::{ContentStore, Descriptor, Platform, media_type, sha256_digest};
+use containerization_freebsd::oci::{ContentStore, Descriptor, Digest, Platform, media_type};
 use containerization_freebsd::{
   Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
   Jail, Limit, Machine, Mount, Network, Output, Process, Resource, Share, Spawn, Step, UnixSocket, Unpacker, Upgrade,
@@ -1253,7 +1253,7 @@ fn layers_an_image_on_the_runtime(work: &Path, store: &ImageStore, runtime: &Ima
   config
     .rootfs
     .diff_ids
-    .extend([sha256_digest(&added), sha256_digest(&hiding)]);
+    .extend([Digest::of(&added), Digest::of(&hiding)]);
   let (_, mut manifest) = runtime.manifest(platform).expect("its manifest");
   manifest.config = blob(
     content,

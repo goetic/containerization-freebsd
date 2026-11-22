@@ -1,4 +1,4 @@
-use super::sha256_hex;
+use super::Digest;
 use crate::error::{Error, Result};
 use std::fmt;
 use std::str::FromStr;
@@ -17,7 +17,7 @@ pub struct Reference {
   pub repository: String,
   pub tag: Option<String>,
   /// A digest such as `sha256:…`. Only sha256 is supported.
-  pub digest: Option<String>,
+  pub digest: Option<Digest>,
 }
 
 impl Reference {
@@ -66,11 +66,15 @@ impl Reference {
     {
       return Err(invalid("its tag must be up to 128 letters, digits, '_', '.' and '-'"));
     }
-    if let Some(digest) = digest
-      && sha256_hex(digest).is_none()
-    {
-      return Err(invalid("its digest must be sha256:<64 lowercase hex digits>"));
-    }
+    let digest = digest
+      .map(|digest| {
+        digest
+          .parse::<Digest>()
+          .ok()
+          .filter(|digest| digest.sha256_hex().is_some())
+          .ok_or_else(|| invalid("its digest must be sha256:<64 lowercase hex digits>"))
+      })
+      .transpose()?;
 
     Ok(Self {
       domain: domain.to_string(),
@@ -78,7 +82,7 @@ impl Reference {
       tag: tag
         .map(str::to_string)
         .or_else(|| digest.is_none().then(|| "latest".to_string())),
-      digest: digest.map(str::to_string),
+      digest,
     })
   }
 
@@ -86,7 +90,8 @@ impl Reference {
   pub fn target(&self) -> &str {
     self
       .digest
-      .as_deref()
+      .as_ref()
+      .map(Digest::as_str)
       .or(self.tag.as_deref())
       .unwrap_or("latest")
   }

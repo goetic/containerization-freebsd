@@ -1,5 +1,5 @@
 use super::{Descriptor, Document, ImageConfig, Manifest, parse};
-use crate::digest::{Hashing, sha256_digest, sha256_file, sha256_hex};
+use crate::digest::{Digest, Hashing, sha256_file};
 use crate::error::{Error, Result};
 use std::fs::File;
 use std::io::{self, Read};
@@ -10,11 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) const BLOBS: &str = "blobs/sha256";
 
 /// The path of the blob `digest` in the OCI image layout at `root`, whether
-/// or not the layout holds it.
-pub(crate) fn blob_path(root: &Path, digest: &str) -> Result<PathBuf> {
-  let hex = sha256_hex(digest).ok_or_else(|| Error::Invalid(format!("{digest:?} is not a sha256 digest")))?;
-
-  Ok(root.join(BLOBS).join(hex))
+/// or not the layout holds it. Fails unless `digest` is sha256.
+pub(crate) fn blob_path(root: &Path, digest: &Digest) -> Result<PathBuf> {
+  Ok(root.join(BLOBS).join(digest.require_sha256()?))
 }
 
 /// Blobs at `blobs/sha256/<hex>` under the root, as in an OCI image layout.
@@ -35,16 +33,17 @@ impl ContentStore {
     })
   }
 
-  /// The path of the blob `digest`, whether or not the store holds it.
-  pub fn path(&self, digest: &str) -> Result<PathBuf> {
+  /// The path of the blob `digest`, whether or not the store holds it. Fails
+  /// unless `digest` is sha256.
+  pub fn path(&self, digest: &Digest) -> Result<PathBuf> {
     blob_path(&self.root, digest)
   }
 
-  pub fn has(&self, digest: &str) -> bool {
+  pub fn has(&self, digest: &Digest) -> bool {
     self.path(digest).is_ok_and(|path| path.exists())
   }
 
-  pub fn read(&self, digest: &str) -> Result<Vec<u8>> {
+  pub fn read(&self, digest: &Digest) -> Result<Vec<u8>> {
     let path = self.path(digest)?;
 
     std::fs::read(&path).map_err(Error::io(format!("reading blob {digest}")))
@@ -74,8 +73,8 @@ impl ContentStore {
   }
 
   /// Stores `bytes` as a blob and returns its digest.
-  pub fn ingest(&self, bytes: &[u8]) -> Result<String> {
-    let digest = sha256_digest(bytes);
+  pub fn ingest(&self, bytes: &[u8]) -> Result<Digest> {
+    let digest = Digest::of(bytes);
     let partial = self.partial();
 
     std::fs::write(&partial, bytes).map_err(Error::io(format!("writing {}", partial.display())))?;
@@ -87,7 +86,7 @@ impl ContentStore {
   /// `descriptor`'s blob, or deletes it if its digest or size differs.
   pub(crate) fn ingest_file(&self, partial: &Path, descriptor: &Descriptor) -> Result<()> {
     let (hex, size) = sha256_file(partial)?;
-    let digest = format!("sha256:{hex}");
+    let digest = Digest::from_sha256(&hex);
 
     if digest != descriptor.digest || size != descriptor.size {
       let _ = std::fs::remove_file(partial);
@@ -102,23 +101,23 @@ impl ContentStore {
 
   /// Stores `reader`'s contents as the blob `digest`, hashing them as they
   /// are written, and fails on a digest mismatch.
-  pub(crate) fn ingest_from(&self, reader: &mut impl Read, digest: &str) -> Result<()> {
+  pub(crate) fn ingest_from(&self, reader: &mut impl Read, digest: &Digest) -> Result<()> {
     let partial = self.partial();
     let written = File::create(&partial)
       .and_then(|file| {
         let mut hashing = Hashing::new(file);
         io::copy(reader, &mut hashing)?;
-        Ok(format!("sha256:{}", hashing.finish()))
+        Ok(Digest::from_sha256(&hashing.finish()))
       })
       .map_err(Error::io(format!("writing {}", partial.display())));
 
     match written {
-      Ok(actual) if actual == digest => self.commit(&partial, digest),
+      Ok(actual) if actual == *digest => self.commit(&partial, digest),
       Ok(actual) => {
         let _ = std::fs::remove_file(&partial);
         Err(Error::Checksum {
           path: partial,
-          actual,
+          actual: actual.to_string(),
           expected: digest.to_string(),
         })
       }
@@ -141,7 +140,7 @@ impl ContentStore {
     ))
   }
 
-  pub fn delete(&self, digest: &str) -> Result<()> {
+  pub fn delete(&self, digest: &Digest) -> Result<()> {
     let path = self.path(digest)?;
 
     match std::fs::remove_file(&path) {
@@ -152,23 +151,25 @@ impl ContentStore {
     }
   }
 
-  pub fn digests(&self) -> Result<Vec<String>> {
+  /// The digests of the blobs the store holds. Files not named for a sha256
+  /// are left out.
+  pub fn digests(&self) -> Result<Vec<Digest>> {
     let directory = self.root.join(BLOBS);
     let listing = || format!("listing {}", directory.display());
+    let mut digests = Vec::new();
 
-    std::fs::read_dir(&directory)
-      .map_err(Error::io(listing()))?
-      .map(|entry| {
-        entry
-          .map(|entry| format!("sha256:{}", entry.file_name().to_string_lossy()))
-          .map_err(Error::io(listing()))
-      })
-      .collect()
+    for entry in std::fs::read_dir(&directory).map_err(Error::io(listing()))? {
+      let name = entry.map_err(Error::io(listing()))?.file_name();
+      if let Ok(digest) = format!("sha256:{}", name.to_string_lossy()).parse() {
+        digests.push(digest);
+      }
+    }
+    Ok(digests)
   }
 
   /// Moves `partial`, a path from `partial()`, into the store as the blob
   /// `digest`, which the caller has verified.
-  pub(crate) fn commit(&self, partial: &Path, digest: &str) -> Result<()> {
+  pub(crate) fn commit(&self, partial: &Path, digest: &Digest) -> Result<()> {
     let path = self.path(digest)?;
 
     std::fs::rename(partial, &path).map_err(Error::io(format!("moving blob {digest} into place")))
@@ -183,10 +184,11 @@ mod tests {
   fn keeps_blobs_by_their_digest() {
     let root = tempfile::tempdir().unwrap();
     let store = ContentStore::new(root.path()).unwrap();
+    std::fs::write(root.path().join(BLOBS).join("stray"), b"").unwrap();
 
     let digest = store.ingest(b"blob").unwrap();
 
-    assert_eq!(digest, sha256_digest(b"blob"));
+    assert_eq!(digest, Digest::of(b"blob"));
     assert!(store.has(&digest));
     assert_eq!(store.read(&digest).unwrap(), b"blob");
     assert_eq!(store.digests().unwrap(), std::slice::from_ref(&digest));
@@ -202,7 +204,7 @@ mod tests {
     std::fs::write(&partial, b"other").unwrap();
     let descriptor = Descriptor {
       media_type: super::super::media_type::LAYER.into(),
-      digest: sha256_digest(b"blob"),
+      digest: Digest::of(b"blob"),
       size: 4,
       platform: None,
       annotations: Default::default(),
