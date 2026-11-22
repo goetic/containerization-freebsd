@@ -4,7 +4,7 @@
 //! container, these share one machine; for a VM each, create a machine per
 //! container.
 
-use crate::agent::{Agent, Exec, Exit, Output, Process, Ran, Relay};
+use crate::agent::{Agent, Exec, Process, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
 use crate::quota::{self, Statistics};
@@ -357,29 +357,7 @@ fn write(jail: &Jail, path: &str, text: &str, append: bool) -> Result<()> {
   })?;
   process.write(text.as_bytes())?;
   process.close_input()?;
-
-  let mut stderr = Vec::new();
-  loop {
-    match process.recv_timeout(QUICK)? {
-      Some(Output::Exited(Exit::Code(0))) => return Ok(()),
-      Some(Output::Exited(exit)) => {
-        return Err(Error::Guest(format!(
-          "writing {path} in jail {} exited {exit:?}: {}",
-          jail.name(),
-          String::from_utf8_lossy(&stderr).trim()
-        )));
-      }
-      Some(Output::Stderr(bytes)) => stderr.extend(bytes),
-      Some(Output::Stdout(_)) => {}
-      None => {
-        return Err(Error::Timeout(format!(
-          "writing {path} in jail {} did not finish within {}s",
-          jail.name(),
-          QUICK.as_secs()
-        )));
-      }
-    }
-  }
+  process.finish(&format!("writing {path} in jail {}", jail.name()), QUICK)
 }
 
 fn stop(agent: &Agent, id: &str) -> Result<()> {

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The largest Data payload the host sends, so that channels take turns on
 /// the console.
@@ -95,6 +95,33 @@ impl Process {
   /// `timeout`.
   pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<Output>> {
     self.next(Some(timeout))
+  }
+
+  /// Waits up to `timeout` for the process to exit 0, discarding its stdout.
+  /// Errors name the process by `what` and carry its stderr.
+  pub(crate) fn finish(&self, what: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut stderr = Vec::new();
+
+    loop {
+      match self.recv_timeout(deadline.saturating_duration_since(Instant::now()))? {
+        Some(Output::Exited(Exit::Code(0))) => return Ok(()),
+        Some(Output::Exited(exit)) => {
+          return Err(Error::Guest(format!(
+            "{what} exited {exit:?}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+          )));
+        }
+        Some(Output::Stderr(bytes)) => stderr.extend(bytes),
+        Some(Output::Stdout(_)) => {}
+        None => {
+          return Err(Error::Timeout(format!(
+            "{what} did not finish within {}s",
+            timeout.as_secs()
+          )));
+        }
+      }
+    }
   }
 
   fn next(&self, timeout: Option<Duration>) -> Result<Option<Output>> {
@@ -285,5 +312,52 @@ impl Drop for Stream {
       state.close(self.channel, "closed by the host");
     }
     state.forget(self.channel);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::agent::Exec;
+  use crate::agent::tests::started;
+
+  #[test]
+  fn finish_times_out_while_the_process_writes_to_stderr() {
+    let agent = started();
+    // Writes to stderr every 100ms for 5s, then exits 0.
+    let process = agent
+      .spawn(Exec {
+        argv: ["sh", "-c", "for i in $(seq 50); do echo $i >&2; sleep 0.1; done"]
+          .map(String::from)
+          .to_vec(),
+        ..Exec::default()
+      })
+      .unwrap();
+    let started = Instant::now();
+
+    let result = process.finish("writing", Duration::from_millis(500));
+
+    assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+  }
+
+  #[test]
+  fn finish_reports_a_failure_with_its_stderr() {
+    let agent = started();
+    let process = agent
+      .spawn(Exec {
+        argv: ["sh", "-c", "echo out; echo broken >&2; exit 3"]
+          .map(String::from)
+          .to_vec(),
+        ..Exec::default()
+      })
+      .unwrap();
+
+    let result = process.finish("writing", Duration::from_secs(10));
+
+    assert!(
+      matches!(&result, Err(Error::Guest(message)) if message == "writing exited Code(3): broken"),
+      "{result:?}"
+    );
   }
 }

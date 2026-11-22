@@ -3,14 +3,14 @@
 //! so a layer stack shared by several images is unpacked once. The top
 //! layer's snapshot is what a container's root is cloned from.
 
-use crate::agent::{Agent, Exec, Exit, Output, Process};
+use crate::agent::{Agent, Exec};
 use crate::error::{Error, Result};
 use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type, sha256_hex};
 use crate::scripts;
 use crate::zfs::Zfs;
 use std::io::Read;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const QUICK: Duration = Duration::from_secs(60);
 /// Extracting a userland-sized layer takes about a minute.
@@ -167,10 +167,10 @@ impl<'a> Unpacker<'a> {
     })();
 
     match written {
-      Ok(()) => finish(&process, UNPACKING),
+      Ok(()) => process.finish("decompressing", UNPACKING),
       // A failed write usually means the decompressor exited early, and its
       // error says why.
-      Err(error) => match finish(&process, QUICK) {
+      Err(error) => match process.finish("decompressing", QUICK) {
         Err(failed @ Error::Guest(_)) => Err(failed),
         _ => Err(error),
       },
@@ -188,56 +188,9 @@ fn compression(media_type: &str) -> Result<&'static str> {
   }
 }
 
-/// Waits up to `timeout` for `process` to exit 0.
-fn finish(process: &Process, timeout: Duration) -> Result<()> {
-  let deadline = Instant::now() + timeout;
-  let mut stderr = Vec::new();
-
-  loop {
-    match process.recv_timeout(deadline.saturating_duration_since(Instant::now()))? {
-      Some(Output::Exited(Exit::Code(0))) => return Ok(()),
-      Some(Output::Exited(exit)) => {
-        return Err(Error::Guest(format!(
-          "decompressing exited {exit:?}: {}",
-          String::from_utf8_lossy(&stderr).trim()
-        )));
-      }
-      Some(Output::Stderr(bytes)) => stderr.extend(bytes),
-      Some(Output::Stdout(_)) => {}
-      None => {
-        return Err(Error::Timeout(format!(
-          "decompressing did not finish within {}s",
-          timeout.as_secs()
-        )));
-      }
-    }
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::agent::tests::started;
-
-  #[test]
-  fn times_out_while_the_process_writes_to_stderr() {
-    let agent = started();
-    // Writes to stderr every 100ms for 5s, then exits 0.
-    let process = agent
-      .spawn(Exec {
-        argv: ["sh", "-c", "for i in $(seq 50); do echo $i >&2; sleep 0.1; done"]
-          .map(String::from)
-          .to_vec(),
-        ..Exec::default()
-      })
-      .unwrap();
-    let started = Instant::now();
-
-    let result = finish(&process, Duration::from_millis(500));
-
-    assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
-    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
-  }
 
   #[test]
   fn decompresses_the_layer_types_it_knows() {
