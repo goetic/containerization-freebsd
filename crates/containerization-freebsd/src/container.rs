@@ -7,9 +7,9 @@
 use crate::agent::{Agent, Exec, Process, Ran, Relay};
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
-use crate::quota::{self, Statistics};
 use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
+use crate::statistics::{self, Statistics};
 use crate::zfs::Zfs;
 use std::mem;
 use std::path::Path;
@@ -181,7 +181,7 @@ impl<'a> Container<'a> {
     let ran = self
       .agent
       .check(&scripts::DATASET_IO.argv(&[&self.dataset]), QUICK)?;
-    statistics.block_io = vec![quota::dataset_io(&self.dataset, &ran.stdout)?];
+    statistics.block_io = vec![statistics::dataset_io(&self.dataset, &ran.stdout)?];
 
     Ok(statistics)
   }

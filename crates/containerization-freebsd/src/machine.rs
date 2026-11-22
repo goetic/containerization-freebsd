@@ -5,7 +5,7 @@ use crate::agent::Agent;
 use crate::clock::ClockSync;
 use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]
-use crate::memory::Memory;
+use crate::kernel_messages::Memory;
 use crate::scripts;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use std::fs::File;
@@ -529,7 +529,7 @@ impl Machine {
   /// Returns the kernel message buffer, read from guest RAM, or why it
   /// couldn't be read.
   #[cfg(feature = "kernel-messages")]
-  pub fn kernel_messages(&self) -> Result<String, String> {
+  pub fn kernel_messages(&self) -> Result<String> {
     self.debug.memory.kernel_messages()
   }
 }

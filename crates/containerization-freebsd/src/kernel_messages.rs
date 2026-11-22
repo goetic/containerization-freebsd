@@ -10,12 +10,13 @@
 
 #![allow(unsafe_code)]
 
+use crate::error::{Error, Result};
 use crate::machine::on_queue;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use std::sync::{Arc, Mutex};
 use virtualization::{
   CustomVirtioDevice, CustomVirtioDeviceConfiguration, CustomVirtioDeviceConfigurationDelegate,
-  CustomVirtioDeviceDelegateProvider, Error,
+  CustomVirtioDeviceDelegateProvider,
 };
 
 /// Virtio device ID 21, the signal distribution device. FreeBSD has no driver
@@ -64,7 +65,7 @@ impl Default for Memory {
 }
 
 impl Memory {
-  pub fn configuration(&self) -> Result<CustomVirtioDeviceConfiguration, Error> {
+  pub fn configuration(&self) -> Result<CustomVirtioDeviceConfiguration, virtualization::Error> {
     let delegate: Arc<dyn CustomVirtioDeviceConfigurationDelegate> = self.created.clone();
     let configuration = CustomVirtioDeviceConfiguration::new()?;
 
@@ -78,14 +79,14 @@ impl Memory {
   }
 
   /// Returns the kernel message buffer, or why it couldn't be read.
-  pub fn kernel_messages(&self) -> Result<String, String> {
+  pub fn kernel_messages(&self) -> Result<String> {
     let device = self
       .created
       .device
       .lock()
       .unwrap_or_else(|poison| poison.into_inner())
       .clone()
-      .ok_or("Virtualization never created the memory device")?;
+      .ok_or_else(|| Error::Guest("Virtualization never created the memory device".to_string()))?;
 
     on_queue(&self.queue, || read(&device))
   }
@@ -116,7 +117,7 @@ fn word(bytes: &[u8], at: usize) -> Option<u32> {
 /// Probes for RAM, then scans it for `struct msgbuf` by `MSG_MAGIC`. The
 /// struct starts `msg_ptr` (8 bytes), `msg_magic`, `msg_size`, `msg_wseq`;
 /// `msgbufinit` puts the `msg_size`-byte buffer just before it.
-fn read(device: &CustomVirtioDevice) -> Result<String, String> {
+fn read(device: &CustomVirtioDevice) -> Result<String> {
   let mut ram = Vec::new();
   let mut address = 0;
 
@@ -128,7 +129,7 @@ fn read(device: &CustomVirtioDevice) -> Result<String, String> {
   }
 
   let (Some(&first), Some(&last)) = (ram.first(), ram.last()) else {
-    return Err("no guest RAM below 64 GiB".to_string());
+    return Err(Error::Guest("no guest RAM below 64 GiB".to_string()));
   };
   let end = last + PROBE_STEP;
   let mut found = Vec::new();
@@ -157,9 +158,9 @@ fn read(device: &CustomVirtioDevice) -> Result<String, String> {
   }
 
   if found.is_empty() {
-    Err(format!(
+    Err(Error::Guest(format!(
       "RAM spans {first:#x}..{end:#x}, but holds no kernel message buffer: the kernel never initialized one"
-    ))
+    )))
   } else {
     Ok(found.join("\n\n"))
   }

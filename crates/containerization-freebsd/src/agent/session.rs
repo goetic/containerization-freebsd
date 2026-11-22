@@ -2,7 +2,7 @@
 //! what the agent sends.
 
 use super::channel::{Stream, relay_accepted};
-use super::credit::{self, Credit};
+use super::console::{self, Credit};
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{CONTROL, Frame, Message, Mux, Side, VersionMismatch};
 use std::collections::HashMap;
@@ -74,7 +74,7 @@ impl Shared {
       changed: Condvar::new(),
     });
     let (events, queue) = mpsc::channel();
-    std::thread::spawn(move || credit::read(output, &credit, &events));
+    std::thread::spawn(move || console::read(output, &credit, &events));
     let handler = shared.clone();
     std::thread::spawn(move || handle(&queue, &handler));
 

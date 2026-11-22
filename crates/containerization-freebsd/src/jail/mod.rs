@@ -9,9 +9,9 @@ pub use network::{Interface, Network};
 use crate::agent::{Agent, Exec, Exit, Process, Ran, Relay};
 use crate::copy;
 use crate::error::{Error, Result};
-use crate::quota::{self, Statistics};
 use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
+use crate::statistics::{self, Statistics};
 use containerization_freebsd_protocol::{Address, Connect};
 use std::path::Path;
 use std::time::Duration;
@@ -121,7 +121,7 @@ impl<'a> Jail<'a> {
   /// resident. Over a limit, they're throttled or paged out. `stop` lifts the
   /// rules.
   pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Result<()> {
-    let rules = quota::rules(&self.name, cpus, memory_in_bytes);
+    let rules = rules(&self.name, cpus, memory_in_bytes);
     let mut args = vec![self.name.as_str()];
     args.extend(rules.iter().map(String::as_str));
 
@@ -152,11 +152,11 @@ impl<'a> Jail<'a> {
     let ran = self
       .agent
       .check(&["rctl", "-u", &format!("jail:{}", self.name)], QUICK)?;
-    let mut statistics = quota::statistics(&ran.stdout)?;
+    let mut statistics = statistics::rctl_usage(&ran.stdout)?;
     let ran = self
       .agent
       .check(&scripts::INTERFACES.argv(&[&self.name]), QUICK)?;
-    statistics.networks = quota::networks(&ran.stdout)?;
+    statistics.networks = statistics::networks(&ran.stdout)?;
 
     Ok(statistics)
   }
@@ -276,6 +276,20 @@ pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   steps.finish()
 }
 
+/// rctl(8) rules denying `jail` more than `cpus` CPUs (`pcpu`) and
+/// `memory_in_bytes` of resident memory (`memoryuse`).
+fn rules(jail: &str, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
+  let rule = |resource: &str, amount: Option<u64>| amount.map(|amount| format!("jail:{jail}:{resource}:deny={amount}"));
+
+  [
+    rule("pcpu", cpus.map(|cpus| u64::from(cpus) * 100)),
+    rule("memoryuse", memory_in_bytes),
+  ]
+  .into_iter()
+  .flatten()
+  .collect()
+}
+
 /// Keeps the first failure among steps that each run regardless.
 #[derive(Default)]
 struct Steps(Option<Error>);
@@ -297,6 +311,19 @@ impl Steps {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn makes_a_rule_for_each_limit_given() {
+    assert_eq!(
+      rules("web", Some(2), Some(256 << 20)),
+      ["jail:web:pcpu:deny=200", "jail:web:memoryuse:deny=268435456"]
+    );
+    assert_eq!(
+      rules("web", None, Some(1 << 30)),
+      ["jail:web:memoryuse:deny=1073741824"]
+    );
+    assert!(rules("web", None, None).is_empty());
+  }
 
   #[test]
   fn takes_every_step_and_keeps_the_first_failure() {

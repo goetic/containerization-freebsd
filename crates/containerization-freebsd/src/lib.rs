@@ -13,15 +13,15 @@ mod error;
 mod host;
 pub mod images;
 pub mod jail;
-pub mod machine;
 #[cfg(feature = "kernel-messages")]
-mod memory;
+mod kernel_messages;
+pub mod machine;
 pub mod oci;
 pub mod prepare;
-pub mod quota;
 pub mod release;
 mod scripts;
 pub mod socket;
+pub mod statistics;
 pub mod unpack;
 pub mod zfs;
 
@@ -33,7 +33,7 @@ pub use images::{Image, ImageStore};
 pub use jail::{Interface, Jail, Mount, Network};
 pub use machine::{Disk, Layout, Machine, Share};
 pub use prepare::{Upgrade, prepare};
-pub use quota::{DatasetIo, NetworkStatistics, Statistics};
 pub use socket::{Direction, SocketRelay, UnixSocket};
+pub use statistics::{DatasetIo, NetworkStatistics, Statistics};
 pub use unpack::{Unpacked, Unpacker};
 pub use zfs::Zfs;

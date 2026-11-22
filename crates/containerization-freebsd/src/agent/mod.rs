@@ -13,7 +13,7 @@
 //! deadlock the reader whose Received counts reopen it.
 
 mod channel;
-mod credit;
+mod console;
 mod session;
 
 pub(crate) use channel::Listener;
