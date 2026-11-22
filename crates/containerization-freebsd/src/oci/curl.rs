@@ -7,6 +7,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// curl's exit status when a response body is over `max-filesize`.
+const TOO_LARGE: i32 = 63;
+
 #[derive(Clone, Debug)]
 pub(super) enum Auth {
   None,
@@ -23,6 +26,9 @@ pub(super) struct Request<'a> {
   pub(super) upload: Option<&'a Path>,
   /// The file the response body is written to.
   pub(super) output: Option<&'a Path>,
+  /// The most bytes the response body may have. curl refuses a larger body
+  /// or stops downloading it.
+  pub(super) max_size: Option<u64>,
 }
 
 pub(super) struct Response {
@@ -40,6 +46,7 @@ impl<'a> Request<'a> {
       content_type: None,
       upload: None,
       output: None,
+      max_size: None,
     }
   }
 
@@ -73,6 +80,9 @@ impl<'a> Request<'a> {
     // The body goes to a file so stdout carries only the status code.
     let output = self.output.unwrap_or(Path::new("/dev/null"));
     config.option("output", &output.to_string_lossy());
+    if let Some(max_size) = self.max_size {
+      config.option("max-filesize", &max_size.to_string());
+    }
     if let Some(accept) = self.accept {
       config.option("header", &format!("Accept: {accept}"));
     }
@@ -104,7 +114,8 @@ impl Response {
 pub(super) fn send(request: &Request, auth: &Auth) -> Result<Response> {
   let headers = tempfile_path();
   let config = request.config(auth, &headers);
-  let result = run(&config, &format!("curl {} {}", request.method, request.url)).map(|status| Response {
+  let command = format!("curl {} {}", request.method, request.url);
+  let result = run(&config, &command, request.max_size).map(|status| Response {
     status,
     headers: last_headers(&std::fs::read_to_string(&headers).unwrap_or_default()),
   });
@@ -129,8 +140,9 @@ impl Config {
 }
 
 /// Runs curl with `config` on stdin and returns the HTTP status it printed.
-/// Errors name the request as `command`.
-fn run(config: &str, command: &str) -> Result<u16> {
+/// Errors name the request as `command`, and say when the response body was
+/// over `max_size` bytes.
+fn run(config: &str, command: &str, max_size: Option<u64>) -> Result<u16> {
   let failed = |failure: String| Error::Command {
     command: command.to_string(),
     failure,
@@ -150,6 +162,11 @@ fn run(config: &str, command: &str) -> Result<u16> {
   let output = child
     .wait_with_output()
     .map_err(|error| failed(error.to_string()))?;
+  if let (Some(max_size), Some(TOO_LARGE)) = (max_size, output.status.code()) {
+    return Err(Error::Guest(format!(
+      "{command}: the response body is over the {max_size}-byte limit"
+    )));
+  }
   if !output.status.success() {
     return Err(failed(format!(
       "exited {}: {}",

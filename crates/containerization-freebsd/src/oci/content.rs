@@ -152,7 +152,9 @@ impl ContentStore {
       .collect()
   }
 
-  fn commit(&self, partial: &Path, digest: &str) -> Result<()> {
+  /// Moves `partial`, a path from `partial()`, into the store as the blob
+  /// `digest`, which the caller has verified.
+  pub(crate) fn commit(&self, partial: &Path, digest: &str) -> Result<()> {
     let path = self.path(digest)?;
 
     std::fs::rename(partial, &path).map_err(Error::io(format!("moving blob {digest} into place")))

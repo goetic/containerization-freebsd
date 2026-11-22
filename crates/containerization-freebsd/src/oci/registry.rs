@@ -1,5 +1,5 @@
 use super::curl::{self, Auth, Request, Response};
-use super::{ContentStore, Descriptor, Reference, media_type, sha256_file, sha256_hex};
+use super::{ContentStore, Descriptor, Reference, media_type, sha256_digest, sha256_hex};
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::fmt;
@@ -75,7 +75,7 @@ impl RegistryClient {
 
   /// Fetches the manifest or index `target`, a tag or digest, from
   /// `reference`'s repository into `store`, verifying it if `target` is a
-  /// digest.
+  /// digest. A manifest over `MAX_MANIFEST` bytes is refused.
   pub fn fetch_manifest(&self, reference: &Reference, target: &str, store: &ContentStore) -> Result<Descriptor> {
     let partial = store.partial();
     let result = (|| {
@@ -84,13 +84,20 @@ impl RegistryClient {
         &format!("manifests/{target}"),
         Some(ACCEPT_MANIFESTS),
         &partial,
+        Some(MAX_MANIFEST),
       )?;
-      let (digest, size) = sha256_file(&partial)?;
+      // curl before 8.4 can't stop a download whose size the registry
+      // didn't send up front.
+      let size = std::fs::metadata(&partial)
+        .map_err(Error::io("reading a manifest"))?
+        .len();
       if size > MAX_MANIFEST {
-        return Err(Error::Invalid(format!(
+        return Err(Error::Guest(format!(
           "{reference}'s manifest {target} is {size} bytes, over the {MAX_MANIFEST}-byte limit"
         )));
       }
+      let bytes = std::fs::read(&partial).map_err(Error::io("reading a manifest"))?;
+      let digest = sha256_digest(&bytes);
       if sha256_hex(target).is_some() && digest != target {
         return Err(Error::Checksum {
           path: partial.clone(),
@@ -99,7 +106,6 @@ impl RegistryClient {
         });
       }
 
-      let bytes = std::fs::read(&partial).map_err(Error::io("reading a manifest"))?;
       let descriptor = Descriptor {
         media_type: media_type_of(response.header("content-type"), &bytes),
         digest,
@@ -107,7 +113,7 @@ impl RegistryClient {
         platform: None,
         annotations: Default::default(),
       };
-      store.ingest_file(&partial, &descriptor)?;
+      store.commit(&partial, &descriptor.digest)?;
       Ok(descriptor)
     })();
 
@@ -118,7 +124,7 @@ impl RegistryClient {
   pub fn fetch_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
     let partial = store.partial();
     let result = self
-      .get(reference, &format!("blobs/{}", descriptor.digest), None, &partial)
+      .get(reference, &format!("blobs/{}", descriptor.digest), None, &partial, None)
       .and_then(|_| store.ingest_file(&partial, descriptor));
 
     let _ = std::fs::remove_file(&partial);
@@ -199,11 +205,19 @@ impl RegistryClient {
   }
 
   /// GETs `path` under the repository into the file `body`, failing on any
-  /// status but 200.
-  fn get(&self, reference: &Reference, path: &str, accept: Option<&str>, body: &Path) -> Result<Response> {
+  /// status but 200. A body over `max_size` bytes is refused.
+  fn get(
+    &self,
+    reference: &Reference,
+    path: &str,
+    accept: Option<&str>,
+    body: &Path,
+    max_size: Option<u64>,
+  ) -> Result<Response> {
     let mut get = Request::new("GET", url(reference, path));
     get.accept = accept;
     get.output = Some(body);
+    get.max_size = max_size;
     let response = self.send(reference, &get, false)?;
 
     match response.status {
@@ -429,6 +443,7 @@ fn media_type_of(content_type: Option<&str>, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::oci::testing::FakeRegistry;
 
   #[test]
   fn reads_a_bearer_challenge() {
@@ -507,5 +522,58 @@ mod tests {
       media_type::DOCKER_MANIFEST
     );
     assert_eq!(media_type_of(None, br#"{"layers":[]}"#), media_type::MANIFEST);
+  }
+
+  #[test]
+  fn refuses_a_manifest_over_the_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(root.path()).unwrap();
+    let huge = vec![b' '; MAX_MANIFEST as usize + 1];
+    let registry = FakeRegistry::default()
+      .manifest("test/image", "1", media_type::MANIFEST, &huge)
+      .serve();
+    let reference = Reference::parse(&format!("{registry}/test/image:1")).unwrap();
+
+    let error = RegistryClient::default()
+      .fetch_manifest(&reference, "1", &store)
+      .unwrap_err();
+
+    assert!(
+      matches!(&error, Error::Guest(message) if message.ends_with("the response body is over the 4194304-byte limit")),
+      "{error}"
+    );
+    assert!(store.digests().unwrap().is_empty());
+    assert_eq!(
+      std::fs::read_dir(root.path().join("ingest"))
+        .unwrap()
+        .count(),
+      0
+    );
+  }
+
+  #[test]
+  fn fetches_a_manifest_once_and_names_its_type() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(root.path()).unwrap();
+    let index = br#"{"schemaVersion":2,"manifests":[]}"#;
+    let wrong = sha256_digest(b"something else");
+    let registry = FakeRegistry::default()
+      .manifest("test/image", "1", media_type::INDEX, index)
+      .manifest("test/image", &wrong, media_type::INDEX, index)
+      .serve();
+    let reference = Reference::parse(&format!("{registry}/test/image:1")).unwrap();
+    let client = RegistryClient::default();
+
+    let descriptor = client.fetch_manifest(&reference, "1", &store).unwrap();
+    assert_eq!(
+      (descriptor.media_type.as_str(), descriptor.size),
+      (media_type::INDEX, index.len() as u64)
+    );
+    assert_eq!(store.read(&descriptor.digest).unwrap(), index);
+    // Fetched by digest, a manifest must have that digest.
+    let error = client
+      .fetch_manifest(&reference, &wrong, &store)
+      .unwrap_err();
+    assert!(matches!(error, Error::Checksum { .. }), "{error}");
   }
 }
