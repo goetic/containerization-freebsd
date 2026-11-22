@@ -37,7 +37,7 @@ Pre-release.
 | `crates/containerization-freebsd-agent` | The guest agent. |
 | `crates/containerization-freebsd-sys` | The agent's system calls, its only unsafe code. |
 | `crates/containerization-freebsd-test` | The integration suite. |
-| `guest/` | The guest bundle: virtiofs patches, agent setup, and build scripts. |
+| `guest/` | The guest bundle: virtiofs patches, rc.d scripts for the agent and modules, and build scripts. |
 
 ## Development
 

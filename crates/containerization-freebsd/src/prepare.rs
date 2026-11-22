@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use virtualization::VirtualMachineState;
 
 /// The NoCloud seed's user-data, which nuageinit runs on the first boot.
-const FIRST_BOOT: &str = include_str!("../../../guest/first-boot.sh");
-/// The guest bundle's file name on the seed, where `FIRST_BOOT` expects it.
+const USER_DATA: &str = include_str!("scripts/user-data.sh");
+/// The guest bundle's file name on the seed, where `USER_DATA` expects it.
 const BUNDLE: &str = "bundle.tar.xz";
 /// The most boots to wait through. A first boot that upgrades reboots once,
 /// and the agent then starts again.
@@ -72,7 +72,7 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
 /// can succeed just before that reboot (see `power_off`), or end in
 /// `SessionEnded` and succeed on the next boot.
 fn wait_first_boot(machine: &Machine) -> Result<()> {
-  let wait = scripts::FIRST_BOOT.argv(&[]);
+  let wait = scripts::FIRST_BOOT_DONE.argv(&[]);
 
   for _ in 0..BOOTS {
     machine.wait_ready(Duration::from_secs(600))?;
@@ -134,7 +134,7 @@ fn seed(directory: &Path, staging: &Path, iso: &Path, bundle: &Path) -> Result<(
     format!("instance-id: freebsd-{instance}\nlocal-hostname: freebsd\n"),
   )
   .map_err(Error::io("writing meta-data"))?;
-  std::fs::write(&user, FIRST_BOOT).map_err(Error::io("writing user-data"))?;
+  std::fs::write(&user, USER_DATA).map_err(Error::io("writing user-data"))?;
 
   let result = image::seed(
     staging,

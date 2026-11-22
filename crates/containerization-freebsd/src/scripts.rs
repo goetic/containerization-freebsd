@@ -1,5 +1,7 @@
 //! Shell scripts the library runs in the guest. Each `scripts/*.sh` documents
 //! its positional parameters. Lint with `shellcheck src/scripts/*.sh`.
+//! `user-data.sh` has no constant here: `prepare` writes it to the seed for
+//! nuageinit to run.
 
 /// A script for the guest's sh(1).
 #[derive(Clone, Copy, Debug)]
@@ -21,7 +23,7 @@ pub(crate) const DATASET_IO: Script = Script(include_str!("scripts/dataset-io.sh
 pub(crate) const DECOMPRESS: Script = Script(include_str!("scripts/decompress.sh"));
 pub(crate) const DISK_DEVICE: Script = Script(include_str!("scripts/disk-device.sh"));
 pub(crate) const DROP: Script = Script(include_str!("scripts/drop.sh"));
-pub(crate) const FIRST_BOOT: Script = Script(include_str!("scripts/first-boot.sh"));
+pub(crate) const FIRST_BOOT_DONE: Script = Script(include_str!("scripts/first-boot-done.sh"));
 pub(crate) const GONE: Script = Script(include_str!("scripts/gone.sh"));
 pub(crate) const INTERFACES: Script = Script(include_str!("scripts/interfaces.sh"));
 pub(crate) const LEASE: Script = Script(include_str!("scripts/lease.sh"));

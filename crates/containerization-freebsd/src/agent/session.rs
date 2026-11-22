@@ -208,7 +208,7 @@ fn handle(queue: &Receiver<Event>, shared: &Arc<Shared>) {
     let mut state = shared.lock();
     let heard = match event {
       // Console text before a session usually explains why there is none,
-      // such as first-boot.sh failing.
+      // such as the seed's user-data script failing.
       Event::Read(bytes) => {
         if !state.mux.in_session() {
           echo(&mut line, &bytes);
