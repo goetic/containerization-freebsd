@@ -13,7 +13,6 @@ mod error;
 mod host;
 pub mod images;
 pub mod jail;
-pub mod lease;
 pub mod machine;
 #[cfg(feature = "kernel-messages")]
 mod memory;
