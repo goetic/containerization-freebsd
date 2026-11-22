@@ -96,7 +96,7 @@ struct DebugDevices {
 }
 
 fn url(path: &Path) -> Result<Url> {
-  Url::from_file_path(path).map_err(|()| Error::Guest(format!("{} is not absolute", path.display())))
+  Url::from_file_path(path).map_err(|()| Error::Invalid(format!("{} is not absolute", path.display())))
 }
 
 impl Layout {
@@ -517,5 +517,17 @@ impl Machine {
   #[cfg(feature = "kernel-messages")]
   pub fn kernel_messages(&self) -> Result<String, String> {
     self.debug.memory.kernel_messages()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn refuses_a_relative_path() {
+    let result = url(Path::new("disk.raw"));
+
+    assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
   }
 }
