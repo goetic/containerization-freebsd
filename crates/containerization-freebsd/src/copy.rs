@@ -4,11 +4,11 @@
 //! paths resolve as the jail sees them, and no symlink escapes it.
 //! Directories travel as tar streams, with the host's `tar` at the other end.
 
-use crate::agent::{Exec, Exit, Output, Process, Spawn};
+use crate::agent::{Exec, Exit, Process, Spawn};
 use crate::error::{Error, Result};
 use crate::jail::Jail;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -52,7 +52,7 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
       rescue: true,
       ..Exec::new(argv)
     })?;
-    feed(dd, &argv, &mut file, &source.display().to_string())?;
+    dd.feed(&mut file, &source.display().to_string(), &format!("{argv:?}"), None)?;
     // No `--`: chmod(1) parses no options after the mode, so it would be
     // taken as a file name.
     return check(jail, &["chmod", &format!("{mode:o}"), &target]);
@@ -74,7 +74,7 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
   let mut argv = vec!["tar", "--no-same-owner"];
   argv.extend(PORTABLE);
   argv.extend(["-x", "-f", "-", "-C", &target]);
-  let fed = feed(rescue(jail, &argv)?, &argv, &mut archive, "the host's tar");
+  let fed = rescue(jail, &argv)?.feed(&mut archive, "the host's tar", &format!("{argv:?}"), None);
   drop(archive);
 
   tar.finish().and(fed)
@@ -110,7 +110,7 @@ pub(crate) fn copy_out(jail: &Jail, source: &str, destination: &Path, create_par
       .open(destination)
       .map_err(Error::io(format!("creating {}", destination.display())))?;
     let argv = ["cat", "--", source];
-    let copied = finish(&rescue(jail, &argv)?, &argv, &mut file);
+    let copied = rescue(jail, &argv)?.finish(&format!("{argv:?}"), None, &mut file);
     if copied.is_err() {
       let _ = fs::remove_file(destination);
     }
@@ -133,7 +133,7 @@ pub(crate) fn copy_out(jail: &Jail, source: &str, destination: &Path, create_par
   let mut argv = vec!["tar"];
   argv.extend(PORTABLE);
   argv.extend(["-c", "-f", "-", "-C", source, "."]);
-  let copied = finish(&rescue(jail, &argv)?, &argv, &mut archive);
+  let copied = rescue(jail, &argv)?.finish(&format!("{argv:?}"), None, &mut archive);
   drop(archive);
 
   tar.finish().and(copied)
@@ -177,7 +177,7 @@ fn parent(path: &str) -> Option<&str> {
 fn kind(jail: &Jail, path: &str) -> Result<Kind> {
   let test = |primary: &str| -> Result<bool> {
     let argv = ["test", primary, path];
-    let (exit, _) = wait(&rescue(jail, &argv)?, &mut io::sink())?;
+    let exit = rescue(jail, &argv)?.wait(&mut io::sink(), &mut io::sink())?;
     Ok(exit == Exit::Code(0))
   };
 
@@ -201,51 +201,7 @@ fn rescue(jail: &Jail, argv: &[&str]) -> Result<Process> {
 }
 
 fn check(jail: &Jail, argv: &[&str]) -> Result<()> {
-  finish(&rescue(jail, argv)?, argv, &mut io::sink())
-}
-
-/// Streams `source` (`what` in errors) to the process's stdin, then waits for
-/// it to exit 0. If the process stops reading, its own failure is the error
-/// returned.
-fn feed(process: Process, argv: &[&str], source: &mut impl Read, what: &str) -> Result<()> {
-  let mut buffer = vec![0; 64 * 1024];
-  let sent = loop {
-    match source.read(&mut buffer) {
-      Ok(0) => break process.close_input(),
-      Ok(read) => {
-        if let Err(error) = process.write(&buffer[..read]) {
-          break Err(error);
-        }
-      }
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-      // Dropping the process kills it.
-      Err(error) => return Err(Error::io(format!("reading {what}"))(error)),
-    }
-  };
-
-  finish(&process, argv, &mut io::sink()).and(sent)
-}
-
-/// Waits for the process to exit 0, writing its stdout to `sink`.
-fn finish(process: &Process, argv: &[&str], sink: &mut impl Write) -> Result<()> {
-  match wait(process, sink)? {
-    (Exit::Code(0), _) => Ok(()),
-    (exit, stderr) => Err(Error::Guest(format!("{argv:?} exited {exit:?}: {}", stderr.trim_end()))),
-  }
-}
-
-/// Waits for the process to exit, writing its stdout to `sink`, and returns
-/// its exit and its stderr.
-fn wait(process: &Process, sink: &mut impl Write) -> Result<(Exit, String)> {
-  let mut stderr = Vec::new();
-
-  loop {
-    match process.recv()? {
-      Output::Stdout(bytes) => sink.write_all(&bytes).map_err(Error::io("copying out"))?,
-      Output::Stderr(bytes) => stderr.extend(bytes),
-      Output::Exited(exit) => return Ok((exit, String::from_utf8_lossy(&stderr).into_owned())),
-    }
-  }
+  rescue(jail, argv)?.finish(&format!("{argv:?}"), None, &mut io::sink())
 }
 
 /// The host's tar. Its stderr is drained while it runs so a full pipe can't

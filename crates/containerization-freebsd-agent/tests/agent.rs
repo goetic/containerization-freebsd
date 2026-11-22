@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-const PATIENCE: Duration = Duration::from_secs(10);
+/// Far longer than any of these tests' commands take.
+const TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
 /// SIGTERM has the same number on FreeBSD and macOS.
 const SIGTERM: i32 = 15;
@@ -104,7 +105,7 @@ impl Host {
     loop {
       let frame = self
         .frames
-        .recv_timeout(PATIENCE)
+        .recv_timeout(TIMEOUT)
         .expect("the agent sends a frame");
       match self
         .mux
@@ -570,7 +571,7 @@ fn a_new_session_kills_the_old_ones_processes() {
 
   let started = Instant::now();
   while running(&pid) {
-    assert!(started.elapsed() < PATIENCE, "process {pid} outlived its session");
+    assert!(started.elapsed() < TIMEOUT, "process {pid} outlived its session");
     std::thread::sleep(Duration::from_millis(20));
   }
   // Nothing from the old channel arrives in the new session.

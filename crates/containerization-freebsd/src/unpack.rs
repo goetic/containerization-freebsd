@@ -9,7 +9,6 @@ use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type, sha256_hex};
 use crate::scripts;
 use crate::zfs::Zfs;
-use std::io::Read;
 use std::time::Duration;
 
 /// Extracting a userland-sized layer takes about a minute.
@@ -142,33 +141,13 @@ impl<'a> Unpacker<'a> {
   fn receive(&self, image: &Image, layer: &Descriptor, staging: &str) -> Result<()> {
     let compression = compression(&layer.media_type)?;
     let path = image.content().path(&layer.digest)?;
-    let reading = || format!("reading {}", path.display());
-    let mut blob = std::fs::File::open(&path).map_err(Error::io(reading()))?;
+    let name = path.display().to_string();
+    let mut blob = std::fs::File::open(&path).map_err(Error::io(format!("reading {name}")))?;
     let process = self
       .agent
       .spawn(Exec::new(scripts::DECOMPRESS.argv(&[compression, staging])))?;
 
-    let written = (|| {
-      let mut buffer = vec![0; 1 << 20];
-      loop {
-        let read = blob.read(&mut buffer).map_err(Error::io(reading()))?;
-        if read == 0 {
-          break;
-        }
-        process.write(&buffer[..read])?;
-      }
-      process.close_input()
-    })();
-
-    match written {
-      Ok(()) => process.finish("decompressing", UNPACKING),
-      // A failed write usually means the decompressor exited early, and its
-      // error says why.
-      Err(error) => match process.finish("decompressing", QUICK) {
-        Err(failed @ Error::Guest(_)) => Err(failed),
-        _ => Err(error),
-      },
-    }
+    process.feed(&mut blob, &name, "decompressing", Some(UNPACKING))
   }
 }
 

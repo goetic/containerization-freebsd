@@ -344,7 +344,11 @@ fn write(jail: &Jail, path: &str, text: &str, append: bool) -> Result<()> {
   let process = jail.spawn(Exec::new(["/bin/sh", "-c", script, path]))?;
   process.write(text.as_bytes())?;
   process.close_input()?;
-  process.finish(&format!("writing {path} in jail {}", jail.name()), QUICK)
+  process.finish(
+    &format!("writing {path} in jail {}", jail.name()),
+    Some(QUICK),
+    &mut std::io::sink(),
+  )
 }
 
 fn stop(agent: &Agent, id: &str) -> Result<()> {

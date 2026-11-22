@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 /// The largest Data payload the host sends, so that channels take turns on
 /// the console.
 const CHUNK: usize = WINDOW / 2;
-/// The most `Relay::splice` reads from the host connection at once.
+/// The most `Relay::splice` and `Process::feed` read from the host at once.
 const READ: usize = 64 << 10;
 
 /// A process the agent runs. Dropping it before it exits kills it.
@@ -102,31 +102,97 @@ impl Process {
     self.next(Some(timeout))
   }
 
-  /// Waits up to `timeout` for the process to exit 0, discarding its stdout.
-  /// Errors name the process by `what` and carry its stderr.
-  pub(crate) fn finish(&self, what: &str, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let mut stderr = Vec::new();
-
+  /// Waits for the process to exit, writing its stdout to `stdout` and its
+  /// stderr to `stderr`, and returns how it exited.
+  pub fn wait(&self, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<Exit> {
     loop {
-      match self.recv_timeout(deadline.saturating_duration_since(Instant::now()))? {
-        Some(Output::Exited(Exit::Code(0))) => return Ok(()),
-        Some(Output::Exited(exit)) => {
-          return Err(Error::Guest(format!(
-            "{what} exited {exit:?}: {}",
-            String::from_utf8_lossy(&stderr).trim()
-          )));
-        }
-        Some(Output::Stderr(bytes)) => stderr.extend(bytes),
-        Some(Output::Stdout(_)) => {}
-        None => {
-          return Err(Error::Timeout(format!(
-            "{what} did not finish within {}s",
-            timeout.as_secs()
-          )));
-        }
+      if let Some(exit) = self.write_out(self.recv()?, stdout, stderr)? {
+        return Ok(exit);
       }
     }
+  }
+
+  /// Like `wait`, but returns `None` once `timeout` has passed in all,
+  /// however much output arrives meanwhile. Dropping the process then kills
+  /// it.
+  pub fn wait_timeout(
+    &self,
+    timeout: Duration,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+  ) -> Result<Option<Exit>> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+      let Some(output) = self.recv_timeout(deadline.saturating_duration_since(Instant::now()))? else {
+        return Ok(None);
+      };
+      if let Some(exit) = self.write_out(output, stdout, stderr)? {
+        return Ok(Some(exit));
+      }
+    }
+  }
+
+  /// Waits up to `timeout`, if given, for the process to exit 0, writing its
+  /// stdout to `stdout`. Errors describe the process by `what` and carry its
+  /// stderr.
+  pub(crate) fn finish(&self, what: &str, timeout: Option<Duration>, stdout: &mut dyn Write) -> Result<()> {
+    let mut stderr = Vec::new();
+    let exit = match timeout {
+      None => self.wait(stdout, &mut stderr)?,
+      Some(timeout) => self
+        .wait_timeout(timeout, stdout, &mut stderr)?
+        .ok_or_else(|| Error::Timeout(format!("{what} did not finish within {}s", timeout.as_secs())))?,
+    };
+
+    match exit {
+      Exit::Code(0) => Ok(()),
+      exit => Err(Error::Guest(format!(
+        "{what} exited {exit:?}: {}",
+        String::from_utf8_lossy(&stderr).trim()
+      ))),
+    }
+  }
+
+  /// Writes what it reads from `source` to the process's stdin, closes stdin,
+  /// and waits for the process to exit 0 as `finish` does, discarding its
+  /// stdout. If the process exits early, writing fails, and the process's
+  /// own failure is the error returned. Errors reading `source` name it
+  /// `source_what`.
+  pub(crate) fn feed(
+    &self,
+    source: &mut dyn Read,
+    source_what: &str,
+    what: &str,
+    timeout: Option<Duration>,
+  ) -> Result<()> {
+    let mut buffer = vec![0; READ];
+    let sent = loop {
+      match source.read(&mut buffer) {
+        Ok(0) => break self.close_input(),
+        Ok(read) => {
+          if let Err(error) = self.write(&buffer[..read]) {
+            break Err(error);
+          }
+        }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+        // The caller drops the process, which kills it.
+        Err(error) => return Err(Error::io(format!("reading {source_what}"))(error)),
+      }
+    };
+
+    self.finish(what, timeout, &mut io::sink()).and(sent)
+  }
+
+  /// Writes `output` to `stdout` or `stderr`, or returns the exit it reports.
+  fn write_out(&self, output: Output, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<Option<Exit>> {
+    let written = match output {
+      Output::Stdout(bytes) => stdout.write_all(&bytes),
+      Output::Stderr(bytes) => stderr.write_all(&bytes),
+      Output::Exited(exit) => return Ok(Some(exit)),
+    };
+    written.map_err(Error::io(format!("writing the output of {}", self.stream.what)))?;
+    Ok(None)
   }
 
   fn next(&self, timeout: Option<Duration>) -> Result<Option<Output>> {
@@ -372,6 +438,25 @@ mod tests {
   use crate::agent::Spawn;
   use crate::agent::tests::started;
 
+  /// Far longer than any of these tests' commands take.
+  const TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
+
+  #[test]
+  fn waits_for_the_exit_keeping_stdout_and_stderr_apart() {
+    let agent = started();
+    let process = agent
+      .spawn(Exec::new(["sh", "-c", "echo out; echo err >&2; exit 2"]))
+      .unwrap();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+
+    let exit = process.wait(&mut stdout, &mut stderr).unwrap();
+
+    assert_eq!(
+      (exit, stdout.as_slice(), stderr.as_slice()),
+      (Exit::Code(2), &b"out\n"[..], &b"err\n"[..])
+    );
+  }
+
   #[test]
   fn finish_times_out_while_the_process_writes_to_stderr() {
     let agent = started();
@@ -385,7 +470,7 @@ mod tests {
       .unwrap();
     let started = Instant::now();
 
-    let result = process.finish("writing", Duration::from_millis(500));
+    let result = process.finish("writing", Some(Duration::from_millis(500)), &mut io::sink());
 
     assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -397,11 +482,40 @@ mod tests {
     let process = agent
       .spawn(Exec::new(["sh", "-c", "echo out; echo broken >&2; exit 3"]))
       .unwrap();
+    let mut stdout = Vec::new();
 
-    let result = process.finish("writing", Duration::from_secs(10));
+    let result = process.finish("writing", TIMEOUT, &mut stdout);
 
     assert!(
       matches!(&result, Err(Error::Guest(message)) if message == "writing exited Code(3): broken"),
+      "{result:?}"
+    );
+    assert_eq!(stdout, b"out\n");
+  }
+
+  #[test]
+  fn feeds_a_reader_to_stdin() {
+    let agent = started();
+    let process = agent
+      .spawn(Exec::new(["sh", "-c", "[ $(wc -c) -eq 1000000 ]"]))
+      .unwrap();
+
+    process
+      .feed(&mut io::repeat(b'x').take(1_000_000), "the input", "counting", TIMEOUT)
+      .unwrap();
+  }
+
+  #[test]
+  fn reports_why_a_process_stopped_reading() {
+    let agent = started();
+    let process = agent
+      .spawn(Exec::new(["sh", "-c", "echo refused >&2; exit 3"]))
+      .unwrap();
+
+    let result = process.feed(&mut io::repeat(b'x').take(16 << 20), "the input", "refusing", TIMEOUT);
+
+    assert!(
+      matches!(&result, Err(Error::Guest(message)) if message == "refusing exited Code(3): refused"),
       "{result:?}"
     );
   }

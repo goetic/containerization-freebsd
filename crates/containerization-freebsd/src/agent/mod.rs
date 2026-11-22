@@ -78,30 +78,17 @@ pub trait Spawn {
     let process = self.spawn(exec)?;
     process.close_input()?;
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    // Dropping the process on a timeout kills it.
+    let exit = process
+      .wait_timeout(timeout, &mut stdout, &mut stderr)?
+      .ok_or_else(|| Error::Timeout(format!("{what} did not finish within {}s", timeout.as_secs())))?;
 
-    loop {
-      let left = timeout.saturating_sub(started.elapsed());
-
-      match process.recv_timeout(left)? {
-        Some(Output::Stdout(bytes)) => stdout.extend(bytes),
-        Some(Output::Stderr(bytes)) => stderr.extend(bytes),
-        Some(Output::Exited(exit)) => {
-          return Ok(Ran {
-            exit,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            seconds: started.elapsed().as_secs_f64(),
-          });
-        }
-        // Dropping the process kills it.
-        None => {
-          return Err(Error::Timeout(format!(
-            "{what} did not finish within {}s",
-            timeout.as_secs()
-          )));
-        }
-      }
-    }
+    Ok(Ran {
+      exit,
+      stdout: String::from_utf8_lossy(&stdout).into_owned(),
+      stderr: String::from_utf8_lossy(&stderr).into_owned(),
+      seconds: started.elapsed().as_secs_f64(),
+    })
   }
 
   /// Like `run`, but fails unless the command exits with status 0.
@@ -287,7 +274,8 @@ pub(crate) mod tests {
   use std::io::{Read, Write};
   use std::net::TcpListener;
 
-  const PATIENCE: Duration = Duration::from_secs(10);
+  /// Far longer than any of these tests' commands take.
+  const TIMEOUT: Duration = Duration::from_secs(10);
   const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
   /// FreeBSD and macOS use the same number for SIGTERM.
   const SIGTERM: i32 = 15;
@@ -304,7 +292,7 @@ pub(crate) mod tests {
   pub(crate) fn started() -> Agent {
     let (output, input) = serve();
     let agent = Agent::new(output, input);
-    agent.wait_ready(PATIENCE).expect("a session");
+    agent.wait_ready(TIMEOUT).expect("a session");
     agent
   }
 
@@ -313,7 +301,7 @@ pub(crate) mod tests {
     let mut output = String::new();
 
     while !output.contains(text) {
-      match process.recv_timeout(PATIENCE).unwrap() {
+      match process.recv_timeout(TIMEOUT).unwrap() {
         Some(Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
         other => panic!("{other:?} before {text:?}, after {output:?}"),
       }
@@ -327,7 +315,7 @@ pub(crate) mod tests {
     let mut output = String::new();
 
     loop {
-      match process.recv_timeout(PATIENCE).unwrap() {
+      match process.recv_timeout(TIMEOUT).unwrap() {
         Some(Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
         Some(Output::Exited(exit)) => return (output, exit),
         other => panic!("{other:?} after {output:?}"),
@@ -364,7 +352,7 @@ pub(crate) mod tests {
     let agent = Agent::new(output, input);
     agent.rejoin().unwrap();
 
-    agent.wait_ready(PATIENCE).expect("a session");
+    agent.wait_ready(TIMEOUT).expect("a session");
   }
 
   #[test]
@@ -373,7 +361,7 @@ pub(crate) mod tests {
     assert_eq!(agent.sessions(), 1);
 
     agent.rejoin().unwrap();
-    agent.wait_ready(PATIENCE).expect("a session");
+    agent.wait_ready(TIMEOUT).expect("a session");
 
     assert_eq!(agent.sessions(), 2);
   }
@@ -383,7 +371,7 @@ pub(crate) mod tests {
     let agent = started();
 
     let ran = agent
-      .run(&["sh", "-c", "echo out; echo err >&2; exit 2"], PATIENCE)
+      .run(&["sh", "-c", "echo out; echo err >&2; exit 2"], TIMEOUT)
       .unwrap();
 
     assert_eq!(ran.exit, Exit::Code(2));
@@ -396,7 +384,7 @@ pub(crate) mod tests {
     let agent = started();
 
     let error = agent
-      .check(&["sh", "-c", "echo why >&2; exit 1"], PATIENCE)
+      .check(&["sh", "-c", "echo why >&2; exit 1"], TIMEOUT)
       .unwrap_err();
 
     assert!(error.to_string().contains("why"), "{error}");
@@ -411,7 +399,7 @@ pub(crate) mod tests {
       .unwrap_err();
     assert!(matches!(error, Error::Timeout(_)), "{error}");
 
-    let ran = agent.check(&["echo", "next"], PATIENCE).unwrap();
+    let ran = agent.check(&["echo", "next"], TIMEOUT).unwrap();
     assert_eq!(ran.lines(), ["next"]);
   }
 
@@ -466,7 +454,7 @@ pub(crate) mod tests {
     let agent = started();
     let argument = "y".repeat(4 * WINDOW);
 
-    let ran = agent.check(&["printf", "%s", &argument], PATIENCE).unwrap();
+    let ran = agent.check(&["printf", "%s", &argument], TIMEOUT).unwrap();
 
     assert_eq!(ran.stdout, argument);
   }
@@ -514,7 +502,7 @@ pub(crate) mod tests {
 
     let started = Instant::now();
     while running(&pid) {
-      assert!(started.elapsed() < PATIENCE, "process {pid} outlived its handle");
+      assert!(started.elapsed() < TIMEOUT, "process {pid} outlived its handle");
       std::thread::sleep(Duration::from_millis(20));
     }
   }
