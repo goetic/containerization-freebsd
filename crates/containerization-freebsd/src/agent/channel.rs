@@ -145,13 +145,13 @@ impl Process {
         .ok_or_else(|| Error::Timeout(format!("{what} did not finish within {}s", timeout.as_secs())))?,
     };
 
-    match exit {
-      Exit::Code(0) => Ok(()),
-      exit => Err(Error::Guest(format!(
-        "{what} exited {exit:?}: {}",
-        String::from_utf8_lossy(&stderr).trim()
-      ))),
+    if exit.success() {
+      return Ok(());
     }
+    Err(Error::Guest(format!(
+      "{what} exited with {exit}: {}",
+      String::from_utf8_lossy(&stderr).trim()
+    )))
   }
 
   /// Writes what it reads from `source` to the process's stdin, closes stdin,
@@ -487,7 +487,7 @@ mod tests {
     let result = process.finish("writing", TIMEOUT, &mut stdout);
 
     assert!(
-      matches!(&result, Err(Error::Guest(message)) if message == "writing exited Code(3): broken"),
+      matches!(&result, Err(Error::Guest(message)) if message == "writing exited with status 3: broken"),
       "{result:?}"
     );
     assert_eq!(stdout, b"out\n");
@@ -515,7 +515,7 @@ mod tests {
     let result = process.feed(&mut io::repeat(b'x').take(16 << 20), "the input", "refusing", TIMEOUT);
 
     assert!(
-      matches!(&result, Err(Error::Guest(message)) if message == "refusing exited Code(3): refused"),
+      matches!(&result, Err(Error::Guest(message)) if message == "refusing exited with status 3: refused"),
       "{result:?}"
     );
   }

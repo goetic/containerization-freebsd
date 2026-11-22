@@ -6,7 +6,7 @@ mod network;
 pub use mount::Mount;
 pub use network::{Interface, Network};
 
-use crate::agent::{Agent, Exec, Exit, Process, QUICK, Ran, Relay, Spawn};
+use crate::agent::{Agent, Exec, Process, QUICK, Ran, Relay, Spawn};
 use crate::copy;
 use crate::error::{Error, Result};
 use crate::scripts;
@@ -76,7 +76,7 @@ impl<'a> Jail<'a> {
   pub fn find(agent: &'a Agent, name: &str) -> Result<Option<Self>> {
     let ran = agent.run(&["jls", "-j", name, "jid"], QUICK)?;
 
-    Ok((ran.exit == Exit::Code(0)).then(|| Self::running(agent, name)))
+    Ok(ran.exit.success().then(|| Self::running(agent, name)))
   }
 
   pub fn name(&self) -> &str {

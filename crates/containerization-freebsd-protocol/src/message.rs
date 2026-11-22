@@ -5,6 +5,7 @@
 
 use crate::codec::{Decode, DecodeError, Encode, Reader, Writer, encode};
 use crate::frame::Frame;
+use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
@@ -183,6 +184,24 @@ pub struct WindowSize {
 pub enum Exit {
   Code(i32),
   Signal(i32),
+}
+
+impl Exit {
+  /// Whether the process exited with status 0, like
+  /// `std::process::ExitStatus::success`.
+  pub fn success(self) -> bool {
+    self == Self::Code(0)
+  }
+}
+
+/// Formats as `status 1` or `signal 15`, to read after "exited with".
+impl fmt::Display for Exit {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Code(code) => write!(formatter, "status {code}"),
+      Self::Signal(signal) => write!(formatter, "signal {signal}"),
+    }
+  }
 }
 
 mod kind {
@@ -448,6 +467,16 @@ impl Decode for Exit {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn says_how_a_process_exited() {
+    assert!(Exit::Code(0).success());
+    assert!(!Exit::Code(1).success() && !Exit::Signal(15).success());
+    assert_eq!(
+      [Exit::Code(1).to_string(), Exit::Signal(15).to_string()],
+      ["status 1", "signal 15"]
+    );
+  }
 
   #[test]
   fn makes_an_exec_from_borrowed_or_owned_strings() {

@@ -142,7 +142,7 @@ impl<'a> Zfs<'a> {
   }
 
   fn succeeds(&self, argv: &[&str]) -> Result<bool> {
-    Ok(matches!(self.agent.run(argv, QUICK)?.exit, crate::Exit::Code(0)))
+    Ok(self.agent.run(argv, QUICK)?.exit.success())
   }
 }
 

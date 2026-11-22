@@ -116,8 +116,8 @@ impl<'a> Builder<'a> {
     }
 
     match exit? {
-      Exit::Code(0) => Ok(()),
-      exit => Err(Error::Guest(format!("the script exited {exit:?}"))),
+      exit if exit.success() => Ok(()),
+      exit => Err(Error::Guest(format!("the script exited with {exit}"))),
     }
   }
 }

@@ -101,18 +101,16 @@ pub trait Spawn {
     let what = described(&exec);
     let ran = self.run_exec(exec, timeout)?;
 
-    match ran.exit {
-      Exit::Code(0) => Ok(ran),
-      exit => {
-        let lines: Vec<&str> = ran.stderr.lines().collect();
-        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
-
-        Err(Error::Guest(format!(
-          "{what} exited {exit:?} after {:.1}s: {tail}",
-          ran.seconds
-        )))
-      }
+    if ran.exit.success() {
+      return Ok(ran);
     }
+    let lines: Vec<&str> = ran.stderr.lines().collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+
+    Err(Error::Guest(format!(
+      "{what} exited with {} after {:.1}s: {tail}",
+      ran.exit, ran.seconds
+    )))
   }
 }
 

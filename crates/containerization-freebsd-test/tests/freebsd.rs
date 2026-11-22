@@ -508,15 +508,11 @@ fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str
     let ran = jail
       .run(&["ping", "-c", "1", "-t", "5", gateway], TIMEOUT)
       .unwrap_or_else(|error| panic!("ping with {network:?}: {error}"));
-    assert_eq!(ran.exit == Exit::Code(0), reaches, "{network:?}: {ran:?}");
+    assert_eq!(ran.exit.success(), reaches, "{network:?}: {ran:?}");
     let ran = jail
       .run(&INTERNET, TIMEOUT)
       .unwrap_or_else(|error| panic!("connect out with {network:?}: {error}"));
-    assert_eq!(
-      ran.exit == Exit::Code(0),
-      reaches,
-      "{network:?} to the internet: {ran:?}"
-    );
+    assert_eq!(ran.exit.success(), reaches, "{network:?} to the internet: {ran:?}");
     // Stopping drops the jail's connection instead of leaving it in TIME_WAIT,
     // which would hold the jail for a minute.
     let stopping = Instant::now();
