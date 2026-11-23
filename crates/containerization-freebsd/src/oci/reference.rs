@@ -11,13 +11,10 @@ const LEGACY_DOCKER_HUB: &str = "index.docker.io";
 /// become `docker.io/library/alpine:latest`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Reference {
-  /// The registry, such as `ghcr.io` or `localhost:5000`.
-  pub domain: String,
-  /// The repository, such as `freebsd/freebsd-runtime`.
-  pub repository: String,
-  pub tag: Option<String>,
-  /// A digest such as `sha256:…`. Only sha256 is supported.
-  pub digest: Option<Digest>,
+  domain: String,
+  repository: String,
+  tag: Option<String>,
+  digest: Option<Digest>,
 }
 
 impl Reference {
@@ -84,6 +81,27 @@ impl Reference {
         .or_else(|| digest.is_none().then(|| "latest".to_string())),
       digest,
     })
+  }
+
+  /// The registry, such as `ghcr.io` or `localhost:5000`.
+  pub fn domain(&self) -> &str {
+    &self.domain
+  }
+
+  /// The repository, such as `freebsd/freebsd-runtime`.
+  pub fn repository(&self) -> &str {
+    &self.repository
+  }
+
+  /// The tag, which is `latest` if the reference has neither a tag nor a
+  /// digest.
+  pub fn tag(&self) -> Option<&str> {
+    self.tag.as_deref()
+  }
+
+  /// The digest, such as `sha256:…`. Only sha256 is supported.
+  pub fn digest(&self) -> Option<&Digest> {
+    self.digest.as_ref()
   }
 
   /// The manifest reference to request: the digest if set, else the tag.

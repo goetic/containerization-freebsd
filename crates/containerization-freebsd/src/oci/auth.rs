@@ -89,10 +89,10 @@ pub(super) fn token_url(
 ) -> Result<url::Url> {
   let realm = parameters
     .get("realm")
-    .ok_or_else(|| Error::Guest(format!("{} named no token realm: {challenge}", reference.domain)))?;
-  let scope = format!("repository:{}:{}", reference.repository, access.actions());
+    .ok_or_else(|| Error::Guest(format!("{} named no token realm: {challenge}", reference.domain())))?;
+  let scope = format!("repository:{}:{}", reference.repository(), access.actions());
   let mut url = url::Url::parse(realm)
-    .map_err(|error| Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain)))?;
+    .map_err(|error| Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain())))?;
 
   let mut query = url.query_pairs_mut();
   if let Some(service) = parameters.get("service") {

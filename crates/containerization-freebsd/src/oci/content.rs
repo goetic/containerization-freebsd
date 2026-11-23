@@ -189,13 +189,7 @@ mod tests {
     let partial = store.partial();
     let path = partial.path().to_path_buf();
     std::fs::write(&path, b"other").unwrap();
-    let descriptor = Descriptor {
-      media_type: super::super::media_type::LAYER.into(),
-      digest: Digest::of(b"blob"),
-      size: 4,
-      platform: None,
-      annotations: Default::default(),
-    };
+    let descriptor = Descriptor::new(super::super::media_type::LAYER, Digest::of(b"blob"), 4);
 
     let error = store.ingest_file(partial, &descriptor).unwrap_err();
 

@@ -2,17 +2,16 @@
 
 use super::{Image, ImageStore, check_runs, choose};
 use crate::error::{Error, Result};
-use crate::oci::{Credentials, Descriptor, Document, Platform, Reference, RegistryClient};
+use crate::oci::{Descriptor, Document, Platform, Reference, RegistryClient};
 
 impl ImageStore {
-  /// Pulls `reference`'s image for `platform`: the index if there is one,
-  /// and that platform's manifest, config and layers. The index or manifest
-  /// `reference` names is always fetched; anything else the store has is
-  /// not.
-  pub fn pull(&self, reference: &str, platform: &Platform, credentials: Option<Credentials>) -> Result<Image> {
+  /// Pulls `reference`'s image for `platform` through `client`: the index if
+  /// there is one, and that platform's manifest, config, and layers. The
+  /// index or manifest `reference` names is always fetched; anything else
+  /// the store has is not.
+  pub fn pull(&self, reference: &str, platform: &Platform, client: &RegistryClient) -> Result<Image> {
     let reference = Reference::parse(reference)?;
     let _blobs = self.using_blobs()?;
-    let client = RegistryClient::new(credentials);
     let top = client.fetch_manifest(&reference, reference.target(), &self.content)?;
 
     let manifest = match self.content.document(&top)? {
@@ -39,44 +38,39 @@ impl ImageStore {
     self.create(&reference.to_string(), top)
   }
 
-  /// Pushes the image `reference` to the repository it names, like
-  /// Containerization's `push(reference:platform:)`. Blobs the registry
-  /// lacks go first, then child manifests by digest, then the top-level
-  /// index or manifest, since registries may reject a manifest that
-  /// references unknown content. To push under another name, tag first.
+  /// Pushes the image `reference` to the repository it names through
+  /// `client`, like Containerization's `push(reference:platform:)`. Blobs
+  /// the registry lacks go first, then child manifests by digest, then the
+  /// top-level index or manifest, since registries may reject a manifest
+  /// that references unknown content. To push under another name, tag
+  /// first.
   ///
   /// With `platform`, an index is pushed as a new index of only that
   /// platform's manifests. Without it, the whole index is pushed, which needs
   /// every platform's manifest, and a pull fetches only one.
-  pub fn push(&self, reference: &str, platform: Option<&Platform>, credentials: Option<Credentials>) -> Result<()> {
-    let _blobs = self.using_blobs()?;
-    let image = self.get(reference)?;
-    let descriptor = self.for_platform(&image, platform)?;
+  pub fn push(&self, reference: &str, platform: Option<&Platform>, client: &RegistryClient) -> Result<()> {
     let reference = Reference::parse(reference)?;
-    let client = RegistryClient::new(credentials);
+    let _blobs = self.using_blobs()?;
+    let image = self.named(&reference)?;
+    let descriptor = self.for_platform(&image, platform)?;
 
-    self.push_children(&client, &reference, &descriptor)?;
+    self.push_children(client, &reference, &descriptor)?;
     client.push_manifest(&reference, reference.target(), &descriptor, &self.content)
   }
 
   /// The platforms `reference`'s image supports, like Containerization's
   /// `platforms(reference:)`. Uses the store's image of that name if there
-  /// is one, otherwise asks the registry without pulling layers.
-  pub fn platforms(&self, reference: &str, credentials: Option<Credentials>) -> Result<Vec<Platform>> {
+  /// is one, otherwise asks the registry through `client` without pulling
+  /// layers.
+  pub fn platforms(&self, reference: &str, client: &RegistryClient) -> Result<Vec<Platform>> {
     let reference = Reference::parse(reference)?;
-    let name = reference.to_string();
     let _blobs = self.using_blobs()?;
-    if let Some(image) = self
-      .list()?
-      .into_iter()
-      .find(|image| image.reference == name)
-    {
+    if let Some(image) = self.find(&reference)? {
       return self.platforms_of(&image.descriptor, None);
     }
 
-    let client = RegistryClient::new(credentials);
     let top = client.fetch_manifest(&reference, reference.target(), &self.content)?;
-    self.platforms_of(&top, Some((&client, &reference)))
+    self.platforms_of(&top, Some((client, &reference)))
   }
 
   /// An index's entries' platforms, skipping those with an `unknown` OS or
@@ -152,8 +146,9 @@ mod tests {
   fn pushes_images_that_pull_back() {
     let (pushed, pulled) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let store = ImageStore::new(pushed.path()).unwrap();
+    let client = RegistryClient::default();
     let image = store
-      .pull(&format!("{}/test/image:1", registry()), &Platform::default(), None)
+      .pull(&format!("{}/test/image:1", registry()), &Platform::default(), &client)
       .unwrap();
     let writable = FakeRegistry::default().serve();
 
@@ -161,10 +156,10 @@ mod tests {
     // index fails. Pushing for arm64 pushes a new index of that manifest.
     let whole = format!("{writable}/test/index:1");
     store.tag(&image.reference, &whole).unwrap();
-    let error = store.push(&whole, None, None).unwrap_err();
+    let error = store.push(&whole, None, &client).unwrap_err();
     assert!(error.to_string().contains("freebsd/amd64"), "{error}");
     store
-      .push(&whole, Some(&Platform::default()), None)
+      .push(&whole, Some(&Platform::default()), &client)
       .unwrap();
 
     // A single manifest, and an index of only that manifest, are pushed
@@ -183,20 +178,22 @@ mod tests {
       .create(&indexed, blob_of(&store, media_type::INDEX, &index))
       .unwrap();
     for name in [&single, &indexed, &single] {
-      store.push(name, Some(&Platform::default()), None).unwrap();
+      store
+        .push(name, Some(&Platform::default()), &client)
+        .unwrap();
     }
 
     let other = ImageStore::new(pulled.path()).unwrap();
     for name in [&single, &indexed] {
-      let back = other.pull(name, &Platform::default(), None).unwrap();
+      let back = other.pull(name, &Platform::default(), &client).unwrap();
       assert_eq!(back.descriptor.digest, store.get(name).unwrap().descriptor.digest);
       let config = back.config(&Platform::default()).unwrap();
       assert_eq!(config.config.unwrap().cmd, Some(vec!["/bin/sh".to_string()]));
     }
     assert!(other.get(&indexed).unwrap().descriptor.is_index());
-    let back = other.pull(&whole, &Platform::default(), None).unwrap();
+    let back = other.pull(&whole, &Platform::default(), &client).unwrap();
     assert_ne!(back.descriptor.digest, image.descriptor.digest);
-    assert_eq!(other.platforms(&whole, None).unwrap(), [Platform::default()]);
+    assert_eq!(other.platforms(&whole, &client).unwrap(), [Platform::default()]);
   }
 
   #[test]
@@ -212,15 +209,19 @@ mod tests {
       Platform::default(),
     ];
 
-    assert_eq!(store.platforms(&reference, None).unwrap(), both);
-    let image = store.pull(&reference, &Platform::default(), None).unwrap();
-    assert_eq!(store.platforms(&reference, None).unwrap(), both);
+    let client = RegistryClient::default();
+
+    assert_eq!(store.platforms(&reference, &client).unwrap(), both);
+    let image = store
+      .pull(&reference, &Platform::default(), &client)
+      .unwrap();
+    assert_eq!(store.platforms(&reference, &client).unwrap(), both);
 
     // A manifest's platform comes from its config.
     let (manifest, _) = image.manifest(&Platform::default()).unwrap();
     store.create("ghcr.io/test/single:1", manifest).unwrap();
     assert_eq!(
-      store.platforms("ghcr.io/test/single:1", None).unwrap(),
+      store.platforms("ghcr.io/test/single:1", &client).unwrap(),
       [Platform::default()]
     );
   }
@@ -231,7 +232,9 @@ mod tests {
     let store = ImageStore::new(root.path()).unwrap();
     let reference = format!("{}/test/image:1", registry());
 
-    let image = store.pull(&reference, &Platform::default(), None).unwrap();
+    let image = store
+      .pull(&reference, &Platform::default(), &RegistryClient::default())
+      .unwrap();
 
     assert_eq!(image.reference, reference);
     assert!(image.descriptor.is_index());
@@ -253,7 +256,11 @@ mod tests {
     };
 
     let error = store
-      .pull(&format!("{}/test/image:1", registry()), &riscv, None)
+      .pull(
+        &format!("{}/test/image:1", registry()),
+        &riscv,
+        &RegistryClient::default(),
+      )
       .unwrap_err();
 
     assert!(error.to_string().contains("freebsd/amd64, freebsd/arm64"), "{error}");

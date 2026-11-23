@@ -4,16 +4,37 @@
 use super::auth::Auth;
 use crate::error::{Error, Result};
 use crate::scratch::Scratch;
+use std::fmt;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use url::Url;
 
 /// curl's exit status when a response body is over `max-filesize`.
 const TOO_LARGE: i32 = 63;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Method {
+  Get,
+  Head,
+  Post,
+  Put,
+}
+
+impl fmt::Display for Method {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(match self {
+      Self::Get => "GET",
+      Self::Head => "HEAD",
+      Self::Post => "POST",
+      Self::Put => "PUT",
+    })
+  }
+}
+
 pub(super) struct Request<'a> {
-  pub(super) method: &'a str,
-  pub(super) url: String,
+  pub(super) method: Method,
+  pub(super) url: Url,
   pub(super) accept: Option<&'a str>,
   pub(super) content_type: Option<&'a str>,
   /// The file sent as the request body.
@@ -32,7 +53,7 @@ pub(super) struct Response {
 }
 
 impl<'a> Request<'a> {
-  pub(super) fn new(method: &'a str, url: String) -> Self {
+  pub(super) fn new(method: Method, url: Url) -> Self {
     Self {
       method,
       url,
@@ -50,7 +71,7 @@ impl<'a> Request<'a> {
   fn config(&self, auth: &Auth, headers: &Path) -> String {
     let mut config = Config::default();
 
-    config.option("url", &self.url);
+    config.option("url", self.url.as_str());
     config.option("dump-header", &headers.to_string_lossy());
     config.flag("location");
     config.flag("silent");
@@ -58,16 +79,16 @@ impl<'a> Request<'a> {
     config.option("retry", "3");
     config.option("write-out", "%{http_code}");
     match (self.method, self.upload) {
-      ("HEAD", _) => config.flag("head"),
-      (_, Some(upload)) => {
+      (Method::Head, _) => config.flag("head"),
+      (method, Some(upload)) => {
         config.option("upload-file", &upload.to_string_lossy());
-        config.option("request", self.method);
+        config.option("request", &method.to_string());
         // An empty Expect header stops curl waiting for 100 Continue.
         config.option("header", "Expect:");
       }
-      ("GET", None) => {}
+      (Method::Get, None) => {}
       (method, None) => {
-        config.option("request", method);
+        config.option("request", &method.to_string());
         config.option("data-binary", "");
       }
     }
@@ -220,7 +241,10 @@ mod tests {
 
   #[test]
   fn writes_curls_config_for_an_upload() {
-    let mut put = Request::new("PUT", "https://ghcr.io/v2/a/b/blobs/uploads/1".to_string());
+    let mut put = Request::new(
+      Method::Put,
+      Url::parse("https://ghcr.io/v2/a/b/blobs/uploads/1").unwrap(),
+    );
     put.content_type = Some("application/octet-stream");
     put.upload = Some(Path::new("/blob"));
 

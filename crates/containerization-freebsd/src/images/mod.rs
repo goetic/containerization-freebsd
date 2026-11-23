@@ -71,12 +71,9 @@ impl ImageStore {
       }
     };
     let all = index.manifests.len();
-    index.manifests.retain(|manifest| {
-      manifest
-        .platform
-        .as_ref()
-        .is_some_and(|other| platform.runs(other))
-    });
+    index
+      .manifests
+      .retain(|manifest| manifest.runs_on(platform));
     if index.manifests.is_empty() {
       return Err(Error::Invalid(format!(
         "{} has no image for {platform}",
@@ -90,11 +87,12 @@ impl ImageStore {
     let bytes =
       serde_json::to_vec(&index).map_err(|error| Error::Invalid(format!("an index for {platform}: {error}")))?;
     Ok(Descriptor {
-      media_type: image.descriptor.media_type.clone(),
-      digest: self.content.ingest(&bytes)?,
-      size: bytes.len() as u64,
-      platform: None,
       annotations: image.descriptor.annotations.clone(),
+      ..Descriptor::new(
+        image.descriptor.media_type.clone(),
+        self.content.ingest(&bytes)?,
+        bytes.len() as u64,
+      )
     })
   }
 
@@ -129,13 +127,26 @@ impl ImageStore {
   }
 
   pub fn get(&self, reference: &str) -> Result<Image> {
-    let reference = Reference::parse(reference)?.to_string();
+    self.named(&Reference::parse(reference)?)
+  }
 
+  /// The image named `reference`.
+  fn named(&self, reference: &Reference) -> Result<Image> {
     self
-      .list()?
-      .into_iter()
-      .find(|image| image.reference == reference)
+      .find(reference)?
       .ok_or_else(|| Error::Invalid(format!("the store has no image {reference}")))
+  }
+
+  /// The image named `reference`, if the store has one.
+  fn find(&self, reference: &Reference) -> Result<Option<Image>> {
+    let name = reference.to_string();
+
+    Ok(
+      self
+        .list()?
+        .into_iter()
+        .find(|image| image.reference == name),
+    )
   }
 
   pub fn list(&self) -> Result<Vec<Image>> {
@@ -175,7 +186,7 @@ impl ImageStore {
 
     let _collecting = self.lock(BLOBS_LOCK, File::lock)?;
     let _index = self.lock(INDEX_LOCK, File::lock)?;
-    let needed = self.reachable(&self.read_index()?)?;
+    let needed = self.reachable(&self.read_index()?.manifests)?;
     for digest in self.content.digests()? {
       if !needed.contains(&digest) {
         self.content.delete(&digest)?;
@@ -184,11 +195,12 @@ impl ImageStore {
     Ok(())
   }
 
-  /// Every blob reachable from `index`. Indexes and manifests the store
-  /// lacks are skipped, but configs and layers are included either way.
-  fn reachable(&self, index: &Index) -> Result<BTreeSet<Digest>> {
+  /// Every blob reachable from `roots`, the roots included. Indexes and
+  /// manifests the store lacks are skipped, but configs and layers are
+  /// included either way.
+  fn reachable(&self, roots: &[Descriptor]) -> Result<BTreeSet<Digest>> {
     let mut needed = BTreeSet::new();
-    let mut pending: Vec<Descriptor> = index.manifests.clone();
+    let mut pending = roots.to_vec();
 
     while let Some(descriptor) = pending.pop() {
       if !self.content.has(&descriptor.digest) || !needed.insert(descriptor.digest.clone()) {
@@ -281,13 +293,7 @@ impl Image {
 
 /// The first manifest in `reference`'s index that runs on `platform`.
 fn choose(index: &Index, platform: &Platform, reference: &impl Display) -> Result<Descriptor> {
-  let runs = |entry: &&Descriptor| {
-    entry
-      .platform
-      .as_ref()
-      .is_some_and(|other| platform.runs(other))
-  };
-  if let Some(chosen) = index.manifests.iter().find(runs) {
+  if let Some(chosen) = index.manifests.iter().find(|entry| entry.runs_on(platform)) {
     return Ok(chosen.clone());
   }
 
@@ -325,16 +331,13 @@ fn ref_name(entry: &Descriptor) -> Option<&String> {
 mod tests {
   use super::*;
   use crate::oci::testing::FakeRegistry;
-  use crate::oci::{RootFs, RunConfig, media_type};
+  use crate::oci::{RegistryClient, RootFs, RunConfig, media_type};
   use std::time::Duration;
 
   pub(super) fn descriptor(media_type: &str, bytes: &[u8], platform: Option<Platform>) -> Descriptor {
     Descriptor {
-      media_type: media_type.into(),
-      digest: Digest::of(bytes),
-      size: bytes.len() as u64,
       platform,
-      annotations: Default::default(),
+      ..Descriptor::new(media_type, Digest::of(bytes), bytes.len() as u64)
     }
   }
 
@@ -401,7 +404,9 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let store = ImageStore::new(root.path()).unwrap();
     let reference = format!("{}/test/image:1", registry());
-    store.pull(&reference, &Platform::default(), None).unwrap();
+    store
+      .pull(&reference, &Platform::default(), &RegistryClient::default())
+      .unwrap();
     let blobs = store.content().digests().unwrap().len();
 
     store.tag(&reference, "ghcr.io/test/other:2").unwrap();
@@ -419,7 +424,9 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let store = ImageStore::new(root.path()).unwrap();
     let reference = format!("{}/test/image:1", registry());
-    store.pull(&reference, &Platform::default(), None).unwrap();
+    store
+      .pull(&reference, &Platform::default(), &RegistryClient::default())
+      .unwrap();
     // Simulate a pull in progress: take the shared blobs lock, then write a
     // manifest blob that no entry in index.json references yet.
     let pulling = store.using_blobs().unwrap();

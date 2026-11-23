@@ -4,7 +4,7 @@
 //! images pulled, unpacked into ZFS and run; and a build-sized workload on a
 //! share. Run them through `bin/dev/test-integration`, which signs them.
 
-use containerization_freebsd::oci::{ContentStore, Descriptor, Digest, Platform, media_type};
+use containerization_freebsd::oci::{ContentStore, Descriptor, Digest, Platform, RegistryClient, media_type};
 use containerization_freebsd::{
   Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
   Jail, Limit, Mac, Machine, Mount, Network, Output, Parents, Process, Resource, Share, Spawn, Step, UnixSocket,
@@ -1175,13 +1175,11 @@ fn gzip(bytes: &[u8], work: &Path) -> Vec<u8> {
 
 /// Stores `bytes` as a blob of `media_type` and returns its descriptor.
 fn blob(content: &ContentStore, media_type: &str, bytes: &[u8]) -> Descriptor {
-  Descriptor {
-    media_type: media_type.into(),
-    digest: content.ingest(bytes).expect("store a blob"),
-    size: bytes.len() as u64,
-    platform: None,
-    annotations: Default::default(),
-  }
+  Descriptor::new(
+    media_type,
+    content.ingest(bytes).expect("store a blob"),
+    bytes.len() as u64,
+  )
 }
 
 #[test]
@@ -1190,7 +1188,11 @@ fn pulls_unpacks_and_runs_oci_images() {
   let platform = Platform::default();
   let store = ImageStore::new(&cache().join("images")).expect("open the image store");
   let runtime = store
-    .pull("ghcr.io/freebsd/freebsd-runtime:15.1", &platform, None)
+    .pull(
+      "ghcr.io/freebsd/freebsd-runtime:15.1",
+      &platform,
+      &RegistryClient::default(),
+    )
     .expect("pull FreeBSD's runtime image");
   let whiteouts = layers_an_image_on_the_runtime(&work, &store, &runtime, &platform);
 

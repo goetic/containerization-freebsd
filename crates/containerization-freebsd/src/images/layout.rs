@@ -3,6 +3,7 @@
 use super::{Image, ImageStore, LAYOUT};
 use crate::error::{Error, Result};
 use crate::oci::{BLOBS, Descriptor, Digest, Document, Index, Platform, REF_NAME, blob_path, parse};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -31,11 +32,8 @@ impl ImageStore {
           .cloned()
           .ok_or_else(|| Error::Invalid(format!("{} has an image with no {REF_NAME}", path.display())))?;
         self.import(directory, &descriptor)?;
-        let alone = Index {
-          manifests: vec![descriptor.clone()],
-          ..Index::default()
-        };
-        if let Some(missing) = self.missing(&alone)? {
+        let needed = self.reachable(std::slice::from_ref(&descriptor))?;
+        if let Some(missing) = self.missing(&needed) {
           return Err(Error::Invalid(format!(
             "{} lacks blob {missing} of {name}",
             directory.display()
@@ -57,11 +55,8 @@ impl ImageStore {
       .iter()
       .map(|reference| self.for_platform(&self.get(reference)?, platform))
       .collect::<Result<Vec<_>>>()?;
-    let index = Index {
-      manifests,
-      ..Index::default()
-    };
-    if let Some(missing) = self.missing(&index)? {
+    let needed = self.reachable(&manifests)?;
+    if let Some(missing) = self.missing(&needed) {
       return Err(Error::Invalid(format!(
         "the store lacks blob {missing} of {references:?}"
       )));
@@ -69,13 +64,16 @@ impl ImageStore {
 
     let blobs = out.join(BLOBS);
     std::fs::create_dir_all(&blobs).map_err(Error::io(format!("making {}", blobs.display())))?;
-    for digest in self.reachable(&index)? {
-      let saved = blob_path(out, &digest)?;
+    for digest in &needed {
+      let saved = blob_path(out, digest)?;
       if !saved.exists() {
-        std::fs::copy(self.content.path(&digest)?, &saved)
-          .map_err(Error::io(format!("writing {}", saved.display())))?;
+        std::fs::copy(self.content.path(digest)?, &saved).map_err(Error::io(format!("writing {}", saved.display())))?;
       }
     }
+    let index = Index {
+      manifests,
+      ..Index::default()
+    };
     let index = serde_json::to_vec(&index).map_err(|error| Error::Invalid(format!("an index to save: {error}")))?;
     for (name, bytes) in [("oci-layout", LAYOUT.as_bytes()), ("index.json", &index)] {
       let partial = out.join(format!("{name}.partial"));
@@ -121,15 +119,11 @@ impl ImageStore {
     }
   }
 
-  /// A blob reachable from `index` that the store lacks. Missing manifests
-  /// aren't reported, since a pull fetches only one platform's manifest.
-  fn missing(&self, index: &Index) -> Result<Option<Digest>> {
-    Ok(
-      self
-        .reachable(index)?
-        .into_iter()
-        .find(|digest| !self.content.has(digest)),
-    )
+  /// A blob in `needed`, as `reachable` returns it, that the store lacks.
+  /// Missing manifests aren't reported, since `reachable` skips them: a pull
+  /// fetches only one platform's manifest.
+  fn missing<'a>(&self, needed: &'a BTreeSet<Digest>) -> Option<&'a Digest> {
+    needed.iter().find(|digest| !self.content.has(digest))
   }
 }
 
@@ -137,7 +131,7 @@ impl ImageStore {
 mod tests {
   use super::*;
   use crate::images::tests::{descriptor, documents, json, registry};
-  use crate::oci::media_type;
+  use crate::oci::{RegistryClient, media_type};
   use std::path::PathBuf;
 
   #[test]
@@ -149,7 +143,9 @@ mod tests {
     );
     let store = ImageStore::new(pulled.path()).unwrap();
     let reference = format!("{}/test/image:1", registry());
-    store.pull(&reference, &Platform::default(), None).unwrap();
+    store
+      .pull(&reference, &Platform::default(), &RegistryClient::default())
+      .unwrap();
     store.tag(&reference, "ghcr.io/test/other:2").unwrap();
     let layout = work.path().join("layout");
 
@@ -194,7 +190,12 @@ mod tests {
       image.descriptor.digest,
       store.get(&reference).unwrap().descriptor.digest
     );
-    assert_eq!(saved.platforms(&reference, None).unwrap(), [Platform::default()]);
+    assert_eq!(
+      saved
+        .platforms(&reference, &RegistryClient::default())
+        .unwrap(),
+      [Platform::default()]
+    );
   }
 
   /// Writes an OCI image layout at `root` holding the blobs `files`, with an

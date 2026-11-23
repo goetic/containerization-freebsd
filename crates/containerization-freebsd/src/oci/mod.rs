@@ -55,6 +55,22 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
+  /// A descriptor with no platform or annotations.
+  pub fn new(media_type: impl Into<String>, digest: Digest, size: u64) -> Self {
+    Self {
+      media_type: media_type.into(),
+      digest,
+      size,
+      platform: None,
+      annotations: BTreeMap::new(),
+    }
+  }
+
+  /// Whether this names a platform whose images run on `platform`.
+  pub fn runs_on(&self, platform: &Platform) -> bool {
+    self.platform.as_ref().is_some_and(|own| platform.runs(own))
+  }
+
   /// Whether this names an image index or a Docker manifest list.
   pub fn is_index(&self) -> bool {
     matches!(

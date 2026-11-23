@@ -1,11 +1,12 @@
 use super::auth::{Access, Auth, Credentials, Secret, TokenResponse, parse_challenge, token_url};
-use super::curl::{self, Request, Response};
+use super::curl::{self, Method, Request, Response};
 use super::{ContentStore, Descriptor, Digest, Reference, media_type};
 use crate::error::{Error, Result};
 use crate::scratch::Scratch;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
+use url::Url;
 
 /// 4 MiB: the distribution spec says registries should accept manifests at
 /// least this large.
@@ -63,13 +64,7 @@ impl RegistryClient {
       });
     }
 
-    let descriptor = Descriptor {
-      media_type: media_type_of(response.header("content-type"), &bytes),
-      digest,
-      size,
-      platform: None,
-      annotations: Default::default(),
-    };
+    let descriptor = Descriptor::new(media_type_of(response.header("content-type"), &bytes), digest, size);
     store.commit(partial, &descriptor.digest)?;
     Ok(descriptor)
   }
@@ -91,38 +86,36 @@ impl RegistryClient {
   /// blob.
   pub fn push_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
     let path = format!("blobs/{}", descriptor.digest);
-    let head = Request::new("HEAD", url(reference, &path));
+    let head = Request::new(Method::Head, url(reference, &path)?);
     match self.send(reference, &head, Access::Push)?.status {
       200 => return Ok(()),
       404 => {}
       status => return Err(unexpected(&head, status, None)),
     }
 
-    let post = Request::new("POST", url(reference, "blobs/uploads/"));
+    let post = Request::new(Method::Post, url(reference, "blobs/uploads/")?);
     let started = self.send(reference, &post, Access::Push)?;
     let location = started
       .header("location")
       .filter(|_| started.status == 202)
       .ok_or_else(|| unexpected(&post, started.status, None))?;
-    let mut upload = url::Url::parse(&post.url)
-      .and_then(|base| base.join(location))
-      .map_err(|error| {
-        Error::Guest(format!(
-          "{} gave the upload location {location:?}: {error}",
-          reference.domain
-        ))
-      })?;
+    let mut upload = post.url.join(location).map_err(|error| {
+      Error::Guest(format!(
+        "{} gave the upload location {location:?}: {error}",
+        reference.domain()
+      ))
+    })?;
     upload
       .query_pairs_mut()
       .append_pair("digest", descriptor.digest.as_str());
 
     let blob = store.path(&descriptor.digest)?;
-    let mut put = Request::new("PUT", upload.to_string());
+    let mut put = Request::new(Method::Put, upload);
     put.content_type = Some("application/octet-stream");
     put.upload = Some(&blob);
     // Credentials go only to the registry, not to an upload location on
     // another origin such as a storage service.
-    let response = if same_origin(&post.url, &put.url) {
+    let response = if post.url.origin() == put.url.origin() {
       self.send(reference, &put, Access::Push)?
     } else {
       curl::send(&put, &Auth::None)?
@@ -144,7 +137,7 @@ impl RegistryClient {
   ) -> Result<()> {
     let document = store.path(&descriptor.digest)?;
     let response_body = Scratch::temporary();
-    let mut put = Request::new("PUT", url(reference, &format!("manifests/{target}")));
+    let mut put = Request::new(Method::Put, url(reference, &format!("manifests/{target}"))?);
     put.content_type = Some(&descriptor.media_type);
     put.upload = Some(&document);
     put.output = Some(response_body.path());
@@ -165,7 +158,7 @@ impl RegistryClient {
     body: &Path,
     max_size: Option<u64>,
   ) -> Result<Response> {
-    let mut get = Request::new("GET", url(reference, path));
+    let mut get = Request::new(Method::Get, url(reference, path)?);
     get.accept = accept;
     get.output = Some(body);
     get.max_size = max_size;
@@ -181,7 +174,7 @@ impl RegistryClient {
   /// WWW-Authenticate challenge asks and retries once. The token's scope
   /// grants `access`.
   fn send(&self, reference: &Reference, request: &Request, access: Access) -> Result<Response> {
-    let key = (format!("{}/{}", reference.api_host(), reference.repository), access);
+    let key = (format!("{}/{}", reference.api_host(), reference.repository()), access);
     let cached = self
       .tokens
       .lock()
@@ -211,24 +204,24 @@ impl RegistryClient {
         .credentials
         .clone()
         .map(Auth::Basic)
-        .ok_or_else(|| Error::Invalid(format!("{} wants an account", reference.domain))),
+        .ok_or_else(|| Error::Invalid(format!("{} wants an account", reference.domain()))),
       "bearer" => {
         let url = token_url(reference, key.1, challenge, &parameters)?;
         self.fetch_token(reference, key, &url).map(Auth::Bearer)
       }
       _ => Err(Error::Invalid(format!(
         "{} asks for {scheme} authentication, which isn't supported",
-        reference.domain
+        reference.domain()
       ))),
     }
   }
 
   /// Fetches a bearer token from `url`, with basic auth if there are
   /// credentials, and caches it under `key`.
-  fn fetch_token(&self, reference: &Reference, key: &(String, Access), url: &url::Url) -> Result<Secret> {
+  fn fetch_token(&self, reference: &Reference, key: &(String, Access), url: &Url) -> Result<Secret> {
     let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
     let body = Scratch::temporary();
-    let mut get = Request::new("GET", url.to_string());
+    let mut get = Request::new(Method::Get, url.clone());
     get.output = Some(body.path());
     let response = curl::send(&get, &auth)?;
     let bytes = std::fs::read(body.path()).unwrap_or_default();
@@ -243,7 +236,7 @@ impl RegistryClient {
     let token: Secret = token
       .token
       .or(token.access_token)
-      .ok_or_else(|| Error::Guest(format!("{} sent no token", reference.domain)))?
+      .ok_or_else(|| Error::Guest(format!("{} sent no token", reference.domain())))?
       .into();
     self
       .tokens
@@ -255,17 +248,15 @@ impl RegistryClient {
 }
 
 /// The `/v2/<repository>/<path>` URL.
-fn url(reference: &Reference, path: &str) -> String {
+fn url(reference: &Reference, path: &str) -> Result<Url> {
   let scheme = if reference.is_loopback() { "http" } else { "https" };
+  let url = format!(
+    "{scheme}://{}/v2/{}/{path}",
+    reference.api_host(),
+    reference.repository()
+  );
 
-  format!("{scheme}://{}/v2/{}/{path}", reference.api_host(), reference.repository)
-}
-
-fn same_origin(one: &str, other: &str) -> bool {
-  match (url::Url::parse(one), url::Url::parse(other)) {
-    (Ok(one), Ok(other)) => one.origin() == other.origin(),
-    _ => false,
-  }
+  Url::parse(&url).map_err(|error| Error::Invalid(format!("{url:?} is not a URL: {error}")))
 }
 
 /// The error for an unexpected `status`, quoting the start of `body`.
@@ -339,6 +330,18 @@ mod tests {
       "{debugged}"
     );
     assert_eq!(Secret::from("hunter2").to_string(), "********");
+  }
+
+  #[test]
+  fn refuses_a_registry_that_makes_no_url() {
+    let reference = Reference::parse("localhost:abc/a").unwrap();
+
+    let error = url(&reference, "tags/list").unwrap_err();
+
+    assert!(
+      matches!(&error, Error::Invalid(message) if message.contains("localhost:abc")),
+      "{error}"
+    );
   }
 
   #[test]
