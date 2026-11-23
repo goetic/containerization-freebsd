@@ -11,7 +11,6 @@ use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
-use virtualization::VirtualMachineState;
 
 /// Tunables for `/efi/freebsd/loader.env`. Apple's virtio-net rejects the
 /// checksum offload and multiqueue features vtnet(4) negotiates, and vtnet then
@@ -112,10 +111,8 @@ fn power_off(machine: &Machine) -> Result<()> {
     let started = Instant::now();
 
     while machine.agent.sessions() == sessions {
-      match machine.state() {
-        VirtualMachineState::Stopped => return Ok(()),
-        VirtualMachineState::Error => return Err(Error::Guest("the machine stopped with an error".to_string())),
-        _ => {}
+      if machine.stopped()? {
+        return Ok(());
       }
       if started.elapsed() >= POWER_OFF {
         return Err(Error::Timeout(format!(

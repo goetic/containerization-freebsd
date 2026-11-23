@@ -391,15 +391,14 @@ pub(crate) fn on_queue<T: Send>(queue: &DispatchQueue, work: impl FnOnce() -> T 
 type Done = Box<dyn FnOnce(Result<(), virtualization::Error>) + Send>;
 
 impl Machine {
-  /// Runs `operation` on the machine's queue, waits for its completion
-  /// handler, and returns the elapsed seconds.
+  /// Runs `operation` on the machine's queue and waits for its completion
+  /// handler.
   fn completed(
     &self,
     action: &str,
     operation: impl FnOnce(&VirtualMachine, Done) -> Result<(), virtualization::Error> + Send,
-  ) -> Result<f64> {
+  ) -> Result<()> {
     let (sender, receiver) = mpsc::channel();
-    let started = Instant::now();
     let machine = &self.machine;
 
     on_queue(&self.queue, || {
@@ -415,41 +414,39 @@ impl Machine {
     receiver
       .recv()
       .map_err(|_| Error::Guest(format!("{action}: Virtualization dropped the completion handler")))?
-      .map_err(Error::virtualization(action))?;
-
-    Ok(started.elapsed().as_secs_f64())
+      .map_err(Error::virtualization(action))
   }
 
-  pub fn start(&self) -> Result<f64> {
+  pub fn start(&self) -> Result<()> {
     self.completed("start", |machine, done| {
       machine.start(done);
       Ok(())
     })
   }
 
-  pub fn pause(&self) -> Result<f64> {
-    let seconds = self.completed("pause", |machine, done| {
+  pub fn pause(&self) -> Result<()> {
+    self.completed("pause", |machine, done| {
       machine.pause(done);
       Ok(())
     })?;
     self.clock.set_paused(true);
-    Ok(seconds)
+    Ok(())
   }
 
   /// Resumes the machine and syncs the guest's clock, which fell behind while
   /// the machine was paused.
-  pub fn resume(&self) -> Result<f64> {
-    let seconds = self.completed("resume", |machine, done| {
+  pub fn resume(&self) -> Result<()> {
+    self.completed("resume", |machine, done| {
       machine.resume(done);
       Ok(())
     })?;
     self.clock.set_paused(false);
     let _ = self.agent.sync_clock();
-    Ok(seconds)
+    Ok(())
   }
 
   /// Stops the VM without a guest shutdown, like pulling its power.
-  pub fn force_stop(&self) -> Result<f64> {
+  pub fn force_stop(&self) -> Result<()> {
     self.completed("stop", |machine, done| {
       machine.stop(done);
       Ok(())
@@ -463,8 +460,7 @@ impl Machine {
   /// A share mounted across a save goes stale: the host's virtio-fs server
   /// restarts with the restored machine and forgets the files the guest
   /// cached, so each cached file fails once.
-  pub fn save(&self, path: &Path) -> Result<f64> {
-    let started = Instant::now();
+  pub fn save(&self, path: &Path) -> Result<()> {
     let url = url(path)?;
 
     self
@@ -473,8 +469,7 @@ impl Machine {
     self.pause()?;
     self.completed("save the machine's state", |machine, done| {
       machine.save_machine_state_to(&url, done)
-    })?;
-    Ok(started.elapsed().as_secs_f64())
+    })
   }
 
   /// Returns the guest device of the disk with `identifier`, such as
@@ -505,15 +500,14 @@ impl Machine {
   /// Restores a state written by `save` into this machine, which must have the
   /// same layout and not have started. The machine stays paused; on resume,
   /// the guest's agent answers the Hello this sends.
-  pub fn restore(&self, path: &Path) -> Result<f64> {
+  pub fn restore(&self, path: &Path) -> Result<()> {
     let url = url(path)?;
 
-    let seconds = self.completed("restore the machine's state", |machine, done| {
+    self.completed("restore the machine's state", |machine, done| {
       machine.restore_machine_state_from(&url, done)
     })?;
     self.clock.set_paused(true);
-    self.agent.rejoin()?;
-    Ok(seconds)
+    self.agent.rejoin()
   }
 
   pub fn state(&self) -> VirtualMachineState {
@@ -522,11 +516,11 @@ impl Machine {
     on_queue(&self.queue, || machine.state())
   }
 
-  /// Waits for a session with the guest's agent and returns the elapsed
-  /// seconds. With NAT, also waits for the default route and its interface's
-  /// link: rc adds the route after starting the agent, and a restored
-  /// machine's link comes up after the agent answers.
-  pub fn wait_ready(&self, timeout: Duration) -> Result<f64> {
+  /// Waits for a session with the guest's agent. With NAT, also waits for the
+  /// default route and its interface's link: rc adds the route after starting
+  /// the agent, and a restored machine's link comes up after the agent
+  /// answers.
+  pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
     let started = Instant::now();
 
     self.agent.wait_ready(timeout)?;
@@ -544,31 +538,39 @@ impl Machine {
         result => result?,
       };
     }
-    Ok(started.elapsed().as_secs_f64())
+    Ok(())
   }
 
   /// Asks the guest to power off and waits for it to stop.
-  pub fn shut_down(&self, timeout: Duration) -> Result<f64> {
+  pub fn shut_down(&self, timeout: Duration) -> Result<()> {
     self.agent.launch(&["shutdown", "-p", "now"])?;
     self.wait_stopped(timeout)
   }
 
   /// Waits for the guest to power itself off.
-  pub fn wait_stopped(&self, timeout: Duration) -> Result<f64> {
+  pub fn wait_stopped(&self, timeout: Duration) -> Result<()> {
     let started = Instant::now();
 
     while started.elapsed() < timeout {
-      match self.state() {
-        VirtualMachineState::Stopped => return Ok(started.elapsed().as_secs_f64()),
-        VirtualMachineState::Error => return Err(Error::Guest("the machine stopped with an error".to_string())),
-        _ => std::thread::sleep(Duration::from_millis(100)),
+      if self.stopped()? {
+        return Ok(());
       }
+      std::thread::sleep(Duration::from_millis(100));
     }
 
     Err(Error::Timeout(format!(
       "the guest did not stop within {}s",
       timeout.as_secs()
     )))
+  }
+
+  /// Whether the machine has stopped. Fails if it stopped with an error.
+  pub(crate) fn stopped(&self) -> Result<bool> {
+    match self.state() {
+      VirtualMachineState::Stopped => Ok(true),
+      VirtualMachineState::Error => Err(Error::Guest("the machine stopped with an error".to_string())),
+      _ => Ok(false),
+    }
   }
 
   /// Returns the kernel message buffer, read from guest RAM, or why it
