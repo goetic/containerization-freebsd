@@ -4,8 +4,8 @@ use std::path::PathBuf;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-  /// A host tool (`curl`, `hdiutil`, `diskutil`, `cp`, `tar`)
-  /// failed, or a registry answered with an HTTP error.
+  /// A host tool (`curl` or `tar`) failed, or a registry answered with an
+  /// HTTP error.
   Command {
     command: String,
     failure: String,

@@ -10,6 +10,7 @@ pub mod container;
 mod copy;
 mod digest;
 mod error;
+mod fat;
 mod host;
 pub mod images;
 pub mod jail;

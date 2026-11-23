@@ -1,4 +1,4 @@
-//! Tools the library runs on the host, such as curl(1) and hdiutil(1).
+//! Tools the library runs on the host, such as curl(1).
 
 use crate::error::{Error, Result};
 use std::process::Command;

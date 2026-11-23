@@ -4,12 +4,11 @@
 use crate::Machine;
 use crate::agent::Spawn;
 use crate::error::{Error, Result};
-use crate::host::run;
+use crate::fat::Volume;
 use crate::machine::Layout;
 use crate::scripts;
 use std::fs::File;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Tunables for `/efi/freebsd/loader.env`. Apple's virtio-net rejects the
@@ -18,6 +17,8 @@ use std::time::{Duration, Instant};
 /// tunables stop it requesting them. `kern.racct.enable` turns on the resource
 /// accounting that rctl limits and jail statistics need.
 const LOADER_ENV: &str = "hw.vtnet.csum_disable=1\nhw.vtnet.mq_disable=1\nkern.racct.enable=1\n";
+/// The NoCloud seed's volume label, which nuageinit looks for.
+const SEED_LABEL: [u8; 11] = *b"CIDATA     ";
 /// The NoCloud seed's user-data, which nuageinit runs on the first boot.
 const USER_DATA: &str = include_str!("scripts/user-data.sh");
 /// The guest bundle's file name on the seed, where `USER_DATA` expects it.
@@ -49,15 +50,14 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
 
   let disk = directory.join("disk.raw");
   clone(base, &disk, size)?;
-  write_loader_env(&disk, &directory.join("esp"), LOADER_ENV)?;
+  write_loader_env(&disk)?;
 
-  let iso = directory.join("seed.iso");
-  let staging = directory.join("seed");
-  seed(directory, &staging, &iso, bundle)?;
+  let seed = directory.join("seed.img");
+  write_seed(&seed, bundle)?;
 
   let mut layout = Layout::first(directory, disk)?;
   layout.nat = upgrade == Upgrade::Latest;
-  layout.seed = Some(iso.clone());
+  layout.seed = Some(seed.clone());
 
   let machine = layout.machine("containerization-freebsd-prepare")?;
   machine.start()?;
@@ -65,8 +65,7 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
   power_off(&machine)?;
   drop(machine);
 
-  let _ = std::fs::remove_dir_all(&staging);
-  let _ = std::fs::remove_file(&iso);
+  let _ = std::fs::remove_file(&seed);
   layout.nat = false;
   layout.seed = None;
 
@@ -128,35 +127,40 @@ fn power_off(machine: &Machine) -> Result<()> {
   )))
 }
 
-fn seed(directory: &Path, staging: &Path, iso: &Path, bundle: &Path) -> Result<()> {
-  let meta = directory.join("meta-data");
-  let user = directory.join("user-data");
+/// Writes the NoCloud seed `image`: a FAT volume labelled `SEED_LABEL` that
+/// holds the meta-data, the user-data, and `bundle`.
+fn write_seed(image: &Path, bundle: &Path) -> Result<()> {
   let instance = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |since| since.as_secs());
+  let meta_data = format!("instance-id: freebsd-{instance}\nlocal-hostname: freebsd\n");
+  let reading = || format!("reading {}", bundle.display());
+  let mut bundle = File::open(bundle).map_err(Error::io(reading()))?;
+  let bundle_size = bundle.metadata().map_err(Error::io(reading()))?.len();
 
-  std::fs::write(
-    &meta,
-    format!("instance-id: freebsd-{instance}\nlocal-hostname: freebsd\n"),
-  )
-  .map_err(Error::io("writing meta-data"))?;
-  std::fs::write(&user, USER_DATA).map_err(Error::io("writing user-data"))?;
-
-  let result = seed_volume(
-    staging,
-    iso,
-    &[("meta-data", &meta), ("user-data", &user), (BUNDLE, bundle)],
-  );
-  let _ = std::fs::remove_file(&meta);
-  let _ = std::fs::remove_file(&user);
-  result
+  let seed = Volume::create(
+    image,
+    SEED_LABEL,
+    (meta_data.len() + USER_DATA.len()) as u64 + bundle_size,
+  )?;
+  seed.write("meta-data", &mut meta_data.as_bytes())?;
+  seed.write("user-data", &mut USER_DATA.as_bytes())?;
+  seed.write(BUNDLE, &mut bundle)?;
+  seed.finish()
 }
 
-/// Makes `destination` an APFS clone of `base` (`clonefile(2)` via `cp -c`),
-/// grown to at least `size` bytes for the guest to expand into.
+/// Makes `destination` a copy of `base`, grown to at least `size` bytes for
+/// the guest to expand into. On APFS, `std::fs::copy` makes the copy a clone
+/// with fclonefileat(2), which shares `base`'s blocks until either changes.
 fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
+  // fclonefileat refuses a destination that exists, and std::fs::copy would
+  // then copy every byte.
   let _ = std::fs::remove_file(destination);
-  run(Command::new("cp").arg("-c").arg(base).arg(destination))?;
+  std::fs::copy(base, destination).map_err(Error::io(format!(
+    "copying {} to {}",
+    base.display(),
+    destination.display()
+  )))?;
 
   let growing = || format!("growing {}", destination.display());
   let file = File::options()
@@ -170,78 +174,12 @@ fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
   Ok(())
 }
 
-/// Writes `/efi/freebsd/loader.env` on the disk's ESP. loader.efi(8) sets
-/// these variables before reading `loader.conf` and passes them to the
-/// kernel as tunables. The ESP is FAT, so macOS can mount it without root.
-fn write_loader_env(disk: &Path, mount_point: &Path, contents: &str) -> Result<()> {
-  let attached = run(
-    Command::new("hdiutil")
-      .args(["attach", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage"])
-      .arg(disk),
-  )?;
-  let whole = attached
-    .split_whitespace()
-    .next()
-    .ok_or_else(|| Error::Guest(format!("hdiutil attached nothing of {}", disk.display())))?
-    .to_string();
+/// Writes `LOADER_ENV` to `/efi/freebsd/loader.env` on the disk's EFI system
+/// partition. loader.efi(8) sets these variables before reading
+/// `loader.conf` and passes them to the kernel as tunables.
+fn write_loader_env(disk: &Path) -> Result<()> {
+  let esp = Volume::esp(disk)?;
 
-  let written = (|| {
-    let partition = attached
-      .lines()
-      .find(|line| line.split_whitespace().nth(1) == Some("EFI"))
-      .and_then(|line| line.split_whitespace().next())
-      .ok_or_else(|| Error::Guest(format!("no EFI partition among:\n{attached}")))?;
-
-    std::fs::create_dir_all(mount_point).map_err(Error::io(format!("making {}", mount_point.display())))?;
-    run(
-      Command::new("diskutil")
-        .args(["mount", "-mountPoint"])
-        .arg(mount_point)
-        .arg(partition),
-    )?;
-
-    let directory = mount_point.join("efi/freebsd");
-    let result = std::fs::create_dir_all(&directory)
-      .and_then(|()| std::fs::write(directory.join("loader.env"), contents))
-      .map_err(Error::io("writing loader.env"));
-
-    run(Command::new("diskutil").arg("unmount").arg(mount_point))?;
-    result
-  })();
-
-  run(Command::new("hdiutil").arg("detach").arg(&whole))?;
-  written
-}
-
-/// Builds the cloud-init NoCloud seed volume `iso`, labelled `cidata`, via
-/// the staging `directory`. `files` maps names on the volume to host files.
-fn seed_volume(directory: &Path, iso: &Path, files: &[(&str, &Path)]) -> Result<()> {
-  let _ = std::fs::remove_dir_all(directory);
-  let _ = std::fs::remove_file(iso);
-  std::fs::create_dir_all(directory).map_err(Error::io(format!("making {}", directory.display())))?;
-
-  for (name, source) in files {
-    let target = directory.join(name);
-
-    std::fs::hard_link(source, &target)
-      .or_else(|_| std::fs::copy(source, &target).map(|_| ()))
-      .map_err(Error::io(format!("putting {} on the seed volume", source.display())))?;
-  }
-
-  run(
-    Command::new("hdiutil")
-      .args([
-        "makehybrid",
-        "-quiet",
-        "-iso",
-        "-joliet",
-        "-default-volume-name",
-        "cidata",
-        "-o",
-      ])
-      .arg(iso)
-      .arg(directory),
-  )?;
-
-  Ok(())
+  esp.write("efi/freebsd/loader.env", &mut LOADER_ENV.as_bytes())?;
+  esp.finish()
 }

@@ -11,7 +11,7 @@ exec >/dev/ttyV0.0 2>&1
 
 seed=/media/cfbsd-seed
 mkdir -p "$seed"
-mount -t cd9660 /dev/iso9660/[cC][iI][dD][aA][tT][aA] "$seed"
+mount -t msdosfs -o ro /dev/msdosfs/[cC][iI][dD][aA][tT][aA] "$seed"
 tar -xf "$seed/bundle.tar.xz" -C /
 umount "$seed"
 rmdir "$seed"

@@ -119,7 +119,9 @@ pub struct Layout {
   pub memory: u64,
   /// Attach a NAT network device with `mac`, as `vtnet0`.
   pub nat: bool,
-  /// A read-only volume attached after the disk, such as a NoCloud seed.
+  /// A volume attached after the disk, such as a NoCloud seed. It is
+  /// writable because nuageinit mounts a FAT seed read-write, which fails on
+  /// a read-only device.
   pub seed: Option<PathBuf>,
   /// Disks attached after the seed, in this order.
   pub disks: Vec<Disk>,
@@ -267,7 +269,7 @@ impl Layout {
     let mut devices = vec![block_device(&self.disk, false, "the disk")?];
 
     if let Some(seed) = &self.seed {
-      devices.push(block_device(seed, true, "the seed")?);
+      devices.push(block_device(seed, false, "the seed")?);
     }
     for disk in &self.disks {
       VirtioBlockDeviceConfiguration::validate_block_device_identifier(&disk.identifier)
