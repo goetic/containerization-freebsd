@@ -18,8 +18,6 @@ use std::time::{Duration, Instant};
 /// The largest Data payload the host sends, so that channels take turns on
 /// the console.
 const CHUNK: usize = WINDOW / 2;
-/// The most `Relay::splice` and `Process::feed` read from the host at once.
-const READ: usize = 64 << 10;
 
 /// A process the agent runs. Dropping it before it exits kills it.
 pub struct Process {
@@ -166,19 +164,14 @@ impl Process {
     what: &str,
     timeout: Option<Duration>,
   ) -> Result<()> {
-    let mut buffer = vec![0; READ];
-    let sent = loop {
-      match source.read(&mut buffer) {
-        Ok(0) => break self.close_input(),
-        Ok(read) => {
-          if let Err(error) = self.write(&buffer[..read]) {
-            break Err(error);
-          }
-        }
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+    let sent = match io::copy(source, &mut &*self) {
+      Ok(_) => self.close_input(),
+      // Only writing to the process wraps an `Error`.
+      Err(error) => match error.downcast::<Error>() {
+        Ok(error) => Err(error),
         // The caller drops the process, which kills it.
         Err(error) => return Err(Error::io(format!("reading {source_what}"))(error)),
-      }
+      },
     };
 
     self.finish(what, timeout, &mut io::sink()).and(sent)
@@ -280,22 +273,36 @@ impl Relay {
       })
     };
 
-    let mut from_local = local;
-    let mut buffer = vec![0; READ];
-    loop {
-      match from_local.read(&mut buffer) {
-        Ok(0) => break,
-        Ok(read) => {
-          if relay.write(&buffer[..read]).is_err() {
-            break;
-          }
-        }
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-        Err(_) => break,
-      }
-    }
+    // Either end failing ends this direction.
+    let _ = io::copy(&mut &local, &mut &*relay);
     let _ = relay.close_write();
     let _ = back.join();
+  }
+}
+
+/// Writes to the process's stdin, as `Process::write` does. A failed write's
+/// `io::Error` wraps the crate's `Error`.
+impl Write for &Process {
+  fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+    Process::write(self, bytes).map_err(io::Error::other)?;
+    Ok(bytes.len())
+  }
+
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+/// Writes to the connection, as `Relay::write` does. A failed write's
+/// `io::Error` wraps the crate's `Error`.
+impl Write for &Relay {
+  fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+    Relay::write(self, bytes).map_err(io::Error::other)?;
+    Ok(bytes.len())
+  }
+
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
   }
 }
 
@@ -503,6 +510,27 @@ mod tests {
     process
       .feed(&mut io::repeat(b'x').take(1_000_000), "the input", "counting", TIMEOUT)
       .unwrap();
+  }
+
+  #[test]
+  fn reports_a_source_it_cannot_read() {
+    struct Unreadable;
+
+    impl Read for Unreadable {
+      fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other("the disk is gone"))
+      }
+    }
+
+    let agent = started();
+    let process = agent.spawn(Exec::new(["cat"])).unwrap();
+
+    let result = process.feed(&mut Unreadable, "the input", "copying", TIMEOUT);
+
+    assert!(
+      matches!(&result, Err(Error::Io { action, .. }) if action == "reading the input"),
+      "{result:?}"
+    );
   }
 
   #[test]
