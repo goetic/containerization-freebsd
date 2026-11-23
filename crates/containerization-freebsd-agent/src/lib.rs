@@ -6,6 +6,7 @@
 //! pair; the binary passes it `/dev/ttyV0.0`.
 
 mod listener;
+mod pipe;
 mod process;
 mod relay;
 mod session;

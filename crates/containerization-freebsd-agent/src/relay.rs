@@ -2,12 +2,14 @@
 //! guest socket with Connect; the agent opens one with Accepted for each
 //! connection to a socket it listens on.
 
-use crate::session::{Handle, Input, Outbox, READ};
+use crate::pipe::{Stopped, read_chunks, write_until_eof};
+use crate::session::{Handle, Input, Outbox};
 use crate::sys::{self, SocketAddress};
 use containerization_freebsd_protocol::{Address, Connect, Message};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -34,73 +36,46 @@ pub(crate) fn connect(connect: &Connect, outbox: Outbox) -> io::Result<Handle> {
     }
   };
 
-  start(connection, outbox)
+  Ok(start(connection, outbox))
 }
 
-/// Relays `connection` on the channel `outbox` sends on.
-pub(crate) fn start(connection: Connection, outbox: Outbox) -> io::Result<Handle> {
-  let (reader, writer) = (connection.try_clone()?, connection.try_clone()?);
-
+/// Relays `connection` on the channel `outbox` sends on. The two threads and
+/// the handle share the connection, as std's streams allow.
+pub(crate) fn start(connection: Connection, outbox: Outbox) -> Handle {
+  let connection = Arc::new(connection);
   let (input, inputs) = mpsc::channel();
-  thread::spawn(move || forward(writer, &inputs));
-  thread::spawn(move || back(reader, &outbox));
+  let (writer, reader) = (connection.clone(), connection.clone());
+  thread::spawn(move || forward(&writer, &inputs));
+  thread::spawn(move || back(&reader, &outbox));
 
-  Ok(Handle::Relay { input, connection })
+  Handle::Relay { input, connection }
 }
 
 /// Writes the host's Data to the connection, and at its Eof half-closes the
 /// connection.
-fn forward(mut connection: Connection, inputs: &Receiver<Input>) {
-  for input in inputs {
-    match input {
-      Input::Data(bytes) => {
-        // The peer closed or reset the connection: the rest of the Data has
-        // nowhere to go.
-        if connection.write_all(&bytes).is_err() {
-          return;
-        }
-      }
-      Input::Eof => {
-        let _ = connection.shutdown(Shutdown::Write);
-        return;
-      }
-    }
+fn forward(connection: &Connection, inputs: &Receiver<Input>) {
+  let mut writer = connection;
+  if write_until_eof(&mut writer, inputs) {
+    let _ = connection.shutdown(Shutdown::Write);
   }
 }
 
 /// Sends what the connection reads as Data, then Eof. Sends Error instead if
 /// reading fails.
-fn back(mut connection: Connection, outbox: &Outbox) {
-  let mut buffer = vec![0; READ];
-
-  loop {
-    match connection.read(&mut buffer) {
-      Ok(0) => {
-        outbox.send(Message::Eof);
-        return;
-      }
-      Ok(read) => {
-        if !outbox.send(Message::Data(buffer[..read].to_vec())) {
-          return;
-        }
-      }
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-      Err(error) => {
-        outbox.send(Message::Error(format!("reading from the connection: {error}")));
-        return;
-      }
+fn back(connection: &Connection, outbox: &Outbox) {
+  match read_chunks(connection, |bytes| outbox.send(Message::Data(bytes))) {
+    Stopped::Eof => {
+      outbox.send(Message::Eof);
+    }
+    // The session loop has stopped.
+    Stopped::Refused => {}
+    Stopped::Failed(error) => {
+      outbox.send(Message::Error(format!("reading from the connection: {error}")));
     }
   }
 }
 
 impl Connection {
-  fn try_clone(&self) -> io::Result<Self> {
-    Ok(match self {
-      Self::Tcp(stream) => Self::Tcp(stream.try_clone()?),
-      Self::Unix(stream) => Self::Unix(stream.try_clone()?),
-    })
-  }
-
   pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
     match self {
       Self::Tcp(stream) => stream.shutdown(how),
@@ -109,27 +84,36 @@ impl Connection {
   }
 }
 
-impl Read for Connection {
+impl Read for &Connection {
   fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
     match self {
-      Self::Tcp(stream) => stream.read(buffer),
-      Self::Unix(stream) => stream.read(buffer),
+      Connection::Tcp(stream) => {
+        let mut stream: &TcpStream = stream;
+        stream.read(buffer)
+      }
+      Connection::Unix(stream) => {
+        let mut stream: &UnixStream = stream;
+        stream.read(buffer)
+      }
     }
   }
 }
 
-impl Write for Connection {
+impl Write for &Connection {
   fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
     match self {
-      Self::Tcp(stream) => stream.write(bytes),
-      Self::Unix(stream) => stream.write(bytes),
+      Connection::Tcp(stream) => {
+        let mut stream: &TcpStream = stream;
+        stream.write(bytes)
+      }
+      Connection::Unix(stream) => {
+        let mut stream: &UnixStream = stream;
+        stream.write(bytes)
+      }
     }
   }
 
   fn flush(&mut self) -> io::Result<()> {
-    match self {
-      Self::Tcp(stream) => stream.flush(),
-      Self::Unix(stream) => stream.flush(),
-    }
+    Ok(())
   }
 }

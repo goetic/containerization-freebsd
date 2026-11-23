@@ -7,16 +7,17 @@
 //! If a child inherits the process's stdout and keeps it open, the host sees
 //! the process as running until that child exits too.
 
-use crate::session::{Handle, Input, Outbox, READ};
+use crate::pipe::{Stopped, read_chunks, write_until_eof};
+use crate::session::{Handle, Outbox};
 use crate::{sys, user};
 use containerization_freebsd_protocol::{Exec, Exit, Message, WindowSize};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
@@ -26,11 +27,11 @@ pub(crate) struct Process {
   /// Cleared after the process exits and before it is reaped, so no signal
   /// reaches another process that reuses the pid.
   alive: Mutex<bool>,
-  terminal: Option<File>,
+  terminal: Option<Arc<File>>,
 }
 
 impl Process {
-  fn new(child: &Child, terminal: Option<File>) -> Self {
+  fn new(child: &Child, terminal: Option<Arc<File>>) -> Self {
     Self {
       // The cast cannot overflow: FreeBSD's pids stop at 99999.
       pid: child.id() as libc::pid_t,
@@ -131,15 +132,15 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
     }
     None => (None, PathBuf::from("/")),
   };
-  let ids = exec
+  let identity = exec
     .user
     .as_ref()
     .map(|user| user::look_up(user, &root))
     .transpose()?;
-  if let Some(ids) = &ids
+  if let Some(identity) = &identity
     && !exec.env.iter().any(|(name, _)| name == "HOME")
   {
-    command.env("HOME", &ids.home);
+    command.env("HOME", &identity.home);
   }
   let cwd = exec
     .cwd
@@ -163,11 +164,7 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
         })
         .collect(),
       umask: exec.umask,
-      ids: ids.map(|ids| sys::Ids {
-        uid: ids.uid,
-        gid: ids.gid,
-        groups: ids.groups,
-      }),
+      ids: identity.map(|identity| identity.ids),
       cwd,
     },
   )
@@ -196,10 +193,14 @@ fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
   let process = Arc::new(Process::new(&child, None));
 
   let (input, inputs) = mpsc::channel();
-  thread::spawn(move || feed(stdin, &inputs, true));
+  thread::spawn(move || {
+    let mut stdin = stdin;
+    // Returning drops stdin, which closes the process's input.
+    write_until_eof(&mut stdin, &inputs);
+  });
   let output = vec![
-    pump(stdout, outbox.clone(), Message::Data, true),
-    pump(stderr, outbox.clone(), Message::Stderr, false),
+    pump(stdout, outbox.clone(), Output::Stdout),
+    pump(stderr, outbox.clone(), Output::Stderr),
   ];
   watch(child, process.clone(), output, outbox);
 
@@ -208,7 +209,7 @@ fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
 
 fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Result<Handle> {
   let (terminal, child_end) = sys::open_terminal(window(size))?;
-  let (reader, writer, resizer) = (terminal.try_clone()?, terminal.try_clone()?, terminal);
+  let terminal = Arc::new(terminal);
   command
     .stdin(child_end.try_clone()?)
     .stdout(child_end.try_clone()?)
@@ -218,60 +219,42 @@ fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Re
   // they close, reading the controller end never returns EOF.
   drop(command);
   let child = child?;
-  let process = Arc::new(Process::new(&child, Some(resizer)));
+  let process = Arc::new(Process::new(&child, Some(terminal.clone())));
 
   let (input, inputs) = mpsc::channel();
-  // A terminal has no end of input to send; the host sends ^D as Data.
-  thread::spawn(move || feed(writer, &inputs, false));
-  let output = vec![pump(reader, outbox.clone(), Message::Data, true)];
+  let mut writer = terminal.clone();
+  // A terminal has no end of input to send: the host sends ^D as Data, so its
+  // Eof is ignored.
+  thread::spawn(move || while write_until_eof(&mut writer, &inputs) {});
+  let output = vec![pump(terminal, outbox.clone(), Output::Stdout)];
   watch(child, process.clone(), output, outbox);
 
   Ok(Handle::Process { input, process })
 }
 
-/// Writes the host's Data to `sink`; the host's Eof is ignored unless
-/// `close_on_eof`.
-fn feed(mut sink: impl Write, inputs: &Receiver<Input>, close_on_eof: bool) {
-  for input in inputs {
-    match input {
-      Input::Data(bytes) => {
-        // The process closed its input, so the rest is discarded.
-        if sink.write_all(&bytes).is_err() {
-          return;
-        }
-      }
-      Input::Eof if close_on_eof => return,
-      Input::Eof => {}
-    }
-  }
+/// Which of a process's outputs `pump` reads. On a terminal, stdout carries
+/// stderr too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Output {
+  Stdout,
+  Stderr,
 }
 
-/// Reads `source` until it ends, sending each read as a message built by
-/// `wrap`.
-fn pump(
-  mut source: impl Read + Send + 'static,
-  outbox: Outbox,
-  wrap: fn(Vec<u8>) -> Message,
-  send_eof: bool,
-) -> JoinHandle<()> {
+/// Reads `source` until it ends, sending each read as Data for stdout or as
+/// Stderr, and then Eof for stdout.
+fn pump(source: impl Read + Send + 'static, outbox: Outbox, output: Output) -> JoinHandle<()> {
   thread::spawn(move || {
-    let mut buffer = vec![0; READ];
-
-    loop {
-      match source.read(&mut buffer) {
-        Ok(0) => break,
-        Ok(read) => {
-          if !outbox.send(wrap(buffer[..read].to_vec())) {
-            return;
-          }
-        }
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-        // Once no descriptor for the child end is open, reading the
-        // controller end fails instead of returning EOF.
-        Err(_) => break,
-      }
+    let wrap = match output {
+      Output::Stdout => Message::Data,
+      Output::Stderr => Message::Stderr,
+    };
+    // Once no descriptor for a pty's child end is open, reading the
+    // controller end fails instead of returning EOF, so failing ends the
+    // output too.
+    if let Stopped::Refused = read_chunks(source, |bytes| outbox.send(wrap(bytes))) {
+      return;
     }
-    if send_eof {
+    if output == Output::Stdout {
       outbox.send(Message::Eof);
     }
   })

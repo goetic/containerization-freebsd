@@ -3,6 +3,7 @@
 //! it events.
 
 use crate::listener::{self, Listening};
+use crate::pipe::{Stopped, read_chunks};
 use crate::process::{self, Process};
 use crate::relay::{self, Connection};
 use crate::sys;
@@ -19,8 +20,6 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 /// The event queue is bounded, so a channel whose output outpaces the console
 /// blocks until the console catches up.
 const QUEUE: usize = 64;
-/// Read buffer size, under MAX_PAYLOAD so every read fits in one frame.
-pub(crate) const READ: usize = 64 << 10;
 
 enum Event {
   Console(Vec<u8>),
@@ -92,7 +91,7 @@ pub(crate) enum Handle {
   },
   Relay {
     input: Sender<Input>,
-    connection: Connection,
+    connection: Arc<Connection>,
   },
   Listener(Listening),
 }
@@ -153,23 +152,12 @@ pub fn serve(input: impl Read + Send + 'static, output: impl Write) -> io::Resul
   result
 }
 
-fn read(mut input: impl Read, events: SyncSender<Event>) {
-  let mut buffer = vec![0; READ];
-
-  let closed = loop {
-    match input.read(&mut buffer) {
-      Ok(0) => break Ok(()),
-      Ok(read) => {
-        if events
-          .send(Event::Console(buffer[..read].to_vec()))
-          .is_err()
-        {
-          return;
-        }
-      }
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-      Err(error) => break Err(error),
-    }
+fn read(input: impl Read, events: SyncSender<Event>) {
+  let closed = match read_chunks(input, |bytes| events.send(Event::Console(bytes)).is_ok()) {
+    Stopped::Eof => Ok(()),
+    // The session loop has stopped.
+    Stopped::Refused => return,
+    Stopped::Failed(error) => Err(error),
   };
   let _ = events.send(Event::Closed(closed));
 }
@@ -308,46 +296,44 @@ impl<W: Write> Agent<W> {
   }
 
   fn exec(&mut self, channel: u32, exec: &Exec) -> io::Result<()> {
-    let outbox = self.outbox(channel);
-    let id = outbox.id;
     // spawn's errors already say which step failed, so they need no prefix.
-    let started = process::spawn(exec, outbox).map_err(|error| error.to_string());
-
-    self.opened(channel, id, started)
+    self.start(channel, |outbox| {
+      process::spawn(exec, outbox).map_err(|error| error.to_string())
+    })
   }
 
   fn connect(&mut self, channel: u32, connect: &Connect) -> io::Result<()> {
-    let outbox = self.outbox(channel);
-    let id = outbox.id;
-    let started = relay::connect(connect, outbox).map_err(|error| {
-      let to = match &connect.to {
-        Address::Port(port) => format!("port {port}"),
-        Address::Unix(path) => format!("{path:?}"),
-      };
-      format!("connecting to {to}{}: {error}", in_jail(connect.jail.as_deref()))
-    });
-
-    self.opened(channel, id, started)
+    self.start(channel, |outbox| {
+      relay::connect(connect, outbox).map_err(|error| {
+        let to = match &connect.to {
+          Address::Port(port) => format!("port {port}"),
+          Address::Unix(path) => format!("{path:?}"),
+        };
+        format!("connecting to {to}{}: {error}", in_jail(connect.jail.as_deref()))
+      })
+    })
   }
 
   fn listen(&mut self, channel: u32, listen: &Listen) -> io::Result<()> {
-    let outbox = self.outbox(channel);
-    let id = outbox.id;
-    let started = listener::listen(listen, outbox).map_err(|error| {
-      format!(
-        "listening on {:?}{}: {error}",
-        listen.path,
-        in_jail(listen.jail.as_deref())
-      )
-    });
-
-    self.opened(channel, id, started)
+    self.start(channel, |outbox| {
+      listener::listen(listen, outbox).map_err(|error| {
+        format!(
+          "listening on {:?}{}: {error}",
+          listen.path,
+          in_jail(listen.jail.as_deref())
+        )
+      })
+    })
   }
 
-  /// Records what opening `channel` started and sends Opened, or sends an
-  /// Error with the reason it failed.
-  fn opened(&mut self, channel: u32, id: u64, started: Result<Handle, String>) -> io::Result<()> {
-    match started {
+  /// Calls `start` to start the process, relay, or listener that opening
+  /// `channel` asks for, then sends Opened, or an Error with the reason it
+  /// failed.
+  fn start(&mut self, channel: u32, start: impl FnOnce(Outbox) -> Result<Handle, String>) -> io::Result<()> {
+    let outbox = self.outbox(channel);
+    let id = outbox.id;
+
+    match start(outbox) {
       Ok(handle) => {
         self.channels.insert(channel, Open { id, handle });
         self.send(channel, Message::Opened)
@@ -370,13 +356,9 @@ impl<W: Write> Agent<W> {
     let outbox = self.outbox(channel);
     let id = outbox.id;
 
-    match relay::start(Connection::Unix(stream), outbox) {
-      Ok(handle) => {
-        self.channels.insert(channel, Open { id, handle });
-        Ok(())
-      }
-      Err(error) => self.send(channel, Message::Error(format!("relaying a connection: {error}"))),
-    }
+    let handle = relay::start(Connection::Unix(stream), outbox);
+    self.channels.insert(channel, Open { id, handle });
+    Ok(())
   }
 
   fn outbox(&mut self, channel: u32) -> Outbox {

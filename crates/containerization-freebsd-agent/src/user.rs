@@ -2,17 +2,15 @@
 //! `/etc/passwd` and `/etc/group`, as runc and Containerization's `vminitd`
 //! do.
 
+use crate::sys;
 use containerization_freebsd_protocol::User;
 use std::io;
 use std::path::Path;
 
-/// A user's ids and home directory.
+/// The ids a process runs with, and its home directory.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Ids {
-  pub(crate) uid: u32,
-  pub(crate) gid: u32,
-  /// Supplementary groups.
-  pub(crate) groups: Vec<u32>,
+pub(crate) struct Identity {
+  pub(crate) ids: sys::Ids,
   pub(crate) home: String,
 }
 
@@ -32,7 +30,7 @@ struct Group<'a> {
 /// Looks up `user` in the files under `root`, a directory in the guest. A
 /// missing file counts as empty; a file whose path leads out of `root` is
 /// refused.
-pub(crate) fn look_up(user: &User, root: &Path) -> io::Result<Ids> {
+pub(crate) fn look_up(user: &User, root: &Path) -> io::Result<Identity> {
   let passwd = read(root, "etc/passwd")?;
   let group = read(root, "etc/group")?;
 
@@ -44,7 +42,7 @@ pub(crate) fn look_up(user: &User, root: &Path) -> io::Result<Ids> {
 /// supplementary groups are those that list the user as a member, unless
 /// `user.group` is set: then it replaces the primary group and no listed
 /// groups are added. `user.groups` are always added.
-fn resolve(user: &User, passwd: &str, group: &str) -> Result<Ids, String> {
+fn resolve(user: &User, passwd: &str, group: &str) -> Result<Identity, String> {
   let uid = user.name.parse::<u32>().ok();
   let account = accounts(passwd).find(|account| match uid {
     Some(uid) => account.uid == uid,
@@ -78,10 +76,8 @@ fn resolve(user: &User, passwd: &str, group: &str) -> Result<Ids, String> {
     }
   }
 
-  Ok(Ids {
-    uid,
-    gid,
-    groups,
+  Ok(Identity {
+    ids: sys::Ids { uid, gid, groups },
     home: home.to_string(),
   })
 }
@@ -183,11 +179,13 @@ nobody:*:65534:
     }
   }
 
-  fn ids(uid: u32, gid: u32, groups: &[u32], home: &str) -> Ids {
-    Ids {
-      uid,
-      gid,
-      groups: groups.to_vec(),
+  fn identity(uid: u32, gid: u32, groups: &[u32], home: &str) -> Identity {
+    Identity {
+      ids: sys::Ids {
+        uid,
+        gid,
+        groups: groups.to_vec(),
+      },
       home: home.into(),
     }
   }
@@ -196,11 +194,11 @@ nobody:*:65534:
   fn takes_a_named_users_ids_home_and_the_groups_that_list_them() {
     assert_eq!(
       resolve(&user("www"), PASSWD, GROUP),
-      Ok(ids(80, 80, &[20], "/nonexistent"))
+      Ok(identity(80, 80, &[20], "/nonexistent"))
     );
     assert_eq!(
       resolve(&user("root"), PASSWD, GROUP),
-      Ok(ids(0, 0, &[0, 5, 20], "/root"))
+      Ok(identity(0, 0, &[0, 5, 20], "/root"))
     );
   }
 
@@ -208,10 +206,10 @@ nobody:*:65534:
   fn takes_a_uid_as_its_listed_user_or_alone() {
     assert_eq!(
       resolve(&user("80"), PASSWD, GROUP),
-      Ok(ids(80, 80, &[20], "/nonexistent"))
+      Ok(identity(80, 80, &[20], "/nonexistent"))
     );
-    assert_eq!(resolve(&user("4242"), PASSWD, GROUP), Ok(ids(4242, 0, &[], "/")));
-    assert_eq!(resolve(&user("4242"), "", ""), Ok(ids(4242, 0, &[], "/")));
+    assert_eq!(resolve(&user("4242"), PASSWD, GROUP), Ok(identity(4242, 0, &[], "/")));
+    assert_eq!(resolve(&user("4242"), "", ""), Ok(identity(4242, 0, &[], "/")));
   }
 
   #[test]
@@ -235,9 +233,12 @@ nobody:*:65534:
 
     assert_eq!(
       resolve(&by_name, PASSWD, GROUP),
-      Ok(ids(80, 65533, &[], "/nonexistent"))
+      Ok(identity(80, 65533, &[], "/nonexistent"))
     );
-    assert_eq!(resolve(&by_gid, PASSWD, GROUP), Ok(ids(80, 4343, &[], "/nonexistent")));
+    assert_eq!(
+      resolve(&by_gid, PASSWD, GROUP),
+      Ok(identity(80, 4343, &[], "/nonexistent"))
+    );
   }
 
   #[test]
@@ -249,7 +250,7 @@ nobody:*:65534:
 
     assert_eq!(
       resolve(&more, PASSWD, GROUP),
-      Ok(ids(80, 80, &[20, 5, 4444], "/nonexistent"))
+      Ok(identity(80, 80, &[20, 5, 4444], "/nonexistent"))
     );
   }
 
@@ -274,8 +275,8 @@ nobody:*:65534:
     let numeric = look_up(&user("4242"), &root.join("etc"));
     std::fs::remove_dir_all(&root).unwrap();
 
-    assert_eq!(found.unwrap(), ids(80, 80, &[], "/nonexistent"));
-    assert_eq!(numeric.unwrap(), ids(4242, 0, &[], "/"));
+    assert_eq!(found.unwrap(), identity(80, 80, &[], "/nonexistent"));
+    assert_eq!(numeric.unwrap(), identity(4242, 0, &[], "/"));
   }
 
   #[test]
