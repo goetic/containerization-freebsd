@@ -1,6 +1,7 @@
 //! The session loop. One thread owns the protocol state and is the only
-//! writer to the console; the console reader and the channels' threads send
-//! it events.
+//! writer to the console. The channels' threads send it events, and the
+//! console reader passes it the host's bytes on a queue of their own, which
+//! the loop empties before it takes each event.
 
 use crate::listener::{self, Listening};
 use crate::pipe::{Stopped, read_chunks};
@@ -21,22 +22,25 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 /// blocks until the console catches up.
 const QUEUE: usize = 64;
 
-enum Event {
-  Console(Vec<u8>),
+/// What the console reader passes the session loop. Its queue is unbounded,
+/// but the host sends no more than the window allows before the loop reports
+/// what it read.
+enum FromConsole {
+  Read(Vec<u8>),
   /// The console's read end closed or failed.
   Closed(io::Result<()>),
+}
+
+// Nearly every event carries a Message, so boxing it would cost an
+// allocation per event and save nothing.
+#[allow(clippy::large_enum_variant)]
+enum Event {
+  /// Wakes the session loop for what the console reader has queued.
+  Console,
   /// A message a channel's thread has for the host.
-  Channel {
-    id: u64,
-    channel: u32,
-    message: Message,
-  },
+  Channel { id: u64, channel: u32, message: Message },
   /// A new connection to the socket of the Listen channel `listener`.
-  Accepted {
-    id: u64,
-    listener: u32,
-    stream: UnixStream,
-  },
+  Accepted { id: u64, listener: u32, stream: UnixStream },
 }
 
 /// Where a channel's threads send messages for the host. Each opened channel
@@ -135,8 +139,9 @@ struct Agent<W> {
 /// fails.
 pub fn serve(input: impl Read + Send + 'static, output: impl Write) -> io::Result<()> {
   let (events, queue) = mpsc::sync_channel(QUEUE);
-  let reader = events.clone();
-  std::thread::spawn(move || read(input, reader));
+  let (console, from_console) = mpsc::channel();
+  let wake = events.clone();
+  std::thread::spawn(move || read(input, &console, &wake));
 
   let mut agent = Agent {
     mux: Mux::new(Side::Guest),
@@ -147,30 +152,51 @@ pub fn serve(input: impl Read + Send + 'static, output: impl Write) -> io::Resul
     ids: 0,
     announced: false,
   };
-  let result = agent.run(&queue);
+  let result = agent.run(&queue, &from_console);
   agent.end_channels();
   result
 }
 
-fn read(input: impl Read, events: SyncSender<Event>) {
-  let closed = match read_chunks(input, |bytes| events.send(Event::Console(bytes)).is_ok()) {
+/// Passes what the console reads to the session loop, and wakes the loop
+/// for it unless the event queue is full. A full queue means the loop is
+/// busy, and it empties the reader's queue before taking its next event.
+fn read(input: impl Read, console: &Sender<FromConsole>, wake: &SyncSender<Event>) {
+  let pass = |from_console| {
+    let passed = console.send(from_console).is_ok();
+    let _ = wake.try_send(Event::Console);
+    passed
+  };
+
+  let closed = match read_chunks(input, |bytes| pass(FromConsole::Read(bytes))) {
     Stopped::Eof => Ok(()),
     // The session loop has stopped.
     Stopped::Refused => return,
     Stopped::Failed(error) => Err(error),
   };
-  let _ = events.send(Event::Closed(closed));
+  pass(FromConsole::Closed(closed));
 }
 
 impl<W: Write> Agent<W> {
-  fn run(&mut self, queue: &Receiver<Event>) -> io::Result<()> {
+  fn run(&mut self, queue: &Receiver<Event>, from_console: &Receiver<FromConsole>) -> io::Result<()> {
     self.announce()?;
 
-    // The agent holds a sender itself, so the queue never disconnects.
-    while let Ok(event) = queue.recv() {
+    loop {
+      // The host's bytes go ahead of the channels' queued output, so the
+      // host's input, and the Received that lets it send more, wait for no
+      // more than the frame being written.
+      while let Ok(from_console) = from_console.try_recv() {
+        match from_console {
+          FromConsole::Read(bytes) => self.console(&bytes)?,
+          FromConsole::Closed(result) => return result,
+        }
+      }
+
+      // The agent holds a sender itself, so the queue never disconnects.
+      let Ok(event) = queue.recv() else {
+        return Ok(());
+      };
       match event {
-        Event::Console(bytes) => self.console(&bytes)?,
-        Event::Closed(result) => return result,
+        Event::Console => {}
         Event::Channel { id, channel, message } => {
           if self.holds(channel, id) {
             self.send(channel, message)?;
@@ -183,7 +209,6 @@ impl<W: Write> Agent<W> {
         }
       }
     }
-    Ok(())
   }
 
   /// Whether `channel` is open and is still the opening identified by `id`.

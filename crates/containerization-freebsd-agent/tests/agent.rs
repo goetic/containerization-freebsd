@@ -591,3 +591,78 @@ fn announces_itself_after_losing_frames() {
   assert_eq!(host.next(), (CONTROL, Message::Pong(2)));
   host.hello();
 }
+
+/// A host that reads the console only when it asks for the agent's next
+/// message, so the agent's output can back up behind it.
+struct SlowHost {
+  mux: Mux,
+  console: UnixStream,
+  decoder: Decoder,
+}
+
+impl SlowHost {
+  fn start() -> Self {
+    let (console, agent) = UnixStream::pair().unwrap();
+    let agent_input = agent.try_clone().unwrap();
+    std::thread::spawn(move || containerization_freebsd_agent::serve(agent_input, agent));
+    let mut host = Self {
+      mux: Mux::new(Side::Host),
+      console,
+      decoder: Decoder::new(),
+    };
+
+    assert_eq!(host.next(), (CONTROL, announcement()));
+    let hello = host.mux.hello();
+    host.write(&hello);
+    assert!(matches!(host.next(), (CONTROL, Message::Hello { answer: true, .. })));
+    host
+  }
+
+  fn write(&mut self, frame: &Frame) {
+    self.console.write_all(&frame.to_bytes()).unwrap();
+  }
+
+  fn send(&mut self, channel: u32, message: Message) {
+    let frame = self.mux.send(channel, message).unwrap();
+    self.write(&frame);
+  }
+
+  /// The agent's next message, skipping Received messages.
+  fn next(&mut self) -> (u32, Message) {
+    loop {
+      if let Some(decoded) = self.decoder.decode() {
+        match self.mux.receive(decoded.unwrap()).unwrap() {
+          (CONTROL, Message::Received(_)) => continue,
+          next => return next,
+        }
+      }
+      let mut buffer = vec![0; 1 << 16];
+      let read = self.console.read(&mut buffer).unwrap();
+      assert!(read > 0, "the agent closed the console");
+      self.decoder.push(&buffer[..read]);
+    }
+  }
+}
+
+#[test]
+fn answers_the_host_ahead_of_output_waiting_for_the_console() {
+  let mut host = SlowHost::start();
+  let (channel, frame) = host.mux.open(Message::Exec(Exec::new(["yes"]))).unwrap();
+  host.write(&frame);
+  assert_eq!(host.next(), (channel, Message::Opened));
+  // While the host reads nothing, yes's output fills the agent's queue.
+  std::thread::sleep(Duration::from_millis(300));
+
+  host.send(CONTROL, Message::Ping(3));
+  let mut output = 0;
+  loop {
+    match host.next() {
+      (CONTROL, Message::Pong(3)) => break,
+      (_, Message::Data(_)) => output += 1,
+      other => panic!("unexpected {other:?}"),
+    }
+  }
+
+  assert!(output < 16, "the Pong followed {output} frames of output");
+  host.send(channel, Message::Error("done".into()));
+}
