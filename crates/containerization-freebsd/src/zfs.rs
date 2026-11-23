@@ -146,6 +146,61 @@ impl<'a> Zfs<'a> {
   }
 }
 
+/// Datasets under `store`, each a clone of the snapshot below it, or a new
+/// dataset at the bottom, and snapshotted as `<dataset>@<tag>` once filled.
+/// A dataset's name says what fills it, so an existing snapshot is reused
+/// rather than filled again. Builds and unpacked image layers are such
+/// chains. Two chains in one store must not be filled concurrently.
+pub(crate) struct SnapshotChain<'a> {
+  zfs: &'a Zfs<'a>,
+  store: &'a str,
+  tag: &'static str,
+}
+
+/// Whether `SnapshotChain::link` reused an existing snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cache {
+  Hit,
+  Miss,
+}
+
+impl<'a> SnapshotChain<'a> {
+  pub(crate) fn new(zfs: &'a Zfs<'a>, store: &'a str, tag: &'static str) -> Self {
+    Self { zfs, store, tag }
+  }
+
+  /// The snapshot of `<store>/<name>`, on top of the snapshot `below`. If it
+  /// doesn't exist yet, makes the dataset, runs `fill` on it, and snapshots
+  /// it; if `fill` fails, the dataset is destroyed.
+  pub(crate) fn link(
+    &self,
+    below: Option<&str>,
+    name: &str,
+    fill: impl FnOnce(&str) -> Result<()>,
+  ) -> Result<(String, Cache)> {
+    let dataset = format!("{}/{name}", self.store);
+    let snapshot = format!("{dataset}@{}", self.tag);
+    if self.zfs.exists(&snapshot)? {
+      return Ok((snapshot, Cache::Hit));
+    }
+
+    // An earlier attempt that failed without cleaning up, such as when the
+    // guest stopped, can leave the dataset behind.
+    if self.zfs.exists(&dataset)? {
+      self.zfs.destroy(&dataset)?;
+    }
+    match below {
+      Some(below) => self.zfs.clone(below, &dataset)?,
+      None => self.zfs.create(&dataset)?,
+    }
+    fill(&dataset).inspect_err(|_| {
+      let _ = self.zfs.destroy(&dataset);
+    })?;
+    self.zfs.snapshot(&snapshot)?;
+    Ok((snapshot, Cache::Miss))
+  }
+}
+
 /// The directory `dataset` is mounted at, given its `mountpoint` property
 /// `value`.
 fn mounted_at(dataset: &str, value: &str) -> Result<String> {

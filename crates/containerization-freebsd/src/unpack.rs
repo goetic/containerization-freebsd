@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type};
 use crate::scripts;
-use crate::zfs::Zfs;
+use crate::zfs::{Cache, SnapshotChain, Zfs};
 use std::time::Duration;
 
 /// Extracting a userland-sized layer takes about a minute.
@@ -62,6 +62,7 @@ impl<'a> Unpacker<'a> {
 
     self.zfs.create_mounted(&self.store)?;
     let directory = self.zfs.mountpoint(&self.store)?;
+    let layers = SnapshotChain::new(&self.zfs, &self.store, UNPACKED);
     let mut unpacked = Unpacked {
       snapshot: String::new(),
       unpacked: 0,
@@ -71,26 +72,22 @@ impl<'a> Unpacker<'a> {
 
     for (index, (layer, chain_id)) in manifest.layers.iter().zip(config.chain_ids()).enumerate() {
       let hex = chain_id.require_sha256()?;
-      let dataset = format!("{}/{hex}", self.store);
-      let snapshot = format!("{dataset}@{UNPACKED}");
-
-      if self.zfs.exists(&snapshot)? {
-        unpacked.cached += 1;
-      } else {
-        let diff_id = diff_ids[index].require_sha256()?;
-        let staging = format!("{directory}/.{hex}.tar");
-        self
-          .layer(image, layer, diff_id, below.as_deref(), &dataset, &staging)
-          .map_err(|error| {
-            error.context(format!(
-              "{} layer {} of {}",
-              image.reference,
-              index + 1,
-              manifest.layers.len()
-            ))
-          })?;
-        self.zfs.snapshot(&snapshot)?;
-        unpacked.unpacked += 1;
+      let (snapshot, cache) = layers
+        .link(below.as_deref(), hex, |dataset| {
+          let diff_id = diff_ids[index].require_sha256()?;
+          self.layer(image, layer, diff_id, dataset, &format!("{directory}/.{hex}.tar"))
+        })
+        .map_err(|error| {
+          error.context(format!(
+            "{} layer {} of {}",
+            image.reference,
+            index + 1,
+            manifest.layers.len()
+          ))
+        })?;
+      match cache {
+        Cache::Hit => unpacked.cached += 1,
+        Cache::Miss => unpacked.unpacked += 1,
       }
       below = Some(snapshot);
     }
@@ -99,28 +96,9 @@ impl<'a> Unpacker<'a> {
     Ok(unpacked)
   }
 
-  /// Applies `layer` to a new `dataset`, a clone of the snapshot `below` or
-  /// empty if there is none, via the decompressed tarball at `staging`. The
-  /// tarball is always removed, and the dataset is destroyed on failure.
-  fn layer(
-    &self,
-    image: &Image,
-    layer: &Descriptor,
-    diff_id: &str,
-    below: Option<&str>,
-    dataset: &str,
-    staging: &str,
-  ) -> Result<()> {
-    // An earlier unpack that failed without cleaning up, such as when the
-    // guest stopped, can leave the dataset behind.
-    if self.zfs.exists(dataset)? {
-      self.zfs.destroy(dataset)?;
-    }
-    match below {
-      Some(below) => self.zfs.clone(below, dataset)?,
-      None => self.zfs.create(dataset)?,
-    }
-
+  /// Applies `layer` to `dataset` via the decompressed tarball at `staging`,
+  /// which is always removed.
+  fn layer(&self, image: &Image, layer: &Descriptor, diff_id: &str, dataset: &str, staging: &str) -> Result<()> {
     let result = self.receive(image, layer, staging).and_then(|()| {
       let root = self.zfs.mountpoint(dataset)?;
       self
@@ -129,9 +107,6 @@ impl<'a> Unpacker<'a> {
         .map(|_| ())
     });
     let _ = self.agent.run(&["rm", "-f", staging], QUICK);
-    if result.is_err() {
-      let _ = self.zfs.destroy(dataset);
-    }
     result
   }
 

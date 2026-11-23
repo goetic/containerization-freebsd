@@ -8,7 +8,8 @@ use crate::digest::sha256;
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
 use crate::scripts;
-use crate::zfs::Zfs;
+use crate::zfs::{Cache, SnapshotChain, Zfs};
+
 /// The snapshot taken of each step's dataset once the step succeeds.
 const BUILT: &str = "built";
 
@@ -60,6 +61,7 @@ impl<'a> Builder<'a> {
   /// must not run concurrently.
   pub fn build(&self, from: &str, steps: &[Step], output: &mut dyn FnMut(&[u8])) -> Result<Built> {
     self.zfs.create_mounted(&self.store)?;
+    let chain = SnapshotChain::new(&self.zfs, &self.store, BUILT);
     let mut built = Built {
       snapshot: from.to_string(),
       ran: 0,
@@ -68,40 +70,21 @@ impl<'a> Builder<'a> {
 
     for (index, step) in steps.iter().enumerate() {
       let key = key(&built.snapshot, step);
-      let dataset = format!("{}/{key}", self.store);
-      let snapshot = format!("{dataset}@{BUILT}");
-
-      if self.zfs.exists(&snapshot)? {
-        built.cached += 1;
-      } else {
-        self
-          .run(&built.snapshot, &dataset, &key, step, output)
-          .map_err(|error| error.context(format!("step {} of {}", index + 1, steps.len())))?;
-        self.zfs.snapshot(&snapshot)?;
-        built.ran += 1;
+      let (snapshot, cache) = chain
+        .link(Some(&built.snapshot), &key, |dataset| {
+          self.in_jail(dataset, &key, step, output)
+        })
+        .map_err(|error| error.context(format!("step {} of {}", index + 1, steps.len())))?;
+      match cache {
+        Cache::Hit => built.cached += 1,
+        Cache::Miss => built.ran += 1,
       }
       built.snapshot = snapshot;
     }
     Ok(built)
   }
 
-  /// Runs `step` in a jail on a fresh clone of `from` at `dataset`,
-  /// destroying the clone if the step fails.
-  fn run(&self, from: &str, dataset: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
-    // A step that failed without cleaning up, such as when the guest
-    // stopped, can leave the dataset behind.
-    if self.zfs.exists(dataset)? {
-      self.zfs.destroy(dataset)?;
-    }
-    self.zfs.clone(from, dataset)?;
-
-    let result = self.in_jail(dataset, key, step, output);
-    if result.is_err() {
-      let _ = self.zfs.destroy(dataset);
-    }
-    result
-  }
-
+  /// Runs `step` in a jail on `dataset`.
   fn in_jail(&self, dataset: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
     let root = self.zfs.mountpoint(dataset)?;
     let name = format!("cfbsd-build-{}", &key[..16]);
