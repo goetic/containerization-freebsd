@@ -103,6 +103,16 @@ impl State {
     Ok(())
   }
 
+  /// Frames `message` for `channel` and writes it. Errors name what the
+  /// message was for as `what`.
+  pub(super) fn send(&mut self, channel: u32, message: Message, what: &str) -> Result<()> {
+    let frame = self
+      .mux
+      .send(channel, message)
+      .map_err(Error::protocol(what))?;
+    self.write(&frame)
+  }
+
   /// Starts a new session, ending any current session and everything it ran.
   pub(super) fn hello(&mut self) -> Result<()> {
     self.channels.clear();
@@ -122,17 +132,11 @@ impl State {
       seconds: now.as_secs(),
       nanoseconds: now.subsec_nanos(),
     };
-    let frame = self
-      .mux
-      .send(CONTROL, time)
-      .map_err(|error| Error::Guest(format!("setting the guest's clock: {error}")))?;
-    self.write(&frame)
+    self.send(CONTROL, time, "setting the guest's clock")
   }
 
   pub(super) fn close(&mut self, channel: u32, reason: &str) {
-    if let Ok(frame) = self.mux.send(channel, Message::Error(reason.to_string())) {
-      let _ = self.write(&frame);
-    }
+    let _ = self.send(channel, Message::Error(reason.to_string()), "closing a channel");
   }
 
   pub(super) fn forget(&mut self, channel: u32) {
@@ -159,9 +163,7 @@ impl State {
       // The console reader thread has already counted it.
       Ok((_, Message::Received(_))) => Heard::Nothing,
       Ok((_, Message::Ping(number))) => {
-        if let Ok(pong) = self.mux.send(channel, Message::Pong(number)) {
-          let _ = self.write(&pong);
-        }
+        let _ = self.send(channel, Message::Pong(number), "answering a ping");
         Heard::Nothing
       }
       Ok((_, Message::Accepted { listener })) => match self.listeners.get(&listener) {

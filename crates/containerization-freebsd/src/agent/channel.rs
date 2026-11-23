@@ -376,12 +376,7 @@ impl Stream {
   }
 
   fn send(&self, message: Message) -> Result<()> {
-    let mut state = self.shared.lock();
-    let frame = state
-      .mux
-      .send(self.channel, message)
-      .map_err(|error| Error::Guest(format!("{}: {error}", self.what)))?;
-    state.write(&frame)
+    self.shared.lock().send(self.channel, message, &self.what)
   }
 
   /// Like `send`, but only if the channel is still open. Returns whether it
@@ -392,11 +387,7 @@ impl Stream {
     if !state.mux.is_open(self.channel) {
       return Ok(false);
     }
-    let frame = state
-      .mux
-      .send(self.channel, message)
-      .map_err(|error| Error::Guest(format!("{}: {error}", self.what)))?;
-    state.write(&frame)?;
+    state.send(self.channel, message, &self.what)?;
     Ok(true)
   }
 

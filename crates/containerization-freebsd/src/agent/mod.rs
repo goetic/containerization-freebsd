@@ -232,15 +232,14 @@ impl Agent {
   /// that may never report back, such as one that powers off the guest.
   pub fn launch(&self, argv: &[&str]) -> Result<()> {
     let mut state = self.shared.lock();
-    let protocol = |error| Error::Guest(format!("{argv:?}: {error}"));
+    let what = format!("{argv:?}");
 
     let (channel, frame) = state
       .mux
       .open(Message::Exec(Exec::new(argv)))
-      .map_err(protocol)?;
+      .map_err(Error::protocol(&what))?;
     state.write(&frame)?;
-    let eof = state.mux.send(channel, Message::Eof).map_err(protocol)?;
-    state.write(&eof)
+    state.send(channel, Message::Eof, &what)
   }
 
   /// Opens a channel with `message` and waits for the agent to send Opened.
@@ -249,10 +248,7 @@ impl Agent {
     let (sender, receiver) = mpsc::channel();
     let channel = {
       let mut state = self.shared.lock();
-      let (channel, frame) = state
-        .mux
-        .open(message)
-        .map_err(|error| Error::Guest(format!("{what}: {error}")))?;
+      let (channel, frame) = state.mux.open(message).map_err(Error::protocol(&what))?;
       state.channels.insert(channel, sender);
       if let Some(host) = host {
         state.listeners.insert(channel, host);
@@ -362,6 +358,28 @@ pub(crate) mod tests {
     agent.wait_ready(TIMEOUT).expect("a session");
 
     assert_eq!(agent.sessions(), 2);
+  }
+
+  #[test]
+  fn says_when_there_is_no_session() {
+    // Nothing serves the other ends, so no session starts.
+    let (output, _agent_output) = std::io::pipe().unwrap();
+    let (_agent_input, input) = std::io::pipe().unwrap();
+    let agent = Agent::new(output, input);
+
+    let error = agent.launch(&["true"]).unwrap_err();
+
+    assert!(
+      matches!(
+        &error,
+        Error::Protocol {
+          error: containerization_freebsd_protocol::Error::NoSession,
+          ..
+        }
+      ),
+      "{error:?}"
+    );
+    assert!(std::error::Error::source(&error).is_some());
   }
 
   #[test]
