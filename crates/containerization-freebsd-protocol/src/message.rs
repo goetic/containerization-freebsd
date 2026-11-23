@@ -3,7 +3,7 @@
 //! bytes. An enum's variant is a u8 tag before its fields. The payload of
 //! Data, Stderr and Error is the raw bytes alone.
 
-use crate::codec::{Decode, DecodeError, Encode, Reader, Writer, encode};
+use crate::codec::{Decode, DecodeError, Encode, Reader, Writer, encode, record, tagged};
 use crate::frame::Frame;
 use std::fmt;
 
@@ -248,25 +248,27 @@ impl Message {
     }
   }
 
-  pub fn frame(&self, channel: u32) -> Frame {
+  /// The message as a frame on `channel`. Data, Stderr, and Error become the
+  /// payload as they are, without a copy.
+  pub fn frame(self, channel: u32) -> Frame {
     let (kind, payload) = match self {
-      Self::Hello { version, answer } => (kind::HELLO, encode(&(*version, *answer))),
-      Self::Ping(number) => (kind::PING, encode(number)),
-      Self::Pong(number) => (kind::PONG, encode(number)),
-      Self::Received(bytes) => (kind::RECEIVED, encode(bytes)),
-      Self::SetTime { seconds, nanoseconds } => (kind::SET_TIME, encode(&(*seconds, *nanoseconds))),
-      Self::Exec(exec) => (kind::EXEC, encode(exec)),
-      Self::Connect(connect) => (kind::CONNECT, encode(connect)),
-      Self::Listen(listen) => (kind::LISTEN, encode(listen)),
-      Self::Accepted { listener } => (kind::ACCEPTED, encode(listener)),
+      Self::Hello { version, answer } => (kind::HELLO, encode(&(version, answer))),
+      Self::Ping(number) => (kind::PING, encode(&number)),
+      Self::Pong(number) => (kind::PONG, encode(&number)),
+      Self::Received(bytes) => (kind::RECEIVED, encode(&bytes)),
+      Self::SetTime { seconds, nanoseconds } => (kind::SET_TIME, encode(&(seconds, nanoseconds))),
+      Self::Exec(exec) => (kind::EXEC, encode(&exec)),
+      Self::Connect(connect) => (kind::CONNECT, encode(&connect)),
+      Self::Listen(listen) => (kind::LISTEN, encode(&listen)),
+      Self::Accepted { listener } => (kind::ACCEPTED, encode(&listener)),
       Self::Opened => (kind::OPENED, Vec::new()),
-      Self::Data(bytes) => (kind::DATA, bytes.clone()),
-      Self::Stderr(bytes) => (kind::STDERR, bytes.clone()),
+      Self::Data(bytes) => (kind::DATA, bytes),
+      Self::Stderr(bytes) => (kind::STDERR, bytes),
       Self::Eof => (kind::EOF, Vec::new()),
-      Self::Resize(size) => (kind::RESIZE, encode(size)),
-      Self::Signal(signal) => (kind::SIGNAL, encode(signal)),
-      Self::Exited(exit) => (kind::EXITED, encode(exit)),
-      Self::Error(message) => (kind::ERROR, message.as_bytes().to_vec()),
+      Self::Resize(size) => (kind::RESIZE, encode(&size)),
+      Self::Signal(signal) => (kind::SIGNAL, encode(&signal)),
+      Self::Exited(exit) => (kind::EXITED, encode(&exit)),
+      Self::Error(message) => (kind::ERROR, message.into_bytes()),
     };
 
     Frame { channel, kind, payload }
@@ -318,150 +320,35 @@ impl Message {
   }
 }
 
-impl Encode for Exec {
+record!(Exec {
+  argv,
+  env,
+  cwd,
+  pty,
+  jail,
+  user,
+  umask,
+  limits,
+  rescue,
+});
+record!(User { name, group, groups });
+record!(Limit { resource, soft, hard });
+record!(Connect { to, jail });
+record!(Listen { path, jail, mode });
+record!(WindowSize { rows, columns });
+tagged!(Address { 0 => Port, 1 => Unix });
+tagged!(Exit { 0 => Code, 1 => Signal });
+
+/// A resource is its number on the wire.
+impl Encode for Resource {
   fn encode(&self, out: &mut Writer) {
-    out
-      .put(&self.argv)
-      .put(&self.env)
-      .put(&self.cwd)
-      .put(&self.pty)
-      .put(&self.jail)
-      .put(&self.user)
-      .put(&self.umask)
-      .put(&self.limits)
-      .put(&self.rescue);
+    out.put(&self.0);
   }
 }
 
-impl Decode for Exec {
+impl Decode for Resource {
   fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    Ok(Self {
-      argv: reader.get()?,
-      env: reader.get()?,
-      cwd: reader.get()?,
-      pty: reader.get()?,
-      jail: reader.get()?,
-      user: reader.get()?,
-      umask: reader.get()?,
-      limits: reader.get()?,
-      rescue: reader.get()?,
-    })
-  }
-}
-
-impl Encode for User {
-  fn encode(&self, out: &mut Writer) {
-    out.put(&self.name).put(&self.group).put(&self.groups);
-  }
-}
-
-impl Decode for User {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    Ok(Self {
-      name: reader.get()?,
-      group: reader.get()?,
-      groups: reader.get()?,
-    })
-  }
-}
-
-impl Encode for Limit {
-  fn encode(&self, out: &mut Writer) {
-    out.put(&self.resource.0).put(&self.soft).put(&self.hard);
-  }
-}
-
-impl Decode for Limit {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    Ok(Self {
-      resource: Resource(reader.get()?),
-      soft: reader.get()?,
-      hard: reader.get()?,
-    })
-  }
-}
-
-impl Encode for Connect {
-  fn encode(&self, out: &mut Writer) {
-    out.put(&self.to).put(&self.jail);
-  }
-}
-
-impl Decode for Connect {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    Ok(Self {
-      to: reader.get()?,
-      jail: reader.get()?,
-    })
-  }
-}
-
-impl Encode for Address {
-  fn encode(&self, out: &mut Writer) {
-    match self {
-      Self::Port(port) => out.put(&0u8).put(port),
-      Self::Unix(path) => out.put(&1u8).put(path),
-    };
-  }
-}
-
-impl Decode for Address {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    match reader.get()? {
-      0u8 => Ok(Self::Port(reader.get()?)),
-      1 => Ok(Self::Unix(reader.get()?)),
-      tag => Err(DecodeError::UnknownTag(tag)),
-    }
-  }
-}
-
-impl Encode for Listen {
-  fn encode(&self, out: &mut Writer) {
-    out.put(&self.path).put(&self.jail).put(&self.mode);
-  }
-}
-
-impl Decode for Listen {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    Ok(Self {
-      path: reader.get()?,
-      jail: reader.get()?,
-      mode: reader.get()?,
-    })
-  }
-}
-
-impl Encode for WindowSize {
-  fn encode(&self, out: &mut Writer) {
-    out.put(&self.rows).put(&self.columns);
-  }
-}
-
-impl Decode for WindowSize {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    Ok(Self {
-      rows: reader.get()?,
-      columns: reader.get()?,
-    })
-  }
-}
-
-impl Encode for Exit {
-  fn encode(&self, out: &mut Writer) {
-    match self {
-      Self::Code(code) => out.put(&0u8).put(code),
-      Self::Signal(signal) => out.put(&1u8).put(signal),
-    };
-  }
-}
-
-impl Decode for Exit {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-    match reader.get()? {
-      0u8 => Ok(Self::Code(reader.get()?)),
-      1 => Ok(Self::Signal(reader.get()?)),
-      tag => Err(DecodeError::UnknownTag(tag)),
-    }
+    reader.get().map(Self)
   }
 }
 
@@ -569,7 +456,7 @@ mod tests {
     ];
 
     for message in messages {
-      assert_eq!(Message::from_frame(message.frame(5)), Ok(message));
+      assert_eq!(Message::from_frame(message.clone().frame(5)), Ok(message));
     }
   }
 

@@ -125,7 +125,7 @@ enum Status {
   Closed,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Channel {
   kind: Kind,
   initiator: Side,
@@ -145,9 +145,10 @@ impl Channel {
     }
   }
 
-  /// Applies `message` from `sender`. Returns `None` if the channel does not
-  /// allow the message now, and otherwise whether the channel is still open.
-  fn step(&mut self, sender: Role, message: &Message) -> Option<Status> {
+  /// The channel as it would be after `message` from `sender`, and whether
+  /// it would still be open, or `None` if the channel does not allow the
+  /// message now. The channel itself is left as it is.
+  fn after(mut self, sender: Role, message: &Message) -> Option<(Self, Status)> {
     let (initiator, responder) = (sender == Role::Initiator, sender == Role::Responder);
     let process = matches!(self.kind, Kind::Exec { .. });
     let ended = if initiator {
@@ -186,7 +187,7 @@ impl Channel {
       Message::Eof => !process && self.initiator_eof && self.responder_eof,
       _ => false,
     };
-    Some(if closed { Status::Closed } else { Status::Open })
+    Some((self, if closed { Status::Closed } else { Status::Open }))
   }
 }
 
@@ -277,8 +278,9 @@ impl Mux {
     }
 
     self.require_session()?;
+    let next = self.check(channel, self.side, &message)?;
     let frame = sized(message.frame(channel))?;
-    self.step(channel, self.side, &message)?;
+    self.commit(channel, next);
     Ok(frame)
   }
 
@@ -311,7 +313,10 @@ impl Mux {
       Some(kind) => {
         self.channels.insert(channel, Channel::new(kind, peer));
       }
-      None => self.step(channel, peer, &message)?,
+      None => {
+        let next = self.check(channel, peer, &message)?;
+        self.commit(channel, next);
+      }
     }
     Ok((channel, message))
   }
@@ -363,24 +368,30 @@ impl Mux {
     channel
   }
 
-  fn step(&mut self, channel: u32, sender: Side, message: &Message) -> Result<(), Error> {
-    let state = self
+  /// The state `channel` would have after `sender` sends `message` on it, if
+  /// the channel allows that. Nothing changes until `commit`.
+  fn check(&self, channel: u32, sender: Side, message: &Message) -> Result<(Channel, Status), Error> {
+    let state = *self
       .channels
-      .get_mut(&channel)
+      .get(&channel)
       .ok_or(Error::UnknownChannel(channel))?;
     let role = if sender == state.initiator {
       Role::Initiator
     } else {
       Role::Responder
     };
-    let status = state
-      .step(role, message)
-      .ok_or_else(|| not_allowed(channel, message))?;
 
-    if status == Status::Closed {
-      self.channels.remove(&channel);
-    }
-    Ok(())
+    state
+      .after(role, message)
+      .ok_or_else(|| not_allowed(channel, message))
+  }
+
+  /// Gives `channel` the state `check` returned, or forgets it if it closed.
+  fn commit(&mut self, channel: u32, (state, status): (Channel, Status)) {
+    match status {
+      Status::Open => self.channels.insert(channel, state),
+      Status::Closed => self.channels.remove(&channel),
+    };
   }
 }
 

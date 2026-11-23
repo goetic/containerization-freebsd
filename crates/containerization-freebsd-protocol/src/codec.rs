@@ -121,6 +121,51 @@ macro_rules! integers {
 
 integers!(u8, u16, u32, u64, i32);
 
+/// Encodes and decodes the struct `$record` as its fields in the order
+/// listed, so that both directions follow one list.
+macro_rules! record {
+  ($record:ty { $($field:ident),+ $(,)? }) => {
+    impl $crate::codec::Encode for $record {
+      fn encode(&self, out: &mut $crate::codec::Writer) {
+        $(out.put(&self.$field);)+
+      }
+    }
+
+    impl $crate::codec::Decode for $record {
+      fn decode(reader: &mut $crate::codec::Reader<'_>) -> Result<Self, $crate::codec::DecodeError> {
+        Ok(Self {
+          $($field: reader.get()?,)+
+        })
+      }
+    }
+  };
+}
+
+/// Encodes and decodes the enum `$tagged`, whose variants each hold one
+/// value, as the variant's u8 tag followed by the value.
+macro_rules! tagged {
+  ($tagged:ty { $($tag:literal => $variant:ident),+ $(,)? }) => {
+    impl $crate::codec::Encode for $tagged {
+      fn encode(&self, out: &mut $crate::codec::Writer) {
+        match self {
+          $(Self::$variant(value) => out.put(&($tag as u8)).put(value),)+
+        };
+      }
+    }
+
+    impl $crate::codec::Decode for $tagged {
+      fn decode(reader: &mut $crate::codec::Reader<'_>) -> Result<Self, $crate::codec::DecodeError> {
+        match reader.get::<u8>()? {
+          $($tag => Ok(Self::$variant(reader.get()?)),)+
+          tag => Err($crate::codec::DecodeError::UnknownTag(tag)),
+        }
+      }
+    }
+  };
+}
+
+pub(crate) use {record, tagged};
+
 impl Encode for bool {
   fn encode(&self, out: &mut Writer) {
     out.put(&u8::from(*self));

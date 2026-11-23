@@ -380,7 +380,7 @@ fn lets_each_side_open_only_its_own_channels() {
     Error::BadChannel(3)
   );
   assert_eq!(
-    guest.receive(accepted.frame(1)).unwrap_err(),
+    guest.receive(accepted.clone().frame(1)).unwrap_err(),
     not_allowed(1, "accepted")
   );
   assert_eq!(host.receive(accepted.frame(2)).unwrap_err(), Error::BadChannel(2));
