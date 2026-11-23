@@ -80,11 +80,10 @@ impl Error {
     move |error| Self::Protocol { what, error }
   }
 
-  pub(crate) fn virtualization(action: &str) -> impl Fn(virtualization::Error) -> Self + '_ {
-    move |error| Self::Virtualization {
-      action: action.to_string(),
-      error,
-    }
+  pub(crate) fn virtualization(action: impl Into<String>) -> impl FnOnce(virtualization::Error) -> Self {
+    let action = action.into();
+
+    move |error| Self::Virtualization { action, error }
   }
 }
 

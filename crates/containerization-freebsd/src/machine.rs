@@ -358,9 +358,9 @@ impl Layout {
 /// errors.
 fn block_device(path: &Path, read_only: bool, what: &str) -> Result<VirtioBlockDeviceConfiguration> {
   let attachment = DiskImageStorageDeviceAttachment::new(&url(path)?, read_only)
-    .map_err(Error::virtualization(&format!("attach {what}")))?;
+    .map_err(Error::virtualization(format!("attach {what}")))?;
 
-  VirtioBlockDeviceConfiguration::new(&attachment).map_err(Error::virtualization(&format!("make {what} device")))
+  VirtioBlockDeviceConfiguration::new(&attachment).map_err(Error::virtualization(format!("make {what} device")))
 }
 
 /// The agent's channel, a single-port virtio console (`/dev/ttyV0.0` in the

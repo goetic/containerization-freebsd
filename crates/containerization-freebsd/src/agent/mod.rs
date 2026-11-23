@@ -23,7 +23,7 @@ pub use containerization_freebsd_protocol::{Exec, Exit, Limit, Resource, User, W
 use crate::error::{Error, Result};
 use channel::Stream;
 use containerization_freebsd_protocol::{Address, Connect, Listen, Message};
-use session::Shared;
+use session::{Route, Shared};
 use std::io::{PipeReader, PipeWriter};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -159,29 +159,27 @@ impl Agent {
   /// Waits for a session with the agent, which starts when the agent
   /// announces itself or answers `rejoin`.
   pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
-    let started = Instant::now();
-    let mut state = self.shared.lock();
+    let (state, _) = self
+      .shared
+      .changed
+      .wait_timeout_while(self.shared.lock(), timeout, |state| {
+        state.mismatch.is_none() && !state.mux.in_session() && !state.closed
+      })
+      .unwrap_or_else(PoisonError::into_inner);
 
-    loop {
-      if let Some(mismatch) = state.mismatch {
-        return Err(Error::Guest(format!("the guest agent: {mismatch}")));
-      }
-      if state.mux.in_session() {
-        return Ok(());
-      }
-      if state.closed {
-        return Err(Error::Guest("the console closed".to_string()));
-      }
-      let left = timeout
-        .checked_sub(started.elapsed())
-        .ok_or_else(|| Error::Timeout(format!("the guest agent did not start within {}s", timeout.as_secs())))?;
-      state = self
-        .shared
-        .changed
-        .wait_timeout(state, left)
-        .unwrap_or_else(PoisonError::into_inner)
-        .0;
+    if let Some(mismatch) = state.mismatch {
+      return Err(Error::Guest(format!("the guest agent: {mismatch}")));
     }
+    if state.mux.in_session() {
+      return Ok(());
+    }
+    if state.closed {
+      return Err(Error::Guest("the console closed".to_string()));
+    }
+    Err(Error::Timeout(format!(
+      "the guest agent did not start within {}s",
+      timeout.as_secs()
+    )))
   }
 
   /// Connects to `port` on the guest's loopback.
@@ -249,10 +247,9 @@ impl Agent {
     let channel = {
       let mut state = self.shared.lock();
       let (channel, frame) = state.mux.open(message).map_err(Error::protocol(&what))?;
-      state.channels.insert(channel, sender);
-      if let Some(host) = host {
-        state.listeners.insert(channel, host);
-      }
+      state
+        .channels
+        .insert(channel, Route { sender, relay_to: host });
       state.write(&frame)?;
       channel
     };

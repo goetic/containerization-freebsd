@@ -22,14 +22,19 @@ pub(super) struct State {
   pub(super) mux: Mux,
   console: PipeWriter,
   credit: Arc<Credit>,
-  /// The sender for each open channel's messages.
-  pub(super) channels: HashMap<u32, mpsc::Sender<Message>>,
-  /// For each open Listen channel, the host socket its connections relay to.
-  pub(super) listeners: HashMap<u32, PathBuf>,
+  /// Where each open channel's messages go.
+  pub(super) channels: HashMap<u32, Route>,
   pub(super) mismatch: Option<VersionMismatch>,
   pub(super) closed: bool,
   /// How many sessions have started.
   pub(super) sessions: u64,
+}
+
+/// Where an open channel's messages go.
+pub(super) struct Route {
+  pub(super) sender: mpsc::Sender<Message>,
+  /// For a Listen channel, the host socket its connections are relayed to.
+  pub(super) relay_to: Option<PathBuf>,
 }
 
 /// The follow-up work, if any, that a frame from the agent leaves for
@@ -66,7 +71,6 @@ impl Shared {
         console: input,
         credit: credit.clone(),
         channels: HashMap::new(),
-        listeners: HashMap::new(),
         mismatch: None,
         closed: false,
         sessions: 0,
@@ -116,7 +120,6 @@ impl State {
   /// Starts a new session, ending any current session and everything it ran.
   pub(super) fn hello(&mut self) -> Result<()> {
     self.channels.clear();
-    self.listeners.clear();
     let hello = self.mux.hello();
     self.write(&hello)
   }
@@ -141,7 +144,6 @@ impl State {
 
   pub(super) fn forget(&mut self, channel: u32) {
     self.channels.remove(&channel);
-    self.listeners.remove(&channel);
   }
 
   fn receive(&mut self, frame: Frame) -> Heard {
@@ -166,11 +168,16 @@ impl State {
         let _ = self.send(channel, Message::Pong(number), "answering a ping");
         Heard::Nothing
       }
-      Ok((_, Message::Accepted { listener })) => match self.listeners.get(&listener) {
+      Ok((_, Message::Accepted { listener })) => match self
+        .channels
+        .get(&listener)
+        .and_then(|route| route.relay_to.clone())
+      {
         Some(host) => {
-          let host = host.clone();
           let (sender, messages) = mpsc::channel();
-          self.channels.insert(channel, sender);
+          self
+            .channels
+            .insert(channel, Route { sender, relay_to: None });
           Heard::Accepted {
             channel,
             host,
@@ -184,8 +191,8 @@ impl State {
         }
       },
       Ok((_, message)) => {
-        if let Some(sender) = self.channels.get(&channel) {
-          let _ = sender.send(message);
+        if let Some(route) = self.channels.get(&channel) {
+          let _ = route.sender.send(message);
         }
         if !self.mux.is_open(channel) {
           self.forget(channel);
@@ -243,7 +250,6 @@ fn handle(queue: &Receiver<Event>, shared: &Arc<Shared>) {
   let mut state = shared.lock();
   state.closed = true;
   state.channels.clear();
-  state.listeners.clear();
   shared.changed.notify_all();
 }
 

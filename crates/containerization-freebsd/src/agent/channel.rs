@@ -89,15 +89,26 @@ impl Process {
 
   /// Returns the process's next output, waiting as long as it takes.
   pub fn recv(&self) -> Result<Output> {
-    self
-      .next(None)?
-      .ok_or_else(|| Error::Guest(format!("{}: no output", self.stream.what)))
+    self.check_running()?;
+    loop {
+      if let Some(output) = self.output(self.stream.recv()?) {
+        return Ok(output);
+      }
+    }
   }
 
   /// Returns the process's next output, or `None` if none arrives within
   /// `timeout`.
   pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<Output>> {
-    self.next(Some(timeout))
+    self.check_running()?;
+    loop {
+      let Some(message) = self.stream.recv_timeout(timeout)? else {
+        return Ok(None);
+      };
+      if let Some(output) = self.output(message) {
+        return Ok(Some(output));
+      }
+    }
   }
 
   /// Waits for the process to exit, writing its stdout to `stdout` and its
@@ -188,23 +199,25 @@ impl Process {
     Ok(None)
   }
 
-  fn next(&self, timeout: Option<Duration>) -> Result<Option<Output>> {
+  /// Fails once the process has exited, since nothing follows Exited.
+  fn check_running(&self) -> Result<()> {
     if self.exited.load(Ordering::Relaxed) {
       return Err(Error::Guest(format!("{} has exited", self.stream.what)));
     }
+    Ok(())
+  }
 
-    loop {
-      match self.stream.recv(timeout)? {
-        Some(Message::Data(bytes)) => return Ok(Some(Output::Stdout(bytes))),
-        Some(Message::Stderr(bytes)) => return Ok(Some(Output::Stderr(bytes))),
-        Some(Message::Exited(exit)) => {
-          self.exited.store(true, Ordering::Relaxed);
-          return Ok(Some(Output::Exited(exit)));
-        }
-        // Eof ends stdout. Exited follows it.
-        Some(_) => {}
-        None => return Ok(None),
+  /// The output `message` carries, if any.
+  fn output(&self, message: Message) -> Option<Output> {
+    match message {
+      Message::Data(bytes) => Some(Output::Stdout(bytes)),
+      Message::Stderr(bytes) => Some(Output::Stderr(bytes)),
+      Message::Exited(exit) => {
+        self.exited.store(true, Ordering::Relaxed);
+        Some(Output::Exited(exit))
       }
+      // Eof ends stdout. Exited follows it.
+      _ => None,
     }
   }
 }
@@ -234,14 +247,13 @@ impl Relay {
     }
 
     loop {
-      match self.stream.recv(None)? {
-        Some(Message::Data(bytes)) => return Ok(Some(bytes)),
-        Some(Message::Eof) => {
+      match self.stream.recv()? {
+        Message::Data(bytes) => return Ok(Some(bytes)),
+        Message::Eof => {
           self.ended.store(true, Ordering::Relaxed);
           return Ok(None);
         }
-        Some(_) => {}
-        None => return Ok(None),
+        _ => {}
       }
     }
   }
@@ -319,7 +331,7 @@ impl Listener {
     }
 
     loop {
-      match self.stream.recv(Some(AGENT_TIMEOUT))? {
+      match self.stream.recv_timeout(AGENT_TIMEOUT)? {
         Some(Message::Eof) => return Ok(()),
         Some(_) => {}
         None => {
@@ -360,7 +372,7 @@ impl Stream {
 
   /// Waits for the agent to send Opened on the new channel.
   pub(super) fn opened(self) -> Result<Self> {
-    match self.recv(Some(AGENT_TIMEOUT))? {
+    match self.recv_timeout(AGENT_TIMEOUT)? {
       Some(Message::Opened) => Ok(self),
       Some(other) => Err(Error::Guest(format!(
         "{}: the agent sent {} before opened",
@@ -397,22 +409,36 @@ impl Stream {
       .try_for_each(|chunk| self.send(Message::Data(chunk.to_vec())))
   }
 
-  /// Returns the next message, or `None` if none arrives within `timeout`.
-  /// An Error message from the agent, or the end of the session, is returned
-  /// as an error.
-  fn recv(&self, timeout: Option<Duration>) -> Result<Option<Message>> {
+  /// Returns the next message, waiting as long as it takes. An Error message
+  /// from the agent, or the end of the session, is returned as an error.
+  fn recv(&self) -> Result<Message> {
     let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
-    let message = match timeout {
-      Some(timeout) => messages.recv_timeout(timeout),
-      None => messages.recv().map_err(|_| RecvTimeoutError::Disconnected),
-    };
+    let message = messages.recv().map_err(|_| self.session_ended())?;
 
-    match message {
-      Ok(Message::Error(reason)) => Err(Error::Guest(format!("{}: {reason}", self.what))),
-      Ok(message) => Ok(Some(message)),
+    self.unless_error(message)
+  }
+
+  /// Like `recv`, but returns `None` if no message arrives within `timeout`.
+  fn recv_timeout(&self, timeout: Duration) -> Result<Option<Message>> {
+    let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+
+    match messages.recv_timeout(timeout) {
+      Ok(message) => self.unless_error(message).map(Some),
       Err(RecvTimeoutError::Timeout) => Ok(None),
-      Err(RecvTimeoutError::Disconnected) => Err(Error::SessionEnded(format!("{} was open", self.what))),
+      Err(RecvTimeoutError::Disconnected) => Err(self.session_ended()),
     }
+  }
+
+  /// `message`, unless it is the agent's Error, which fails the channel.
+  fn unless_error(&self, message: Message) -> Result<Message> {
+    match message {
+      Message::Error(reason) => Err(Error::Guest(format!("{}: {reason}", self.what))),
+      message => Ok(message),
+    }
+  }
+
+  fn session_ended(&self) -> Error {
+    Error::SessionEnded(format!("{} was open", self.what))
   }
 }
 
