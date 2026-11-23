@@ -7,8 +7,8 @@
 use containerization_freebsd::oci::{ContentStore, Descriptor, Digest, Platform, RegistryClient, media_type};
 use containerization_freebsd::{
   Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
-  Jail, Limit, Mac, Machine, Mount, Network, Output, Parents, Process, Resource, Share, Spawn, Step, UnixSocket,
-  Unpacker, Upgrade, User, WindowSize, Zfs, release,
+  Jail, Layout, Limit, Mac, Machine, Mount, Network, Output, Parents, Process, Resource, Share, Spawn, Step,
+  UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, release,
 };
 use containerization_freebsd_test::{base_disk, bundle, cache, userland};
 use std::io::{Read, Write};
@@ -30,6 +30,33 @@ fn work(name: &str) -> PathBuf {
   let _ = std::fs::remove_dir_all(&directory);
   std::fs::create_dir_all(&directory).expect("make the work directory");
   directory
+}
+
+/// Prepares a base disk in `work`. `Upgrade::Latest` would download the
+/// release's patches, which takes minutes.
+fn prepare(work: &Path) -> Layout {
+  containerization_freebsd::prepare(&base_disk(), work, DISK_SIZE, Upgrade::None, &bundle()).expect("prepare the base")
+}
+
+/// Makes the machine `name` from `layout`, starts it, and waits for its
+/// agent.
+fn boot(layout: &Layout, name: &str) -> Machine {
+  let machine = layout.machine(name).expect("make the machine");
+  machine.start().expect("start");
+  machine
+    .wait_ready(Duration::from_secs(300))
+    .expect("the agent starts");
+  machine
+}
+
+/// A read-only share of the cache that holds the userland, which tests mount
+/// at `/mnt/userland`.
+fn userland_share() -> Share {
+  Share {
+    tag: "userland".into(),
+    path: userland().parent().expect("the cache").to_path_buf(),
+    read_only: true,
+  }
 }
 
 fn sh(script: &str) -> [&str; 3] {
@@ -114,9 +141,7 @@ fn prepares_boots_and_restores() {
   std::fs::create_dir_all(&shared).expect("make the shared directory");
   std::fs::write(shared.join("from-host"), "written on the host\n").expect("write a shared file");
 
-  // `Upgrade::Latest` would download the release's patches, which takes minutes.
-  let mut layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
-    .expect("prepare the base");
+  let mut layout = prepare(&work);
   layout.shares.push(Share {
     tag: "shared".into(),
     path: shared.clone(),
@@ -127,11 +152,7 @@ fn prepares_boots_and_restores() {
     .validate_save_restore()
     .expect("the layout can be saved");
 
-  let cold = layout.machine("cold").expect("make the machine");
-  cold.start().expect("start");
-  cold
-    .wait_ready(Duration::from_secs(300))
-    .expect("the agent starts");
+  let cold = boot(&layout, "cold");
   let ran = cold
     .agent
     .check(&["freebsd-version", "-k"], TIMEOUT)
@@ -172,15 +193,9 @@ fn streams_input_across_windows(cold: &Machine, work: &Path) {
     .expect("start a checksum");
   checksum.write(&input).expect("stream the input");
   checksum.close_input().expect("end the input");
-  let mut sum = Vec::new();
-  loop {
-    match checksum.recv().expect("its output") {
-      Output::Stdout(bytes) => sum.extend(bytes),
-      Output::Stderr(bytes) => panic!("{}", String::from_utf8_lossy(&bytes)),
-      Output::Exited(exit) => break assert_eq!(exit, Exit::Code(0)),
-    }
-  }
-  assert_eq!(String::from_utf8_lossy(&sum).trim(), host_sha256(&work.join("input")));
+  let (sum, exit) = finish(&checksum);
+  assert_eq!(exit, Exit::Code(0));
+  assert_eq!(sum.trim(), host_sha256(&work.join("input")));
 }
 
 /// Checks that rc loaded the bundle's patched modules, including its fusefs
@@ -322,11 +337,15 @@ fn runs_a_command_in_a_terminal(restored: &Machine) {
 const SPARE: Mac = Mac([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]);
 
 /// A script that succeeds if the spare device has no IPv4 address.
-const UNCONFIGURED: &str = "for device in $(ifconfig -l ether); do \
-       if ifconfig \"$device\" ether | grep -q 'ether 02:00:5e:10:00:01'; then \
+fn unconfigured() -> String {
+  format!(
+    "for device in $(ifconfig -l ether); do \
+       if ifconfig \"$device\" ether | grep -q 'ether {SPARE}'; then \
          ! ifconfig \"$device\" inet | grep -q 'inet '; exit; \
        fi; \
-     done; exit 1";
+     done; exit 1"
+  )
+}
 
 /// Connects to the host the image came from, resolved through the guest's
 /// resolver.
@@ -374,25 +393,14 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
 /// Boots a guest for jails: with NAT, a spare NAT device, an empty images
 /// disk, and the userland's share mounted at `/mnt/userland`.
 fn boot_for_jails(work: &Path) -> Machine {
-  let mut layout = containerization_freebsd::prepare(&base_disk(), work, DISK_SIZE, Upgrade::None, &bundle())
-    .expect("prepare the base");
-
+  let mut layout = prepare(work);
   let images = Disk::create(work.join("images.raw"), "images", 8 << 30).expect("make the images disk");
   layout.disks.push(images);
   layout.nat = true;
   layout.interfaces.push(SPARE);
-  let userland = userland();
-  layout.shares.push(Share {
-    tag: "userland".into(),
-    path: userland.parent().expect("the cache").to_path_buf(),
-    read_only: true,
-  });
+  layout.shares.push(userland_share());
 
-  let machine = layout.machine("jails").expect("make the machine");
-  machine.start().expect("start");
-  machine
-    .wait_ready(Duration::from_secs(300))
-    .expect("the agent starts");
+  let machine = boot(&layout, "jails");
   // `wait_ready` waits for the NAT network too, although rc starts the agent
   // before the network.
   machine
@@ -421,7 +429,7 @@ fn boot_for_jails(work: &Path) -> Machine {
     .expect("vtnet0 is the NAT device, taking router advertisements");
   machine
     .agent
-    .check(&sh(UNCONFIGURED), TIMEOUT)
+    .check(&sh(&unconfigured()), TIMEOUT)
     .expect("the spare has no address");
   machine
 }
@@ -897,7 +905,7 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
   assert_eq!(interface.gateway.as_deref(), Some(gateway), "{interface:?}");
   machine
     .agent
-    .check(&sh(UNCONFIGURED), TIMEOUT)
+    .check(&sh(&unconfigured()), TIMEOUT)
     .expect("leasing configures nothing");
   let address = interface
     .address
@@ -937,7 +945,7 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
     .expect("delete the container with an interface");
   machine
     .agent
-    .check(&sh("ifconfig -a | grep -q 'ether 02:00:5e:10:00:01'"), TIMEOUT)
+    .check(&sh(&format!("ifconfig -a | grep -q 'ether {SPARE}'")), TIMEOUT)
     .expect("its device is back in the guest");
 }
 
@@ -1051,25 +1059,15 @@ fn runs_a_build_sized_workload_on_a_share() {
   let shared = work.join("shared");
   write_project(&shared.join("project"));
 
-  let mut layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
-    .expect("prepare the base");
-  let userland = userland();
+  let mut layout = prepare(&work);
   layout.shares.push(Share {
     tag: "shared".into(),
     path: shared.clone(),
     read_only: false,
   });
-  layout.shares.push(Share {
-    tag: "userland".into(),
-    path: userland.parent().expect("the cache").to_path_buf(),
-    read_only: true,
-  });
+  layout.shares.push(userland_share());
 
-  let machine = layout.machine("workload").expect("make the machine");
-  machine.start().expect("start");
-  machine
-    .wait_ready(Duration::from_secs(300))
-    .expect("the agent starts");
+  let machine = boot(&layout, "workload");
   machine
     .mount_share("shared", "/mnt/shared")
     .expect("mount the share");
@@ -1196,13 +1194,7 @@ fn pulls_unpacks_and_runs_oci_images() {
     .expect("pull FreeBSD's runtime image");
   let whiteouts = layers_an_image_on_the_runtime(&work, &store, &runtime, &platform);
 
-  let layout = containerization_freebsd::prepare(&base_disk(), &work, DISK_SIZE, Upgrade::None, &bundle())
-    .expect("prepare the base");
-  let machine = layout.machine("images").expect("make the machine");
-  machine.start().expect("start");
-  machine
-    .wait_ready(Duration::from_secs(300))
-    .expect("the agent starts");
+  let machine = boot(&prepare(&work), "images");
 
   let (base, layered) = unpacks_each_layer_once(&machine, &runtime, &whiteouts, &platform);
   let containers = Containers::new(&machine.agent, "zroot/cfbsd/containers");
@@ -1333,19 +1325,8 @@ fn runs_the_images_process(containers: &Containers, runtime: &Image, platform: &
     .write(b"freebsd-version -u; exit 3\n")
     .expect("give it commands");
   main.close_input().expect("end its input");
-  let mut stdout = Vec::new();
-  let exit = loop {
-    match main.recv().expect("its output") {
-      Output::Stdout(bytes) => stdout.extend(bytes),
-      Output::Stderr(bytes) => panic!("{}", String::from_utf8_lossy(&bytes)),
-      Output::Exited(exit) => break exit,
-    }
-  };
-  assert!(
-    stdout.starts_with(b"15.1-RELEASE"),
-    "{}",
-    String::from_utf8_lossy(&stdout)
-  );
+  let (stdout, exit) = finish(main);
+  assert!(stdout.starts_with("15.1-RELEASE"), "{stdout}");
   assert_eq!(exit, Exit::Code(3));
   shell.delete().expect("delete the container");
 }
