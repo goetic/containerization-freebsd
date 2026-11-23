@@ -4,7 +4,7 @@
 //! the loop empties before it takes each event.
 
 use crate::listener::{self, Listening};
-use crate::pipe::{Stopped, read_chunks};
+use crate::pipe::{READ, Stopped, read_chunks};
 use crate::process::{self, Process};
 use crate::relay::{self, Connection};
 use crate::sys;
@@ -21,6 +21,9 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 /// The event queue is bounded, so a channel whose output outpaces the console
 /// blocks until the console catches up.
 const QUEUE: usize = 64;
+/// The most bytes of frames the loop gathers before writing them. A full
+/// read's Data frame reaches it alone, so it goes out at once.
+const BATCH: usize = READ;
 
 /// What the console reader passes the session loop. Its queue is unbounded,
 /// but the host sends no more than the window allows before the loop reports
@@ -131,6 +134,10 @@ struct Agent<W> {
   /// Frames from the old session that are still in flight then draw one
   /// announcement in total, not one each.
   announced: bool,
+  /// Frames waiting to be written. The loop writes them before it waits for
+  /// an event, or once there are `BATCH` bytes of them, so the frames it
+  /// sends in between share one write.
+  pending: Vec<u8>,
 }
 
 /// Serves sessions over a console until its read end closes. The agent
@@ -151,6 +158,7 @@ pub fn serve(input: impl Read + Send + 'static, output: impl Write) -> io::Resul
     channels: HashMap::new(),
     ids: 0,
     announced: false,
+    pending: Vec::new(),
   };
   let result = agent.run(&queue, &from_console);
   agent.end_channels();
@@ -178,7 +186,7 @@ fn read(input: impl Read, console: &Sender<FromConsole>, wake: &SyncSender<Event
 
 impl<W: Write> Agent<W> {
   fn run(&mut self, queue: &Receiver<Event>, from_console: &Receiver<FromConsole>) -> io::Result<()> {
-    self.announce()?;
+    self.announce();
 
     loop {
       // The host's bytes go ahead of the channels' queued output, so the
@@ -186,27 +194,38 @@ impl<W: Write> Agent<W> {
       // more than the frame being written.
       while let Ok(from_console) = from_console.try_recv() {
         match from_console {
-          FromConsole::Read(bytes) => self.console(&bytes)?,
-          FromConsole::Closed(result) => return result,
+          FromConsole::Read(bytes) => self.console(&bytes),
+          FromConsole::Closed(result) => return self.flush().and(result),
         }
       }
 
-      // The agent holds a sender itself, so the queue never disconnects.
-      let Ok(event) = queue.recv() else {
-        return Ok(());
+      let event = match queue.try_recv() {
+        Ok(event) => event,
+        Err(_) => {
+          // Nothing else is ready, so write what has gathered before waiting.
+          self.flush()?;
+          // The agent holds a sender itself, so the queue never disconnects.
+          let Ok(event) = queue.recv() else {
+            return Ok(());
+          };
+          event
+        }
       };
       match event {
         Event::Console => {}
         Event::Channel { id, channel, message } => {
           if self.holds(channel, id) {
-            self.send(channel, message)?;
+            self.send(channel, message);
           }
         }
         Event::Accepted { id, listener, stream } => {
           if self.holds(listener, id) {
-            self.accepted(listener, stream)?;
+            self.accepted(listener, stream);
           }
         }
+      }
+      if self.pending.len() >= BATCH {
+        self.flush()?;
       }
     }
   }
@@ -219,28 +238,27 @@ impl<W: Write> Agent<W> {
       .is_some_and(|open| open.id == id)
   }
 
-  fn console(&mut self, bytes: &[u8]) -> io::Result<()> {
+  fn console(&mut self, bytes: &[u8]) {
     // These bytes have left the tty's input queue, so the host may send that
     // many more.
     let read = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-    self.send(CONTROL, Message::Received(read))?;
+    self.send(CONTROL, Message::Received(read));
     self.decoder.push(bytes);
 
     while let Some(decoded) = self.decoder.decode() {
       match decoded {
-        Ok(frame) => self.receive(frame)?,
+        Ok(frame) => self.receive(frame),
         // Frames were lost. The announcement makes the host start a new
         // session.
         Err(Skipped(count)) => {
           eprintln!("agent: dropped {count} bytes between frames");
-          self.announce()?;
+          self.announce();
         }
       }
     }
-    Ok(())
   }
 
-  fn receive(&mut self, frame: Frame) -> io::Result<()> {
+  fn receive(&mut self, frame: Frame) {
     let channel = frame.channel;
 
     match self.mux.receive(frame) {
@@ -250,33 +268,26 @@ impl<W: Write> Agent<W> {
         self.end_channels();
         self.announced = false;
         let answer = self.mux.hello();
-        self.write(&answer)
+        self.write(&answer);
       }
       Ok((_, Message::Ping(number))) => self.send(CONTROL, Message::Pong(number)),
       Ok((_, Message::SetTime { seconds, nanoseconds })) => {
         if let Err(error) = sys::set_time(seconds, nanoseconds) {
           eprintln!("agent: setting the clock: {error}");
         }
-        Ok(())
       }
       Ok((_, Message::Exec(exec))) => self.exec(channel, &exec),
       Ok((_, Message::Connect(connect))) => self.connect(channel, &connect),
       Ok((_, Message::Listen(listen))) => self.listen(channel, &listen),
-      Ok((_, message)) => {
-        self.deliver(channel, message);
-        Ok(())
-      }
+      Ok((_, message)) => self.deliver(channel, message),
       // The host has a session that the agent does not. The agent announces
       // itself once so the host starts a new one; frames still arriving
       // from the old session are then dropped.
       Err(Error::NoSession) if !self.announced => self.announce(),
       // A frame from the old session after the announcement, or one that
       // crossed its channel's close in flight.
-      Err(Error::NoSession | Error::UnknownChannel(_)) => Ok(()),
-      Err(error) => {
-        eprintln!("agent: refused a frame on channel {channel}: {error}");
-        Ok(())
-      }
+      Err(Error::NoSession | Error::UnknownChannel(_)) => {}
+      Err(error) => eprintln!("agent: refused a frame on channel {channel}: {error}"),
     }
   }
 
@@ -320,29 +331,29 @@ impl<W: Write> Agent<W> {
     }
   }
 
-  fn exec(&mut self, channel: u32, exec: &Exec) -> io::Result<()> {
+  fn exec(&mut self, channel: u32, exec: &Exec) {
     // spawn's errors already say which step failed, so they need no prefix.
     self.start(channel, |outbox| {
       process::spawn(exec, outbox).map_err(|error| error.to_string())
-    })
+    });
   }
 
-  fn connect(&mut self, channel: u32, connect: &Connect) -> io::Result<()> {
+  fn connect(&mut self, channel: u32, connect: &Connect) {
     self.start(channel, |outbox| {
       relay::connect(connect, outbox).map_err(|error| format!("connecting to {connect}: {error}"))
-    })
+    });
   }
 
-  fn listen(&mut self, channel: u32, listen: &Listen) -> io::Result<()> {
+  fn listen(&mut self, channel: u32, listen: &Listen) {
     self.start(channel, |outbox| {
       listener::listen(listen, outbox).map_err(|error| format!("listening on {listen}: {error}"))
-    })
+    });
   }
 
   /// Calls `start` to start the process, relay, or listener that opening
   /// `channel` asks for, then sends Opened, or an Error with the reason it
   /// failed.
-  fn start(&mut self, channel: u32, start: impl FnOnce(Outbox) -> Result<Handle, String>) -> io::Result<()> {
+  fn start(&mut self, channel: u32, start: impl FnOnce(Outbox) -> Result<Handle, String>) {
     let outbox = self.outbox(channel);
     let id = outbox.id;
 
@@ -357,21 +368,20 @@ impl<W: Write> Agent<W> {
 
   /// Opens an Accepted channel for a connection to the socket of the Listen
   /// channel `listener`, and relays the connection on it.
-  fn accepted(&mut self, listener: u32, stream: UnixStream) -> io::Result<()> {
+  fn accepted(&mut self, listener: u32, stream: UnixStream) {
     let (channel, frame) = match self.mux.open(Message::Accepted { listener }) {
       Ok(opened) => opened,
       Err(error) => {
         eprintln!("agent: could not relay a connection to listener {listener}: {error}");
-        return Ok(());
+        return;
       }
     };
-    self.write(&frame)?;
+    self.write(&frame);
     let outbox = self.outbox(channel);
     let id = outbox.id;
 
     let handle = relay::start(Connection::Unix(stream), outbox);
     self.channels.insert(channel, Open { id, handle });
-    Ok(())
   }
 
   fn outbox(&mut self, channel: u32) -> Outbox {
@@ -383,25 +393,24 @@ impl<W: Write> Agent<W> {
     }
   }
 
-  /// Sends a message to the host. If it closes the channel (Exited, Error, or
-  /// the second Eof on a relay or listener), the channel is forgotten.
-  fn send(&mut self, channel: u32, message: Message) -> io::Result<()> {
+  /// Queues a message for the host. If it closes the channel (Exited, Error,
+  /// or the second Eof on a relay or listener), the channel is forgotten.
+  fn send(&mut self, channel: u32, message: Message) {
     match self.mux.send(channel, message) {
-      Ok(frame) => self.write(&frame)?,
+      Ok(frame) => self.write(&frame),
       Err(error) => eprintln!("agent: could not send on channel {channel}: {error}"),
     }
     if channel != CONTROL && !self.mux.is_open(channel) {
       self.channels.remove(&channel);
     }
-    Ok(())
   }
 
   /// Tells the host that the agent has no session, which ends the host's.
-  fn announce(&mut self) -> io::Result<()> {
+  fn announce(&mut self) {
     self.end_channels();
     self.announced = true;
     let hello = self.mux.hello();
-    self.write(&hello)
+    self.write(&hello);
   }
 
   /// Stops the work of every channel when the session ends.
@@ -411,8 +420,21 @@ impl<W: Write> Agent<W> {
     }
   }
 
-  fn write(&mut self, frame: &Frame) -> io::Result<()> {
-    self.output.write_all(&frame.to_bytes())?;
-    self.output.flush()
+  /// Adds `frame` to those waiting to be written.
+  fn write(&mut self, frame: &Frame) {
+    frame.encode(&mut self.pending);
+  }
+
+  /// Writes the frames waiting to be written, all at once.
+  fn flush(&mut self) -> io::Result<()> {
+    if self.pending.is_empty() {
+      return Ok(());
+    }
+    let written = self
+      .output
+      .write_all(&self.pending)
+      .and_then(|()| self.output.flush());
+    self.pending.clear();
+    written
   }
 }

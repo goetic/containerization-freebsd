@@ -10,6 +10,8 @@ use std::net::{Shutdown, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -41,9 +43,15 @@ impl Host {
   /// Starts an agent on the other end of the console and opens a session
   /// with it.
   fn start() -> Self {
+    Self::start_with(|agent| agent)
+  }
+
+  /// Like `start`, but the agent writes to the console through `output`.
+  fn start_with<W: Write + Send + 'static>(output: impl FnOnce(UnixStream) -> W) -> Self {
     let (console, agent) = UnixStream::pair().unwrap();
     let agent_input = agent.try_clone().unwrap();
-    std::thread::spawn(move || containerization_freebsd_agent::serve(agent_input, agent));
+    let agent_output = output(agent);
+    std::thread::spawn(move || containerization_freebsd_agent::serve(agent_input, agent_output));
 
     let mut reader = console.try_clone().unwrap();
     let (sender, frames) = mpsc::channel();
@@ -577,6 +585,47 @@ fn a_new_session_kills_the_old_ones_processes() {
   // Nothing from the old channel arrives in the new session.
   host.send(CONTROL, Message::Ping(1));
   assert_eq!(host.next(), (CONTROL, Message::Pong(1)));
+}
+
+/// The agent's end of the console, counting the agent's writes to it.
+struct Counting {
+  console: UnixStream,
+  writes: Arc<AtomicUsize>,
+}
+
+impl Write for Counting {
+  fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+    self.writes.fetch_add(1, Ordering::Relaxed);
+    self.console.write(bytes)
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    self.console.flush()
+  }
+}
+
+#[test]
+fn writes_the_answers_to_one_read_at_once() {
+  let writes = Arc::new(AtomicUsize::new(0));
+  let counted = writes.clone();
+  let mut host = Host::start_with(move |console| Counting {
+    console,
+    writes: counted,
+  });
+  let before = writes.load(Ordering::Relaxed);
+
+  let mut pings = Vec::new();
+  for number in 0..50 {
+    let ping = host.mux.send(CONTROL, Message::Ping(number)).unwrap();
+    pings.extend(ping.to_bytes());
+  }
+  host.console.write_all(&pings).unwrap();
+  for number in 0..50 {
+    assert_eq!(host.next(), (CONTROL, Message::Pong(number)));
+  }
+
+  let writes = writes.load(Ordering::Relaxed) - before;
+  assert!(writes <= 5, "the agent wrote 50 Pongs in {writes} writes");
 }
 
 #[test]
