@@ -11,7 +11,6 @@ use crate::pipe::{Stopped, read_chunks, write_until_eof};
 use crate::session::{Handle, Outbox};
 use crate::{sys, user};
 use containerization_freebsd_protocol::{Exec, Exit, Message, WindowSize};
-use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -42,12 +41,12 @@ impl Process {
 
   /// Sends `signal`, numbered as on the guest, to the process.
   pub(crate) fn signal(&self, signal: i32) -> io::Result<()> {
-    self.send(self.pid, signal)
+    self.while_alive(|pid| sys::signal(pid, signal))
   }
 
   /// Kills the process and the rest of its process group.
   pub(crate) fn kill(&self) {
-    let _ = self.send(-self.pid, libc::SIGKILL);
+    let _ = self.while_alive(sys::kill_group);
   }
 
   pub(crate) fn resize(&self, size: WindowSize) -> io::Result<()> {
@@ -57,10 +56,11 @@ impl Process {
     }
   }
 
-  fn send(&self, target: libc::pid_t, signal: i32) -> io::Result<()> {
+  /// Calls `send` with the pid unless the process has exited.
+  fn while_alive(&self, send: impl FnOnce(libc::pid_t) -> io::Result<()>) -> io::Result<()> {
     let alive = self.alive.lock().unwrap_or_else(PoisonError::into_inner);
 
-    if *alive { sys::signal(target, signal) } else { Ok(()) }
+    if *alive { send(self.pid) } else { Ok(()) }
   }
 
   /// Waits for the process to exit without reaping it, then disables
@@ -127,8 +127,8 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
 
   let (jail, root) = match &exec.jail {
     Some(name) => {
-      let (jid, root) = sys::find_jail(name)?;
-      (Some(jid), root)
+      let (jail, root) = sys::find_jail(name)?;
+      (Some(jail), root)
     }
     None => (None, PathBuf::from("/")),
   };
@@ -142,18 +142,12 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
   {
     command.env("HOME", &identity.home);
   }
-  let cwd = exec
-    .cwd
-    .as_deref()
-    .or(jail.map(|_| "/"))
-    .map(CString::new)
-    .transpose()
-    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the working directory has a NUL"))?;
+  let cwd = exec.cwd.as_deref().or(jail.map(|_| "/")).map(PathBuf::from);
 
   sys::enter_on_exec(
     command,
     sys::Entry {
-      jid: jail,
+      jail,
       limits: exec
         .limits
         .iter()

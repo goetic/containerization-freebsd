@@ -3,11 +3,15 @@
 use std::io;
 use std::path::PathBuf;
 
+/// The id of a running jail, which only `find_jail` returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JailId(libc::c_int);
+
 /// Finds the running jail named `name` and returns its id and the path of
 /// its root in the guest.
 #[cfg(target_os = "freebsd")]
-pub fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
-  use std::ffi::{CStr, CString, OsString};
+pub fn find_jail(name: &str) -> io::Result<(JailId, PathBuf)> {
+  use std::ffi::{CStr, OsString};
   use std::os::unix::ffi::OsStringExt;
 
   fn parameter(bytes: &[u8]) -> libc::iovec {
@@ -17,8 +21,7 @@ pub fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
     }
   }
 
-  let wanted =
-    CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a jail's name has a NUL"))?;
+  let wanted = crate::c_string(name)?;
   let mut path = vec![0u8; libc::PATH_MAX as usize];
   let mut parameters = [
     parameter(c"name".to_bytes_with_nul()),
@@ -44,11 +47,11 @@ pub fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
     .map_err(|_| io::Error::other(format!("jail {name:?}'s path has no end")))?
     .to_bytes()
     .to_vec();
-  Ok((jid, PathBuf::from(OsString::from_vec(path))))
+  Ok((JailId(jid), PathBuf::from(OsString::from_vec(path))))
 }
 
 #[cfg(not(target_os = "freebsd"))]
-pub fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
+pub fn find_jail(name: &str) -> io::Result<(JailId, PathBuf)> {
   Err(io::Error::new(
     io::ErrorKind::Unsupported,
     format!("jail {name:?}: jails are FreeBSD's"),
@@ -56,21 +59,21 @@ pub fn find_jail(name: &str) -> io::Result<(libc::c_int, PathBuf)> {
 }
 
 /// The id of the running jail named `name`, if a name is given.
-pub fn jail_id(name: Option<&str>) -> io::Result<Option<libc::c_int>> {
+pub fn jail_id(name: Option<&str>) -> io::Result<Option<JailId>> {
   name
-    .map(|name| find_jail(name).map(|(jid, _)| jid))
+    .map(|name| find_jail(name).map(|(jail, _)| jail))
     .transpose()
 }
 
 #[cfg(target_os = "freebsd")]
-pub(crate) fn attach(jid: libc::c_int) -> io::Result<()> {
+pub(crate) fn attach(jail: JailId) -> io::Result<()> {
   // SAFETY: jail_attach touches no memory.
-  crate::check(unsafe { libc::jail_attach(jid) })?;
+  crate::check(unsafe { libc::jail_attach(jail.0) })?;
   Ok(())
 }
 
 /// Never called, because `find_jail` always fails off FreeBSD.
 #[cfg(not(target_os = "freebsd"))]
-pub(crate) fn attach(_: libc::c_int) -> io::Result<()> {
+pub(crate) fn attach(_: JailId) -> io::Result<()> {
   Err(io::ErrorKind::Unsupported.into())
 }

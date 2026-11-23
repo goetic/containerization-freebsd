@@ -1,15 +1,16 @@
 //! Sockets opened from a child process attached to a jail, so that paths and
 //! loopback are the jail's, and passed back over SCM_RIGHTS.
 
-use crate::jail::attach;
+use crate::jail::{JailId, attach};
 use crate::process::reap;
-use crate::{check, close_on_exec};
+use crate::{c_string, check, close_on_exec, retry};
 use std::ffi::CStr;
 use std::io;
 use std::mem::{self, MaybeUninit};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::ptr;
 
 /// A socket address in the kernel's format.
@@ -38,12 +39,13 @@ impl SocketAddress {
   }
 
   /// The Unix socket at `path`.
-  pub fn unix(path: &CStr) -> io::Result<Self> {
+  pub fn unix(path: impl AsRef<Path>) -> io::Result<Self> {
+    let path = path.as_ref();
+    let bytes = c_string(path)?.into_bytes();
     // SAFETY: all zeros is a valid, unnamed Unix socket address; the path is
     // filled in below.
     let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let bytes = path.to_bytes();
     // Leave room for a terminating NUL.
     let longest = address.sun_path.len() - 1;
     if bytes.len() > longest {
@@ -52,7 +54,7 @@ impl SocketAddress {
         format!("{path:?} is over the {longest} bytes a socket's path may have"),
       ));
     }
-    for (to, &from) in address.sun_path.iter_mut().zip(bytes) {
+    for (to, &from) in address.sun_path.iter_mut().zip(&bytes) {
       *to = from as libc::c_char;
     }
 
@@ -88,12 +90,12 @@ impl SocketAddress {
 }
 
 /// Connects to the first of `addresses` that accepts, from a child process
-/// attached to jail `jid`, so paths and loopback are the jail's.
-pub fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::Result<OwnedFd> {
+/// attached to `jail`, so paths and loopback are the jail's.
+pub fn connect_in(jail: JailId, addresses: &[SocketAddress]) -> io::Result<OwnedFd> {
   // SAFETY: the closure makes only async-signal-safe system calls on data it
   // borrows, and allocates nothing.
   let connected = unsafe {
-    in_jail(jid, || {
+    in_jail(jail, || {
       let mut error = libc::EADDRNOTAVAIL;
       for address in addresses {
         let socket = libc::socket(address.family(), libc::SOCK_STREAM, 0);
@@ -101,7 +103,7 @@ pub fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::Result<O
           return Err(errno());
         }
         if libc::connect(socket, address.as_ptr(), address.length) == 0 {
-          return Ok(socket);
+          return Ok(Some(socket));
         }
         error = errno();
         libc::close(socket);
@@ -113,19 +115,20 @@ pub fn connect_in(jid: libc::c_int, addresses: &[SocketAddress]) -> io::Result<O
 }
 
 /// Creates a Unix socket listening at `path` from a child process attached
-/// to jail `jid`, so the path is the jail's. Any socket already at `path` is
+/// to `jail`, so the path is the jail's. Any socket already at `path` is
 /// replaced. If `mode` is given, the socket file gets those permissions.
 // mode_t is u16 on FreeBSD and macOS, but u32 on Linux.
 #[allow(clippy::unnecessary_cast)]
-pub fn listen_in(jid: libc::c_int, path: &CStr, mode: Option<u16>) -> io::Result<OwnedFd> {
-  let address = SocketAddress::unix(path)?;
+pub fn listen_in(jail: JailId, path: impl AsRef<Path>, mode: Option<u16>) -> io::Result<OwnedFd> {
+  let address = SocketAddress::unix(&path)?;
+  let path = c_string(path.as_ref())?;
   // bind(2) creates the socket file as 0777 & ~umask.
   let mask = mode.map(|mode| !mode & 0o777);
 
   // SAFETY: as in `connect_in`.
   let listening = unsafe {
-    in_jail(jid, || {
-      unlink_socket(path)?;
+    in_jail(jail, || {
+      unlink_socket(&path)?;
       if let Some(mask) = mask {
         libc::umask(mask as libc::mode_t);
       }
@@ -136,37 +139,45 @@ pub fn listen_in(jid: libc::c_int, path: &CStr, mode: Option<u16>) -> io::Result
       {
         return Err(errno());
       }
-      Ok(socket)
+      Ok(Some(socket))
     })
   };
   listening?.ok_or_else(|| io::Error::other("the child sent no socket"))
 }
 
 /// Removes the socket at `path`, if there is one, from a child process
-/// attached to jail `jid`.
-pub fn remove_socket_in(jid: libc::c_int, path: &CStr) -> io::Result<()> {
+/// attached to `jail`.
+pub fn remove_socket_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<()> {
+  let path = c_string(path.as_ref())?;
+
   // SAFETY: as in `connect_in`.
-  unsafe { in_jail(jid, || unlink_socket(path).map(|()| -1)) }?;
+  unsafe { in_jail(jail, || unlink_socket(&path).map(|()| None)) }?;
   Ok(())
 }
 
-/// Waits until `listener` has a connection or `stop` is ready. Returns false
-/// if `stop` is ready, even with a connection pending, and true otherwise.
-pub fn wait_for_connection(listener: BorrowedFd, stop: BorrowedFd) -> io::Result<bool> {
+/// What `wait_for_connection` found ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ready {
+  Connection,
+  /// The stop descriptor, even if a connection is pending too.
+  Stop,
+}
+
+/// Waits until `listener` has a connection or `stop` is ready.
+pub fn wait_for_connection(listener: BorrowedFd, stop: BorrowedFd) -> io::Result<Ready> {
   let mut descriptors = [listener, stop].map(|fd| libc::pollfd {
     fd: fd.as_raw_fd(),
     events: libc::POLLIN,
     revents: 0,
   });
 
-  loop {
-    // SAFETY: poll writes only the revents of the descriptors it is given.
-    match check(unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as libc::nfds_t, -1) }) {
-      Ok(_) => return Ok(descriptors[1].revents == 0),
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-      Err(error) => return Err(error),
-    }
-  }
+  // SAFETY: poll writes only the revents of the descriptors it is given.
+  retry(|| unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as libc::nfds_t, -1) })?;
+  Ok(if descriptors[1].revents == 0 {
+    Ready::Connection
+  } else {
+    Ready::Stop
+  })
 }
 
 /// Unlinks `path` if it is a socket. Allocates nothing, so a forked child
@@ -190,8 +201,8 @@ fn unlink_socket(path: &CStr) -> Result<(), libc::c_int> {
   Ok(())
 }
 
-/// Runs `act` in a child process attached to jail `jid` and receives the
-/// descriptor `act` returns, unless it returns -1. If `act` fails, the child
+/// Runs `act` in a child process attached to `jail` and receives the
+/// descriptor `act` returns, if it returns one. If `act` fails, the child
 /// exits with the errno as its status.
 ///
 /// A child that sends a descriptor waits until the parent has received it
@@ -204,8 +215,8 @@ fn unlink_socket(path: &CStr) -> Result<(), libc::c_int> {
 /// The child is a fork of a multithreaded process, so `act` must make only
 /// async-signal-safe calls and allocate nothing.
 unsafe fn in_jail(
-  jid: libc::c_int,
-  act: impl FnOnce() -> Result<libc::c_int, libc::c_int>,
+  jail: JailId,
+  act: impl FnOnce() -> Result<Option<libc::c_int>, libc::c_int>,
 ) -> io::Result<Option<OwnedFd>> {
   let (ours, theirs) = UnixStream::pair()?;
 
@@ -213,13 +224,13 @@ unsafe fn in_jail(
   // which the caller's guarantee about `act` makes safe after fork.
   let pid = check(unsafe { libc::fork() })?;
   if pid == 0 {
-    let done = attach(jid)
+    let done = attach(jail)
       .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
       .and_then(|()| act())
       .and_then(|fd| {
-        if fd == -1 {
+        let Some(fd) = fd else {
           return Ok(());
-        }
+        };
         send_fd(theirs.as_raw_fd(), fd)?;
         // Wait for the parent to receive the descriptor and close its end.
         // The child inherited a copy of that end, so it closes it first.

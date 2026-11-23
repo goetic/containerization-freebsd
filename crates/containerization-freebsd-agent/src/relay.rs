@@ -28,12 +28,11 @@ pub(crate) fn connect(connect: &Connect, outbox: Outbox) -> io::Result<Handle> {
         SocketAddr::from((Ipv6Addr::LOCALHOST, *port)),
       ][..],
     )?),
-    (Address::Port(port), Some(jid)) => Connection::Tcp(sys::connect_in(jid, &SocketAddress::loopback(*port))?.into()),
-    (Address::Unix(path), None) => Connection::Unix(UnixStream::connect(path)?),
-    (Address::Unix(path), Some(jid)) => {
-      let address = SocketAddress::unix(&sys::path(path)?)?;
-      Connection::Unix(sys::connect_in(jid, &[address])?.into())
+    (Address::Port(port), Some(jail)) => {
+      Connection::Tcp(sys::connect_in(jail, &SocketAddress::loopback(*port))?.into())
     }
+    (Address::Unix(path), None) => Connection::Unix(UnixStream::connect(path)?),
+    (Address::Unix(path), Some(jail)) => Connection::Unix(sys::connect_in(jail, &[SocketAddress::unix(path)?])?.into()),
   };
 
   Ok(start(connection, outbox))

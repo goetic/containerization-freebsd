@@ -2,13 +2,14 @@
 //! limits, umask, user and directory, or running a guest `/rescue` tool in
 //! place of its program.
 
-use crate::check;
-use crate::jail::attach;
+use crate::jail::{JailId, attach};
+use crate::{c_string, check};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, PipeReader, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::ptr;
 
@@ -32,11 +33,11 @@ pub struct Ids {
 
 /// The setup a process performs between fork and exec.
 pub struct Entry {
-  pub jid: Option<libc::c_int>,
+  pub jail: Option<JailId>,
   pub limits: Vec<Limit>,
   pub umask: Option<u16>,
   pub ids: Option<Ids>,
-  pub cwd: Option<CString>,
+  pub cwd: Option<PathBuf>,
 }
 
 /// The step of an `Entry` that failed.
@@ -105,15 +106,16 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering
     })
     .collect();
   let umask = entry.umask.map(|umask| umask as libc::mode_t);
-  let Entry { jid, ids, cwd, .. } = entry;
+  let cwd = entry.cwd.as_ref().map(c_string).transpose()?;
+  let Entry { jail, ids, .. } = entry;
 
   // SAFETY: between fork and exec, the closure makes only async-signal-safe
   // system calls on data it owns, and allocates nothing.
   unsafe {
     command.pre_exec(move || {
       let report = writer.as_fd();
-      if let Some(jid) = jid {
-        attach(jid).map_err(failed_at(report, Step::Jail))?;
+      if let Some(jail) = jail {
+        attach(jail).map_err(failed_at(report, Step::Jail))?;
       }
       for (resource, limit) in &limits {
         check(libc::setrlimit(*resource as _, limit)).map_err(failed_at(report, Step::Limits))?;
@@ -162,13 +164,11 @@ unsafe impl Sync for Rescue {}
 /// contain it. The environment is the agent's, overlaid with the command's.
 pub fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> {
   use std::collections::BTreeMap;
-  use std::os::unix::ffi::OsStrExt;
 
-  let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, what.to_string());
   let name = argv
     .first()
     .filter(|name| !name.is_empty() && !name.contains('/') && *name != "." && *name != "..")
-    .ok_or_else(|| invalid("no rescue tool is named"))?;
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no rescue tool is named"))?;
   let tool = File::open(format!("/rescue/{name}"))
     .map_err(|error| io::Error::new(error.kind(), format!("/rescue/{name}: {error}")))?;
 
@@ -179,14 +179,17 @@ pub fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> 
       None => environment.remove(name),
     };
   }
-  let cstring = |bytes: Vec<u8>| CString::new(bytes).map_err(|_| invalid("an argument or variable has a NUL"));
-  let args = argv
-    .iter()
-    .map(|arg| cstring(arg.clone().into_bytes()))
-    .collect::<io::Result<Vec<_>>>()?;
+  let args = argv.iter().map(c_string).collect::<io::Result<Vec<_>>>()?;
   let variables = environment
-    .iter()
-    .map(|(name, value)| cstring([name.as_bytes(), b"=", value.as_bytes()].concat()))
+    .into_iter()
+    .map(|(name, value)| {
+      let mut variable = name.clone();
+      variable.push("=");
+      variable.push(value);
+      // The error names only the variable, since its value may be a secret.
+      c_string(variable)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("variable {name:?} has a NUL")))
+    })
     .collect::<io::Result<Vec<_>>>()?;
   let pointers = |strings: &[CString]| {
     let mut pointers: Vec<_> = strings.iter().map(|string| string.as_ptr()).collect();

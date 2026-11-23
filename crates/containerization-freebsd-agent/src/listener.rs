@@ -2,7 +2,7 @@
 //! session loop relays each connection on a new Accepted channel.
 
 use crate::session::{Handle, Outbox};
-use crate::sys;
+use crate::sys::{self, JailId, Ready};
 use containerization_freebsd_protocol::{Listen, Message};
 use std::fs;
 use std::io::{self, PipeReader, PipeWriter, Read, Write};
@@ -16,7 +16,7 @@ use std::thread;
 /// for a later Listen to replace.
 pub(crate) struct Listening {
   stop: PipeWriter,
-  jail: Option<libc::c_int>,
+  jail: Option<JailId>,
   path: String,
 }
 
@@ -55,9 +55,9 @@ pub(crate) fn listen(listen: &Listen, outbox: Outbox) -> io::Result<Handle> {
 }
 
 /// Binds a socket listening at `path`, replacing any socket already there.
-fn bind(jail: Option<libc::c_int>, path: &str, mode: Option<u16>) -> io::Result<UnixListener> {
-  if let Some(jid) = jail {
-    return Ok(sys::listen_in(jid, &sys::path(path)?, mode)?.into());
+fn bind(jail: Option<JailId>, path: &str, mode: Option<u16>) -> io::Result<UnixListener> {
+  if let Some(jail) = jail {
+    return Ok(sys::listen_in(jail, path, mode)?.into());
   }
   remove(None, path)?;
   let listener = UnixListener::bind(path)?;
@@ -68,9 +68,9 @@ fn bind(jail: Option<libc::c_int>, path: &str, mode: Option<u16>) -> io::Result<
 }
 
 /// Removes the socket at `path`, if there is one.
-fn remove(jail: Option<libc::c_int>, path: &str) -> io::Result<()> {
-  if let Some(jid) = jail {
-    return sys::remove_socket_in(jid, &sys::path(path)?);
+fn remove(jail: Option<JailId>, path: &str) -> io::Result<()> {
+  if let Some(jail) = jail {
+    return sys::remove_socket_in(jail, path);
   }
   match fs::symlink_metadata(path) {
     Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path),
@@ -86,8 +86,8 @@ fn remove(jail: Option<libc::c_int>, path: &str) -> io::Result<()> {
 fn accept(listener: &UnixListener, mut stopped: PipeReader, outbox: &Outbox) -> bool {
   loop {
     match sys::wait_for_connection(listener.as_fd(), stopped.as_fd()) {
-      Ok(true) => {}
-      Ok(false) => return stopped.read(&mut [0]).is_ok_and(|read| read == 1),
+      Ok(Ready::Connection) => {}
+      Ok(Ready::Stop) => return stopped.read(&mut [0]).is_ok_and(|read| read == 1),
       Err(error) => {
         outbox.send(Message::Error(format!("waiting for a connection: {error}")));
         return false;
