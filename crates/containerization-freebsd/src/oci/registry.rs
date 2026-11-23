@@ -2,6 +2,7 @@ use super::auth::{Access, Auth, Credentials, Secret, TokenResponse, parse_challe
 use super::curl::{self, Request, Response};
 use super::{ContentStore, Descriptor, Digest, Reference, media_type};
 use crate::error::{Error, Result};
+use crate::scratch::Scratch;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
@@ -33,59 +34,56 @@ impl RegistryClient {
   /// digest. A manifest over `MAX_MANIFEST` bytes is refused.
   pub fn fetch_manifest(&self, reference: &Reference, target: &str, store: &ContentStore) -> Result<Descriptor> {
     let partial = store.partial();
-    let result = (|| {
-      let response = self.get(
-        reference,
-        &format!("manifests/{target}"),
-        Some(&media_type::MANIFESTS.join(", ")),
-        &partial,
-        Some(MAX_MANIFEST),
-      )?;
-      // curl before 8.4 can't stop a download whose size the registry
-      // didn't send up front.
-      let size = std::fs::metadata(&partial)
-        .map_err(Error::io("reading a manifest"))?
-        .len();
-      if size > MAX_MANIFEST {
-        return Err(Error::Guest(format!(
-          "{reference}'s manifest {target} is {size} bytes, over the {MAX_MANIFEST}-byte limit"
-        )));
-      }
-      let bytes = std::fs::read(&partial).map_err(Error::io("reading a manifest"))?;
-      let digest = Digest::of(&bytes);
-      if let Ok(expected) = target.parse::<Digest>()
-        && digest != expected
-      {
-        return Err(Error::Checksum {
-          path: partial.clone(),
-          actual: digest.to_string(),
-          expected: target.to_string(),
-        });
-      }
+    let response = self.get(
+      reference,
+      &format!("manifests/{target}"),
+      Some(&media_type::MANIFESTS.join(", ")),
+      partial.path(),
+      Some(MAX_MANIFEST),
+    )?;
+    // curl before 8.4 can't stop a download whose size the registry didn't
+    // send up front.
+    let size = std::fs::metadata(partial.path())
+      .map_err(Error::io("reading a manifest"))?
+      .len();
+    if size > MAX_MANIFEST {
+      return Err(Error::Guest(format!(
+        "{reference}'s manifest {target} is {size} bytes, over the {MAX_MANIFEST}-byte limit"
+      )));
+    }
+    let bytes = std::fs::read(partial.path()).map_err(Error::io("reading a manifest"))?;
+    let digest = Digest::of(&bytes);
+    if let Ok(expected) = target.parse::<Digest>()
+      && digest != expected
+    {
+      return Err(Error::Checksum {
+        path: partial.path().to_path_buf(),
+        actual: digest.to_string(),
+        expected: target.to_string(),
+      });
+    }
 
-      let descriptor = Descriptor {
-        media_type: media_type_of(response.header("content-type"), &bytes),
-        digest,
-        size,
-        platform: None,
-        annotations: Default::default(),
-      };
-      store.commit(&partial, &descriptor.digest)?;
-      Ok(descriptor)
-    })();
-
-    let _ = std::fs::remove_file(&partial);
-    result
+    let descriptor = Descriptor {
+      media_type: media_type_of(response.header("content-type"), &bytes),
+      digest,
+      size,
+      platform: None,
+      annotations: Default::default(),
+    };
+    store.commit(partial, &descriptor.digest)?;
+    Ok(descriptor)
   }
 
   pub fn fetch_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
     let partial = store.partial();
-    let result = self
-      .get(reference, &format!("blobs/{}", descriptor.digest), None, &partial, None)
-      .and_then(|_| store.ingest_file(&partial, descriptor));
-
-    let _ = std::fs::remove_file(&partial);
-    result
+    self.get(
+      reference,
+      &format!("blobs/{}", descriptor.digest),
+      None,
+      partial.path(),
+      None,
+    )?;
+    store.ingest_file(partial, descriptor)
   }
 
   /// Uploads `descriptor`'s blob unless a HEAD finds it in the repository,
@@ -145,20 +143,16 @@ impl RegistryClient {
     store: &ContentStore,
   ) -> Result<()> {
     let document = store.path(&descriptor.digest)?;
-    let response_body = store.partial();
+    let response_body = Scratch::temporary();
     let mut put = Request::new("PUT", url(reference, &format!("manifests/{target}")));
     put.content_type = Some(&descriptor.media_type);
     put.upload = Some(&document);
-    put.output = Some(&response_body);
+    put.output = Some(response_body.path());
 
-    let result = self
-      .send(reference, &put, Access::Push)
-      .and_then(|response| match response.status {
-        201 => Ok(()),
-        status => Err(unexpected(&put, status, Some(&response_body))),
-      });
-    let _ = std::fs::remove_file(&response_body);
-    result
+    match self.send(reference, &put, Access::Push)?.status {
+      201 => Ok(()),
+      status => Err(unexpected(&put, status, Some(response_body.path()))),
+    }
   }
 
   /// GETs `path` under the repository into the file `body`, failing on any
@@ -233,13 +227,11 @@ impl RegistryClient {
   /// credentials, and caches it under `key`.
   fn fetch_token(&self, reference: &Reference, key: &(String, Access), url: &url::Url) -> Result<Secret> {
     let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
-    let body = curl::tempfile_path();
+    let body = Scratch::temporary();
     let mut get = Request::new("GET", url.to_string());
-    get.output = Some(&body);
-    let response = curl::send(&get, &auth);
-    let bytes = std::fs::read(&body).unwrap_or_default();
-    let _ = std::fs::remove_file(&body);
-    let response = response?;
+    get.output = Some(body.path());
+    let response = curl::send(&get, &auth)?;
+    let bytes = std::fs::read(body.path()).unwrap_or_default();
     if response.status != 200 {
       return Err(Error::Command {
         command: format!("GET {url}"),

@@ -3,8 +3,9 @@
 
 use super::auth::Auth;
 use crate::error::{Error, Result};
+use crate::scratch::Scratch;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// curl's exit status when a response body is over `max-filesize`.
@@ -105,16 +106,15 @@ impl Response {
 }
 
 pub(super) fn send(request: &Request, auth: &Auth) -> Result<Response> {
-  let headers = tempfile_path();
-  let config = request.config(auth, &headers);
+  let headers = Scratch::temporary();
+  let config = request.config(auth, headers.path());
   let command = format!("curl {} {}", request.method, request.url);
-  let result = run(&config, &command, request.max_size).map(|status| Response {
-    status,
-    headers: last_headers(&std::fs::read_to_string(&headers).unwrap_or_default()),
-  });
+  let status = run(&config, &command, request.max_size)?;
 
-  let _ = std::fs::remove_file(&headers);
-  result
+  Ok(Response {
+    status,
+    headers: last_headers(&std::fs::read_to_string(headers.path()).unwrap_or_default()),
+  })
 }
 
 /// A curl config file (`--config`), one option per line.
@@ -172,18 +172,6 @@ fn run(config: &str, command: &str, max_size: Option<u64>) -> Result<u16> {
     .trim()
     .parse()
     .map_err(|_| failed("wrote no HTTP status".to_string()))
-}
-
-/// A unique scratch path in the temporary directory.
-pub(super) fn tempfile_path() -> PathBuf {
-  use std::sync::atomic::{AtomicU64, Ordering};
-  static NEXT: AtomicU64 = AtomicU64::new(0);
-
-  std::env::temp_dir().join(format!(
-    "containerization-freebsd-curl-{}-{}",
-    std::process::id(),
-    NEXT.fetch_add(1, Ordering::Relaxed)
-  ))
 }
 
 /// `value` as a double-quoted string in curl's config syntax.

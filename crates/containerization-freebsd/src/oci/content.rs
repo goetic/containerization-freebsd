@@ -1,10 +1,10 @@
 use super::{Descriptor, Document, ImageConfig, Manifest, parse};
 use crate::digest::{Digest, Hashing, sha256_file};
 use crate::error::{Error, Result};
+use crate::scratch::Scratch;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where an OCI image layout keeps its blobs, relative to its root.
 pub(crate) const BLOBS: &str = "blobs/sha256";
@@ -77,21 +77,20 @@ impl ContentStore {
     let digest = Digest::of(bytes);
     let partial = self.partial();
 
-    std::fs::write(&partial, bytes).map_err(Error::io(format!("writing {}", partial.display())))?;
-    self.commit(&partial, &digest)?;
+    std::fs::write(partial.path(), bytes).map_err(Error::io(format!("writing {}", partial.path().display())))?;
+    self.commit(partial, &digest)?;
     Ok(digest)
   }
 
-  /// Moves `partial`, a path from `partial()`, into the store as
-  /// `descriptor`'s blob, or deletes it if its digest or size differs.
-  pub(crate) fn ingest_file(&self, partial: &Path, descriptor: &Descriptor) -> Result<()> {
-    let (hex, size) = sha256_file(partial)?;
+  /// Moves `partial`, from `partial()`, into the store as `descriptor`'s
+  /// blob, or drops it, removing the file, if its digest or size differs.
+  pub(crate) fn ingest_file(&self, partial: Scratch, descriptor: &Descriptor) -> Result<()> {
+    let (hex, size) = sha256_file(partial.path())?;
     let digest = Digest::from_sha256(&hex);
 
     if digest != descriptor.digest || size != descriptor.size {
-      let _ = std::fs::remove_file(partial);
       return Err(Error::Checksum {
-        path: partial.to_path_buf(),
+        path: partial.path().to_path_buf(),
         actual: format!("{digest} ({size} bytes)"),
         expected: format!("{} ({} bytes)", descriptor.digest, descriptor.size),
       });
@@ -103,41 +102,28 @@ impl ContentStore {
   /// are written, and fails on a digest mismatch.
   pub(crate) fn ingest_from(&self, reader: &mut impl Read, digest: &Digest) -> Result<()> {
     let partial = self.partial();
-    let written = File::create(&partial)
+    let actual = File::create(partial.path())
       .and_then(|file| {
         let mut hashing = Hashing::new(file);
         io::copy(reader, &mut hashing)?;
         Ok(Digest::from_sha256(&hashing.finish()))
       })
-      .map_err(Error::io(format!("writing {}", partial.display())));
+      .map_err(Error::io(format!("writing {}", partial.path().display())))?;
 
-    match written {
-      Ok(actual) if actual == *digest => self.commit(&partial, digest),
-      Ok(actual) => {
-        let _ = std::fs::remove_file(&partial);
-        Err(Error::Checksum {
-          path: partial,
-          actual: actual.to_string(),
-          expected: digest.to_string(),
-        })
-      }
-      Err(error) => {
-        let _ = std::fs::remove_file(&partial);
-        Err(error)
-      }
+    if actual != *digest {
+      return Err(Error::Checksum {
+        path: partial.path().to_path_buf(),
+        actual: actual.to_string(),
+        expected: digest.to_string(),
+      });
     }
+    self.commit(partial, digest)
   }
 
-  /// A unique path under `ingest/`, on the store's file system so that a
+  /// A scratch path under `ingest/`, on the store's file system so that a
   /// verified blob can be renamed into place.
-  pub(crate) fn partial(&self) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    self.root.join("ingest").join(format!(
-      "{}-{}",
-      std::process::id(),
-      NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+  pub(crate) fn partial(&self) -> Scratch {
+    Scratch::new_in(&self.root.join("ingest"), "")
   }
 
   pub fn delete(&self, digest: &Digest) -> Result<()> {
@@ -167,12 +153,12 @@ impl ContentStore {
     Ok(digests)
   }
 
-  /// Moves `partial`, a path from `partial()`, into the store as the blob
-  /// `digest`, which the caller has verified.
-  pub(crate) fn commit(&self, partial: &Path, digest: &Digest) -> Result<()> {
+  /// Moves `partial`, from `partial()`, into the store as the blob `digest`,
+  /// which the caller has verified.
+  pub(crate) fn commit(&self, partial: Scratch, digest: &Digest) -> Result<()> {
     let path = self.path(digest)?;
 
-    std::fs::rename(partial, &path).map_err(Error::io(format!("moving blob {digest} into place")))
+    std::fs::rename(partial.path(), &path).map_err(Error::io(format!("moving blob {digest} into place")))
   }
 }
 
@@ -201,7 +187,8 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let store = ContentStore::new(root.path()).unwrap();
     let partial = store.partial();
-    std::fs::write(&partial, b"other").unwrap();
+    let path = partial.path().to_path_buf();
+    std::fs::write(&path, b"other").unwrap();
     let descriptor = Descriptor {
       media_type: super::super::media_type::LAYER.into(),
       digest: Digest::of(b"blob"),
@@ -210,10 +197,10 @@ mod tests {
       annotations: Default::default(),
     };
 
-    let error = store.ingest_file(&partial, &descriptor).unwrap_err();
+    let error = store.ingest_file(partial, &descriptor).unwrap_err();
 
     assert!(matches!(error, Error::Checksum { .. }), "{error}");
-    assert!(!partial.exists());
+    assert!(!path.exists());
     assert!(!store.has(&descriptor.digest));
   }
 }
