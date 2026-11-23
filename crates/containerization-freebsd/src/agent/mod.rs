@@ -147,7 +147,8 @@ impl Agent {
   /// Starts a session with an agent that is already running and so will not
   /// announce itself, as after a restore.
   pub(crate) fn rejoin(&self) -> Result<()> {
-    self.shared.lock().hello()
+    let written = self.shared.lock().hello();
+    written.wait()
   }
 
   /// How many sessions with the agent have started. Each boot and restore
@@ -220,37 +221,41 @@ impl Agent {
   /// is synced at the start of each session, and a machine also syncs it
   /// every 30 seconds while it runs.
   pub fn sync_clock(&self) -> Result<()> {
-    self.shared.lock().sync_clock()
+    let written = self.shared.lock().sync_clock()?;
+    written.wait()
   }
 
   /// Starts `argv` in the guest without waiting for Opened, for commands
   /// that may never report back, such as one that powers off the guest.
   pub fn launch(&self, argv: &[&str]) -> Result<()> {
-    let mut state = self.shared.lock();
     let what = format!("{argv:?}");
+    let (opened, ended) = {
+      let mut state = self.shared.lock();
+      let (channel, frame) = state
+        .mux
+        .open(Message::Exec(Exec::new(argv)))
+        .map_err(Error::protocol(&what))?;
+      (state.queue(frame), state.send(channel, Message::Eof, &what)?)
+    };
 
-    let (channel, frame) = state
-      .mux
-      .open(Message::Exec(Exec::new(argv)))
-      .map_err(Error::protocol(&what))?;
-    state.write(&frame)?;
-    state.send(channel, Message::Eof, &what)
+    opened.wait()?;
+    ended.wait()
   }
 
   /// Opens a channel with `message` and waits for the agent to send Opened.
   /// For a Listen channel, connections are relayed to `host`.
   fn open(&self, message: Message, what: String, host: Option<PathBuf>) -> Result<Stream> {
     let (sender, receiver) = mpsc::channel();
-    let channel = {
+    let (channel, written) = {
       let mut state = self.shared.lock();
       let (channel, frame) = state.mux.open(message).map_err(Error::protocol(&what))?;
       state
         .channels
         .insert(channel, Route { sender, relay_to: host });
-      state.write(&frame)?;
-      channel
+      (channel, state.queue(frame))
     };
 
+    written.wait()?;
     Stream::new(channel, self.shared.clone(), receiver, what).opened()
   }
 }
@@ -258,7 +263,7 @@ impl Agent {
 #[cfg(test)]
 pub(crate) mod tests {
   use super::*;
-  use containerization_freebsd_protocol::{VERSION, WINDOW};
+  use containerization_freebsd_protocol::{Decoder, Mux, Side, VERSION, WINDOW};
   use std::io::{Read, Write};
   use std::net::TcpListener;
 
@@ -457,6 +462,97 @@ pub(crate) mod tests {
 
     let (output, exit) = finish(&process);
     assert_eq!((output.trim(), exit), (input.len().to_string().as_str(), Exit::Code(0)));
+  }
+
+  /// A guest that speaks the protocol by hand and never reports what it read
+  /// from the console, so the host's window stays shut once it fills.
+  struct SilentGuest {
+    mux: Mux,
+    decoder: Decoder,
+    input: PipeReader,
+    output: PipeWriter,
+  }
+
+  impl SilentGuest {
+    /// Starts a session with a new agent, and returns both.
+    fn start() -> (Agent, Self) {
+      let (output, guest_output) = std::io::pipe().unwrap();
+      let (guest_input, input) = std::io::pipe().unwrap();
+      let agent = Agent::new(output, input);
+      let mut guest = Self {
+        mux: Mux::new(Side::Guest),
+        decoder: Decoder::new(),
+        input: guest_input,
+        output: guest_output,
+      };
+
+      // The guest announces itself, then answers the host's Hello.
+      guest.hello();
+      guest.receive();
+      guest.hello();
+      agent.wait_ready(TIMEOUT).expect("a session");
+      (agent, guest)
+    }
+
+    fn hello(&mut self) {
+      let hello = self.mux.hello();
+      self.output.write_all(&hello.to_bytes()).unwrap();
+    }
+
+    fn send(&mut self, channel: u32, message: Message) {
+      let frame = self.mux.send(channel, message).unwrap();
+      self.output.write_all(&frame.to_bytes()).unwrap();
+    }
+
+    /// Returns the host's next message.
+    fn receive(&mut self) -> (u32, Message) {
+      loop {
+        if let Some(decoded) = self.decoder.decode() {
+          return self.mux.receive(decoded.unwrap()).unwrap();
+        }
+        self.read();
+      }
+    }
+
+    /// Waits for more of the host's bytes.
+    fn read(&mut self) {
+      let mut buffer = [0; 4096];
+      let read = self.input.read(&mut buffer).unwrap();
+      self.decoder.push(&buffer[..read]);
+    }
+  }
+
+  #[test]
+  fn routes_what_the_agent_sends_while_a_write_waits_for_room() {
+    let (agent, mut guest) = SilentGuest::start();
+    let (cat, channel) = std::thread::scope(|scope| {
+      let spawning = scope.spawn(|| agent.spawn(Exec::new(["cat"])).unwrap());
+      // The host sets the guest's clock first.
+      let channel = loop {
+        if let (channel, Message::Exec(_)) = guest.receive() {
+          break channel;
+        }
+      };
+      guest.send(channel, Message::Opened);
+      (spawning.join().unwrap(), channel)
+    });
+
+    // The Exec frame is longer than the window, so writing it stops partway.
+    let argument = "y".repeat(2 * WINDOW);
+    std::thread::scope(|scope| {
+      let blocked = scope.spawn(|| agent.spawn(Exec::new(["echo", argument.as_str()])));
+      guest.read();
+
+      guest.send(channel, Message::Data(b"routed".to_vec()));
+      assert!(matches!(
+        cat.recv_timeout(TIMEOUT).unwrap(),
+        Some(Output::Stdout(bytes)) if bytes == b"routed"
+      ));
+      assert!(!blocked.is_finished());
+      // Closing the console fails the write instead of leaving it to time out.
+      drop(guest);
+      assert!(blocked.join().unwrap().is_err());
+    });
   }
 
   #[test]

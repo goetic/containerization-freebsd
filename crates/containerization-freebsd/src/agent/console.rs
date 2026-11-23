@@ -1,12 +1,13 @@
-//! The console's window, and the thread that reads the console and reopens
-//! the window as the agent reports what it has read.
+//! The console's window, the thread that reads the console and reopens the
+//! window as the agent reports what it has read, and the thread that writes
+//! to the console as the window allows.
 
 use super::AGENT_TIMEOUT;
 use super::session::Event;
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{CONTROL, Decoder, Frame, Message, Skipped, WINDOW};
-use std::io::{PipeReader, Read};
-use std::sync::mpsc;
+use std::io::{PipeReader, PipeWriter, Read, Write};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Condvar, Mutex, PoisonError};
 
 /// Tracks the console bytes the host has written that the agent has not yet
@@ -80,9 +81,37 @@ impl Credit {
   }
 }
 
+/// A frame for the writer thread, and where to report how writing it went.
+pub(super) struct Outgoing {
+  pub(super) frame: Frame,
+  pub(super) done: SyncSender<Result<()>>,
+}
+
+/// Writes each frame from `queue` to the console in order, in slices as the
+/// window makes room for them, and reports how each went.
+pub(super) fn write(queue: &Receiver<Outgoing>, mut input: PipeWriter, credit: &Credit) {
+  for Outgoing { frame, done } in queue {
+    let _ = done.send(write_frame(&mut input, credit, &frame));
+  }
+}
+
+fn write_frame(input: &mut PipeWriter, credit: &Credit, frame: &Frame) -> Result<()> {
+  let bytes = frame.to_bytes();
+  let mut rest = bytes.as_slice();
+
+  while !rest.is_empty() {
+    let (now, later) = rest.split_at(credit.take(rest.len())?);
+    input
+      .write_all(now)
+      .map_err(Error::io("writing to the guest agent"))?;
+    rest = later;
+  }
+  Ok(())
+}
+
 /// Reads the console, counts the agent's Received reports, and passes
-/// everything to the handler thread. This thread must never lock the
-/// session's state, because a writer holds that lock while it waits for room.
+/// everything to the handler thread. Counting them here, rather than in the
+/// handler thread, reopens the window however busy that thread is.
 pub(super) fn read(mut output: PipeReader, credit: &Credit, events: &mpsc::Sender<Event>) {
   let mut decoder = Decoder::new();
   let mut buffer = vec![0; 64 << 10];

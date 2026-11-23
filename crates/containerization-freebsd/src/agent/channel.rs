@@ -2,7 +2,7 @@
 //! listeners, each over a stream of the agent's messages.
 
 use super::AGENT_TIMEOUT;
-use super::session::Shared;
+use super::session::{Shared, Written};
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{Exit, Message, WINDOW, WindowSize};
 use std::io::{self, Read, Write};
@@ -388,18 +388,22 @@ impl Stream {
   }
 
   fn send(&self, message: Message) -> Result<()> {
-    self.shared.lock().send(self.channel, message, &self.what)
+    let written = self.shared.lock().send(self.channel, message, &self.what)?;
+    written.wait()
   }
 
   /// Like `send`, but only if the channel is still open. Returns whether it
   /// was. A process's channel closes when the process exits, which can happen
   /// before the host has acted on Opened.
   fn send_while_open(&self, message: Message) -> Result<bool> {
-    let mut state = self.shared.lock();
-    if !state.mux.is_open(self.channel) {
-      return Ok(false);
-    }
-    state.send(self.channel, message, &self.what)?;
+    let written = {
+      let mut state = self.shared.lock();
+      if !state.mux.is_open(self.channel) {
+        return Ok(false);
+      }
+      state.send(self.channel, message, &self.what)?
+    };
+    written.wait()?;
     Ok(true)
   }
 
@@ -446,12 +450,17 @@ impl Drop for Stream {
   /// Closes the channel if it is still open, which kills the process or
   /// closes the connection.
   fn drop(&mut self) {
-    let mut state = self.shared.lock();
-
-    if state.channels.contains_key(&self.channel) && state.mux.is_open(self.channel) {
-      state.close(self.channel, "closed by the host");
-    }
-    state.forget(self.channel);
+    let written = {
+      let mut state = self.shared.lock();
+      let written = if state.channels.contains_key(&self.channel) && state.mux.is_open(self.channel) {
+        state.close(self.channel, "closed by the host")
+      } else {
+        Written::nothing()
+      };
+      state.forget(self.channel);
+      written
+    };
+    let _ = written.wait();
   }
 }
 
