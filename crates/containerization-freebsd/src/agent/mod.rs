@@ -199,10 +199,7 @@ impl Agent {
   }
 
   pub(crate) fn relay(&self, connect: Connect) -> Result<Relay> {
-    let what = match &connect.to {
-      Address::Port(port) => format!("port {port}"),
-      Address::Unix(path) => path.clone(),
-    };
+    let what = connect.to_string();
 
     self
       .open(Message::Connect(connect), what, None)
@@ -212,7 +209,7 @@ impl Agent {
   /// Makes the agent listen on the Unix socket `listen` describes, and relays
   /// each connection to the host's socket at `host`.
   pub(crate) fn listen(&self, listen: Listen, host: PathBuf) -> Result<Listener> {
-    let what = listen.path.clone();
+    let what = listen.to_string();
 
     self
       .open(Message::Listen(listen), what, Some(host))

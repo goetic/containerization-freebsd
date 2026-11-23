@@ -163,6 +163,39 @@ pub enum Address {
   Unix(String),
 }
 
+/// `port 80`, or a Unix socket's path in quotes.
+impl fmt::Display for Address {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Port(port) => write!(formatter, "port {port}"),
+      Self::Unix(path) => write!(formatter, "{path:?}"),
+    }
+  }
+}
+
+/// The address, then the jail if there is one: `port 80 in jail "web"`.
+impl fmt::Display for Connect {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(formatter, "{}", self.to)?;
+    in_jail(formatter, self.jail.as_deref())
+  }
+}
+
+/// The socket's path in quotes, then the jail if there is one.
+impl fmt::Display for Listen {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(formatter, "{:?}", self.path)?;
+    in_jail(formatter, self.jail.as_deref())
+  }
+}
+
+fn in_jail(formatter: &mut fmt::Formatter<'_>, jail: Option<&str>) -> fmt::Result {
+  match jail {
+    Some(jail) => write!(formatter, " in jail {jail:?}"),
+    None => Ok(()),
+  }
+}
+
 /// A Unix socket for the agent to listen on. The agent creates the socket
 /// from inside the jail, if there is one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -355,6 +388,37 @@ impl Decode for Resource {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn names_what_a_relay_or_listener_reaches() {
+    let web = Some("web".to_string());
+
+    assert_eq!(
+      Connect {
+        to: Address::Port(80),
+        jail: None,
+      }
+      .to_string(),
+      "port 80"
+    );
+    assert_eq!(
+      Connect {
+        to: Address::Unix("/var/run/a.sock".into()),
+        jail: web.clone(),
+      }
+      .to_string(),
+      r#""/var/run/a.sock" in jail "web""#
+    );
+    assert_eq!(
+      Listen {
+        path: "/var/run/b.sock".into(),
+        jail: web,
+        mode: None,
+      }
+      .to_string(),
+      r#""/var/run/b.sock" in jail "web""#
+    );
+  }
 
   #[test]
   fn says_how_a_process_exited() {

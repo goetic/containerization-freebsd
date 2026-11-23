@@ -8,7 +8,7 @@ use crate::process::{self, Process};
 use crate::relay::{self, Connection};
 use crate::sys;
 use containerization_freebsd_protocol::{
-  Address, CONTROL, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
+  CONTROL, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
 };
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -304,25 +304,13 @@ impl<W: Write> Agent<W> {
 
   fn connect(&mut self, channel: u32, connect: &Connect) -> io::Result<()> {
     self.start(channel, |outbox| {
-      relay::connect(connect, outbox).map_err(|error| {
-        let to = match &connect.to {
-          Address::Port(port) => format!("port {port}"),
-          Address::Unix(path) => format!("{path:?}"),
-        };
-        format!("connecting to {to}{}: {error}", in_jail(connect.jail.as_deref()))
-      })
+      relay::connect(connect, outbox).map_err(|error| format!("connecting to {connect}: {error}"))
     })
   }
 
   fn listen(&mut self, channel: u32, listen: &Listen) -> io::Result<()> {
     self.start(channel, |outbox| {
-      listener::listen(listen, outbox).map_err(|error| {
-        format!(
-          "listening on {:?}{}: {error}",
-          listen.path,
-          in_jail(listen.jail.as_deref())
-        )
-      })
+      listener::listen(listen, outbox).map_err(|error| format!("listening on {listen}: {error}"))
     })
   }
 
@@ -402,10 +390,4 @@ impl<W: Write> Agent<W> {
     self.output.write_all(&frame.to_bytes())?;
     self.output.flush()
   }
-}
-
-fn in_jail(jail: Option<&str>) -> String {
-  jail
-    .map(|jail| format!(" in jail {jail:?}"))
-    .unwrap_or_default()
 }
