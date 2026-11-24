@@ -1,6 +1,7 @@
 //! Files opened, created, and removed from a child process attached to a
 //! jail, so that paths, and any symlinks along them, resolve as they do in
-//! the jail. Opened files are passed back over SCM_RIGHTS.
+//! the jail. Opened files are passed back over SCM_RIGHTS. File flags are
+//! cleared in the calling process.
 
 use crate::jail::JailId;
 use crate::socket::in_jail;
@@ -50,6 +51,16 @@ pub fn create_in(jail: JailId, path: impl AsRef<Path>, mode: u16) -> io::Result<
     })
   }?;
   Ok(created.map(File::from))
+}
+
+/// Clears the file flags, such as `schg`, of the file at `path`, without
+/// following a symlink there.
+pub fn clear_flags(path: impl AsRef<Path>) -> io::Result<()> {
+  let path = c_string(path.as_ref())?;
+
+  // SAFETY: lchflags only reads the path, which outlives the call.
+  crate::check(unsafe { libc::lchflags(path.as_ptr(), 0) })?;
+  Ok(())
 }
 
 /// Removes the file at `path` in `jail`, if there is one.

@@ -7,10 +7,12 @@ use crate::agent::{Agent, Exec, QUICK, Spawn};
 use crate::error::{Error, Result};
 use crate::images::Image;
 use crate::oci::{Descriptor, Platform, media_type};
-use crate::scripts;
 use crate::zfs::{Cache, SnapshotChain, Zfs};
 use std::time::Duration;
 
+/// The guest agent's binary, where the guest bundle installs it. Its
+/// `unpack` subcommand unpacks a layer.
+const AGENT: &str = "/usr/local/sbin/containerization-freebsd-agent";
 /// Extracting a userland-sized layer takes about a minute.
 const UNPACKING: Duration = Duration::from_secs(600);
 /// The snapshot taken of each layer's dataset once the layer is applied.
@@ -95,42 +97,28 @@ impl<'a> Unpacker<'a> {
     Ok(unpacked)
   }
 
-  /// Applies `layer` to the dataset mounted at `root` via the decompressed
-  /// tarball at `staging`. The tarball, and the sha256 and whiteout list
-  /// beside it, are always removed: by `scripts::APPLY` as it exits, or here
-  /// if anything failed.
+  /// Streams `layer`'s blob to the agent's `unpack`, which decompresses it to
+  /// `staging`, checks it against `diff_id`, and applies it to the dataset
+  /// mounted at `root`. The agent removes `staging` as it exits, or this does
+  /// if the agent was killed first.
   fn layer(&self, image: &Image, layer: &Descriptor, diff_id: &str, root: &str, staging: &str) -> Result<()> {
-    let result = self.receive(image, layer, staging).and_then(|()| {
-      self
-        .agent
-        .check(&scripts::APPLY.argv(&[root, staging, diff_id]), UNPACKING)
-        .map(|_| ())
-    });
-    if result.is_err() {
-      let (sha256, whiteouts) = (format!("{staging}.sha256"), format!("{staging}.whiteouts"));
-      let _ = self
-        .agent
-        .run(&["rm", "-f", staging, &sha256, &whiteouts], QUICK);
-    }
-    result
-  }
-
-  /// Streams `layer`'s blob to the guest, which decompresses it to
-  /// `staging`, hashing it and listing its whiteouts as it goes.
-  fn receive(&self, image: &Image, layer: &Descriptor, staging: &str) -> Result<()> {
     let compression = compression(&layer.media_type)?;
     let path = image.content().path(&layer.digest)?;
     let name = path.display().to_string();
     let mut blob = std::fs::File::open(&path).map_err(Error::io(format!("reading {name}")))?;
     let process = self
       .agent
-      .spawn(Exec::new(scripts::DECOMPRESS.argv(&[compression, staging])))?;
+      .spawn(Exec::new([AGENT, "unpack", compression, root, staging, diff_id]))?;
 
-    process.feed(&mut blob, &name, "decompressing", Some(UNPACKING))
+    let result = process.feed(&mut blob, &name, "unpacking", Some(UNPACKING));
+    if result.is_err() {
+      let _ = self.agent.run(&["rm", "-f", staging], QUICK);
+    }
+    result
   }
 }
 
-/// A layer media type's compression, as `scripts::DECOMPRESS` names it.
+/// A layer media type's compression, as the agent's `unpack` names it.
 fn compression(media_type: &str) -> Result<&'static str> {
   match media_type {
     media_type::LAYER | media_type::DOCKER_LAYER => Ok("none"),

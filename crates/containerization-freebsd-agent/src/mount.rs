@@ -7,8 +7,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// How many symlinks resolving one mount point may follow, as many as
-/// FreeBSD's MAXSYMLINKS.
+/// How many symlinks resolving one path may follow, as many as FreeBSD's
+/// MAXSYMLINKS.
 const SYMLINKS: usize = 32;
 
 /// Mounts what `mounting` describes, creating missing directories at its
@@ -19,7 +19,7 @@ pub(crate) fn mount(mounting: &Mount) -> io::Result<()> {
   let point = match &destination.jail {
     Some(jail) => {
       let (_, root) = sys::find_jail(jail)?;
-      resolve(&root, &destination.path)?
+      mount_point(&root, &destination.path)?
     }
     None => PathBuf::from(&destination.path),
   };
@@ -28,12 +28,23 @@ pub(crate) fn mount(mounting: &Mount) -> io::Result<()> {
   sys::mount(&mounting.kind, &mounting.source, &point, &mounting.options)
 }
 
-/// Resolves `path` in the jail rooted at `root`, and returns its guest path.
-/// Symlinks resolve within the root, as under chroot(2): absolute targets
-/// start at the root, and `..` stops there. Resolving from the guest is safe
-/// only while nothing in the jail can swap a directory on the path for a
-/// symlink.
-fn resolve(root: &Path, path: &str) -> io::Result<PathBuf> {
+/// Resolves `path` in the jail rooted at `root` as `resolve` does, refusing
+/// the root itself.
+fn mount_point(root: &Path, path: &str) -> io::Result<PathBuf> {
+  let point = resolve(root, path)?;
+
+  if point == root {
+    return Err(io::Error::new(io::ErrorKind::InvalidInput, "that is the jail's root"));
+  }
+  Ok(point)
+}
+
+/// Resolves `path` in the tree rooted at `root`, such as a jail's, and
+/// returns its guest path. Symlinks resolve within the root, as under
+/// chroot(2): absolute targets start at the root, and `..` stops there.
+/// Resolving from the guest is safe only while nothing in the tree can swap a
+/// directory on the path for a symlink.
+pub(crate) fn resolve(root: &Path, path: &str) -> io::Result<PathBuf> {
   // The components still to resolve, the next one last.
   let mut rest = Vec::new();
   push(&mut rest, Path::new(path));
@@ -60,10 +71,6 @@ fn resolve(root: &Path, path: &str) -> io::Result<PathBuf> {
       }
       _ => resolved.push(part),
     }
-  }
-
-  if resolved.as_os_str().is_empty() {
-    return Err(io::Error::new(io::ErrorKind::InvalidInput, "that is the jail's root"));
   }
   Ok(root.join(resolved))
 }
@@ -169,9 +176,10 @@ mod tests {
     let root = directory.path();
     symlink("loop", root.join("loop")).unwrap();
 
-    let error = |path| resolve(root, path).unwrap_err().to_string();
+    let error = |path| mount_point(root, path).unwrap_err().to_string();
     assert_eq!(error("/loop"), "too many symbolic links");
     assert_eq!(error("/srv/.."), "that is the jail's root");
     assert_eq!(error("/"), "that is the jail's root");
+    assert_eq!(resolve(root, "/srv/..").unwrap(), root);
   }
 }

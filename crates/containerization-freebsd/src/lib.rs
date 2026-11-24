@@ -21,7 +21,6 @@ pub mod oci;
 pub mod prepare;
 pub mod release;
 mod scratch;
-mod scripts;
 pub mod socket;
 #[cfg(test)]
 mod testing;
