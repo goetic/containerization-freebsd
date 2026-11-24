@@ -133,8 +133,8 @@ impl ImageStore {
 mod tests {
   use super::*;
   use crate::images::tests::{descriptor, json, registry};
-  use crate::oci::testing::FakeRegistry;
   use crate::oci::{Index, media_type};
+  use crate::testing::FakeRegistry;
 
   /// Ingests `bytes` and returns a `media_type` descriptor for them.
   fn blob_of(store: &ImageStore, media_type: &str, bytes: &[u8]) -> Descriptor {

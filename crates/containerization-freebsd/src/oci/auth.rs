@@ -3,6 +3,7 @@
 
 use super::Reference;
 use crate::error::{Error, Result};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -52,6 +53,20 @@ pub(super) enum Auth {
   None,
   Bearer(Secret),
   Basic(Credentials),
+}
+
+impl Auth {
+  /// The Authorization header that sends this, if any.
+  pub(super) fn header(&self) -> Option<String> {
+    match self {
+      Self::None => None,
+      Self::Bearer(token) => Some(format!("Bearer {}", token.expose())),
+      Self::Basic(credentials) => {
+        let pair = format!("{}:{}", credentials.username, credentials.password.expose());
+        Some(format!("Basic {}", BASE64_STANDARD.encode(pair)))
+      }
+    }
+  }
 }
 
 /// What a request does to a repository, and so what its token must grant.
@@ -166,6 +181,21 @@ mod tests {
     assert_eq!(scheme, "Basic");
     assert_eq!(parameters["realm"], r#"a "quoted" realm"#);
     assert_eq!(parameters["charset"], "UTF-8");
+  }
+
+  #[test]
+  fn sends_a_token_or_credentials_as_an_authorization_header() {
+    let basic = Auth::Basic(Credentials {
+      username: "user".into(),
+      password: "pass".into(),
+    });
+
+    assert_eq!(basic.header().as_deref(), Some("Basic dXNlcjpwYXNz"));
+    assert_eq!(
+      Auth::Bearer("a-token".into()).header().as_deref(),
+      Some("Bearer a-token")
+    );
+    assert_eq!(Auth::None.header(), None);
   }
 
   #[test]

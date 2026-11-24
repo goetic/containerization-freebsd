@@ -1,14 +1,64 @@
-//! A loopback registry for tests, serving pulls and pushes for any
-//! repository. Like ghcr.io, it requires a bearer token scoped to the
-//! repository: GET and HEAD accept pull or push, POST and PUT need push. Blob
-//! GETs and HEADs redirect to unauthenticated storage outside the API, as
-//! real registries often do.
+//! Loopback HTTP servers for tests: a registry, the files in a directory, and
+//! canned responses in order.
+//!
+//! The registry serves pulls and pushes for any repository. Like ghcr.io, it
+//! requires a bearer token scoped to the repository: GET and HEAD accept pull
+//! or push, POST and PUT need push. Blob GETs and HEADs redirect to
+//! unauthenticated storage outside the API, as real registries often do.
 
-use super::Digest;
+use crate::oci::Digest;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use url::Url;
+
+/// Serves on a thread, answering each request with what `respond` returns
+/// for it and the server's `host:port`, and returns the `host:port`.
+fn serve(mut respond: impl FnMut(&Request, &str) -> Response + Send + 'static) -> String {
+  let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap().to_string();
+  let host = address.clone();
+
+  std::thread::spawn(move || {
+    for mut stream in listener.incoming().flatten() {
+      let Ok(request) = Request::read(&stream, &host) else {
+        continue;
+      };
+      let response = respond(&request, &host);
+      let _ = response.write(&mut stream, request.method == "HEAD");
+    }
+  });
+  address
+}
+
+/// Serves the files in `root`, and returns the server's URL.
+pub(crate) fn serve_files(root: PathBuf) -> String {
+  let address = serve(
+    move |request, _| match std::fs::read(root.join(request.url.path().trim_start_matches('/'))) {
+      Ok(bytes) => Response::ok(bytes),
+      Err(_) => Response::status("404 Not Found"),
+    },
+  );
+  format!("http://{address}")
+}
+
+/// Answers each request with the next of `responses`, and returns the
+/// server's URL and the requests it has received. Once the responses run
+/// out, it answers 400.
+pub(crate) fn serve_in_order(responses: Vec<Response>) -> (String, Arc<Mutex<Vec<Request>>>) {
+  let requests = Arc::new(Mutex::new(Vec::new()));
+  let received = requests.clone();
+  let mut responses = responses.into_iter();
+  let address = serve(move |request, _| {
+    received.lock().unwrap().push(request.clone());
+    responses
+      .next()
+      .unwrap_or_else(|| Response::status("400 Bad Request"))
+  });
+  (format!("http://{address}"), requests)
+}
 
 #[derive(Default)]
 pub(crate) struct FakeRegistry {
@@ -36,20 +86,7 @@ impl FakeRegistry {
 
   /// Serves on a thread and returns the `host:port`.
   pub(crate) fn serve(mut self) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let host = address.clone();
-
-    std::thread::spawn(move || {
-      for mut stream in listener.incoming().flatten() {
-        let Ok(request) = Request::read(&stream, &host) else {
-          continue;
-        };
-        let response = self.respond(&request, &host);
-        let _ = response.write(&mut stream, request.method == "HEAD");
-      }
-    });
-    address
+    serve(move |request, host| self.respond(request, host))
   }
 
   fn respond(&mut self, request: &Request, host: &str) -> Response {
@@ -203,11 +240,12 @@ impl Route {
   }
 }
 
-struct Request {
+#[derive(Clone)]
+pub(crate) struct Request {
   method: String,
   url: Url,
   /// Headers by lowercase name.
-  headers: HashMap<String, String>,
+  pub(crate) headers: HashMap<String, String>,
   body: Vec<u8>,
 }
 
@@ -267,30 +305,42 @@ impl Request {
   }
 }
 
-struct Response {
+pub(crate) struct Response {
   status: &'static str,
   headers: Vec<(&'static str, String)>,
   body: Vec<u8>,
+  /// How many of the body's bytes are sent, if not all of them.
+  cut: Option<usize>,
 }
 
 impl Response {
-  fn status(status: &'static str) -> Self {
+  pub(crate) fn status(status: &'static str) -> Self {
     Self {
       status,
       headers: Vec::new(),
       body: Vec::new(),
+      cut: None,
     }
   }
 
-  fn ok(body: Vec<u8>) -> Self {
-    Self {
-      body,
-      ..Self::status("200 OK")
-    }
+  pub(crate) fn ok(body: Vec<u8>) -> Self {
+    Self::status("200 OK").body(body)
   }
 
-  fn header(mut self, name: &'static str, value: String) -> Self {
+  pub(crate) fn body(mut self, body: Vec<u8>) -> Self {
+    self.body = body;
+    self
+  }
+
+  pub(crate) fn header(mut self, name: &'static str, value: String) -> Self {
     self.headers.push((name, value));
+    self
+  }
+
+  /// Sends only the first `at` bytes of the body before closing the
+  /// connection, though the Content-Length promises them all.
+  pub(crate) fn cut(mut self, at: usize) -> Self {
+    self.cut = Some(at);
     self
   }
 
@@ -306,7 +356,7 @@ impl Response {
       self.body.len()
     )?;
     if !head {
-      stream.write_all(&self.body)?;
+      stream.write_all(&self.body[..self.cut.unwrap_or(self.body.len())])?;
     }
     Ok(())
   }

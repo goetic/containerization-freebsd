@@ -11,7 +11,7 @@ mod copy;
 mod digest;
 mod error;
 mod fat;
-mod host;
+mod http;
 pub mod images;
 pub mod jail;
 #[cfg(feature = "kernel-messages")]
@@ -24,6 +24,8 @@ mod scratch;
 mod scripts;
 pub mod socket;
 pub mod statistics;
+#[cfg(test)]
+mod testing;
 pub mod unpack;
 pub mod zfs;
 

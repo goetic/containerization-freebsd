@@ -330,8 +330,8 @@ fn ref_name(entry: &Descriptor) -> Option<&String> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::oci::testing::FakeRegistry;
   use crate::oci::{RegistryClient, RootFs, RunConfig, media_type};
+  use crate::testing::FakeRegistry;
   use std::time::Duration;
 
   pub(super) fn descriptor(media_type: &str, bytes: &[u8], platform: Option<Platform>) -> Descriptor {

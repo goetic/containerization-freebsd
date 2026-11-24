@@ -1,25 +1,44 @@
 use super::auth::{Access, Auth, Credentials, Secret, TokenResponse, parse_challenge, token_url};
-use super::curl::{self, Method, Request, Response};
 use super::{ContentStore, Descriptor, Digest, Reference, media_type};
 use crate::error::{Error, Result};
-use crate::scratch::Scratch;
+use crate::http::{self, Method, Request, Response};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use url::Url;
 
 /// 4 MiB: the distribution spec says registries should accept manifests at
 /// least this large.
 const MAX_MANIFEST: u64 = 4 << 20;
+/// The most of a token response that is read.
+const MAX_TOKEN: u64 = 1 << 20;
 
-/// A distribution API client over curl(1), which gets tokens and passwords
-/// on stdin rather than in its arguments.
-#[derive(Debug, Default)]
+/// A distribution API client. It keeps its connections open for later
+/// requests, and caches the bearer tokens that registries grant it.
 pub struct RegistryClient {
   credentials: Option<Credentials>,
   /// Bearer tokens, keyed by `<API host>/<repository>` and the access they
   /// grant.
   tokens: Mutex<HashMap<(String, Access), Secret>>,
+  agent: ureq::Agent,
+}
+
+/// Shows the credentials and tokens, which redact their secrets, but not the
+/// agent, whose proxy settings may hold a password.
+impl fmt::Debug for RegistryClient {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("RegistryClient")
+      .field("credentials", &self.credentials)
+      .field("tokens", &self.tokens)
+      .finish_non_exhaustive()
+  }
+}
+
+impl Default for RegistryClient {
+  fn default() -> Self {
+    Self::new(None)
+  }
 }
 
 impl RegistryClient {
@@ -27,6 +46,7 @@ impl RegistryClient {
     Self {
       credentials,
       tokens: Mutex::default(),
+      agent: http::agent(),
     }
   }
 
@@ -34,26 +54,20 @@ impl RegistryClient {
   /// `reference`'s repository into `store`, verifying it if `target` is a
   /// digest. A manifest over `MAX_MANIFEST` bytes is refused.
   pub fn fetch_manifest(&self, reference: &Reference, target: &str, store: &ContentStore) -> Result<Descriptor> {
+    let accept = media_type::MANIFESTS.join(", ");
+    let mut get = Request::new(Method::Get, url(reference, &format!("manifests/{target}"))?);
+    get.accept = Some(&accept);
+    let what = get.to_string();
     let partial = store.partial();
-    let response = self.get(
-      reference,
-      &format!("manifests/{target}"),
-      Some(&media_type::MANIFESTS.join(", ")),
-      partial.path(),
-      Some(MAX_MANIFEST),
-    )?;
-    // curl before 8.4 can't stop a download whose size the registry didn't
-    // send up front.
-    let size = std::fs::metadata(partial.path())
-      .map_err(Error::io("reading a manifest"))?
-      .len();
-    if size > MAX_MANIFEST {
-      return Err(Error::Guest(format!(
-        "{reference}'s manifest {target} is {size} bytes, over the {MAX_MANIFEST}-byte limit"
-      )));
-    }
-    let bytes = std::fs::read(partial.path()).map_err(Error::io("reading a manifest"))?;
-    let digest = Digest::of(&bytes);
+    let mut content_type = None;
+    let downloaded = http::download(partial.path(), Some(MAX_MANIFEST), &what, |from| {
+      get.from = from;
+      let response = self.get(reference, &get)?;
+      content_type = response.header("content-type").map(str::to_string);
+      Ok(response)
+    })?;
+
+    let digest = Digest::from_sha256(&downloaded.sha256);
     if let Ok(expected) = target.parse::<Digest>()
       && digest != expected
     {
@@ -63,43 +77,45 @@ impl RegistryClient {
         expected: target.to_string(),
       });
     }
-
-    let descriptor = Descriptor::new(media_type_of(response.header("content-type"), &bytes), digest, size);
+    let bytes = std::fs::read(partial.path()).map_err(Error::io("reading a manifest"))?;
+    let descriptor = Descriptor::new(media_type_of(content_type.as_deref(), &bytes), digest, downloaded.size);
     store.commit(partial, &descriptor.digest)?;
     Ok(descriptor)
   }
 
+  /// Fetches `descriptor`'s blob into `store`, hashing it as it arrives. A
+  /// blob longer than the descriptor's size is refused once it passes it.
   pub fn fetch_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
+    let mut get = Request::new(Method::Get, url(reference, &format!("blobs/{}", descriptor.digest))?);
+    let what = get.to_string();
     let partial = store.partial();
-    self.get(
-      reference,
-      &format!("blobs/{}", descriptor.digest),
-      None,
-      partial.path(),
-      None,
-    )?;
-    store.ingest_file(partial, descriptor)
+    let downloaded = http::download(partial.path(), Some(descriptor.size), &what, |from| {
+      get.from = from;
+      self.get(reference, &get)
+    })?;
+
+    store.ingest_hashed(partial, descriptor, &downloaded.sha256, downloaded.size)
   }
 
   /// Uploads `descriptor`'s blob unless a HEAD finds it in the repository,
   /// as a monolithic upload: a POST opens the session and one PUT sends the
   /// blob.
   pub fn push_blob(&self, reference: &Reference, descriptor: &Descriptor, store: &ContentStore) -> Result<()> {
-    let path = format!("blobs/{}", descriptor.digest);
-    let head = Request::new(Method::Head, url(reference, &path)?);
-    match self.send(reference, &head, Access::Push)?.status {
+    let head = Request::new(Method::Head, url(reference, &format!("blobs/{}", descriptor.digest))?);
+    let found = self.send(reference, &head, Access::Push)?;
+    match found.status() {
       200 => return Ok(()),
       404 => {}
-      status => return Err(unexpected(&head, status, None)),
+      _ => return Err(found.unexpected(&head)),
     }
 
     let post = Request::new(Method::Post, url(reference, "blobs/uploads/")?);
     let started = self.send(reference, &post, Access::Push)?;
-    let location = started
-      .header("location")
-      .filter(|_| started.status == 202)
-      .ok_or_else(|| unexpected(&post, started.status, None))?;
-    let mut upload = post.url.join(location).map_err(|error| {
+    let location = match (started.status(), started.header("location")) {
+      (202, Some(location)) => location.to_string(),
+      _ => return Err(started.unexpected(&post)),
+    };
+    let mut upload = post.url.join(&location).map_err(|error| {
       Error::Guest(format!(
         "{} gave the upload location {location:?}: {error}",
         reference.domain()
@@ -118,11 +134,11 @@ impl RegistryClient {
     let response = if post.url.origin() == put.url.origin() {
       self.send(reference, &put, Access::Push)?
     } else {
-      curl::send(&put, &Auth::None)?
+      http::send(&self.agent, &put, None)?
     };
-    match response.status {
+    match response.status() {
       201 => Ok(()),
-      status => Err(unexpected(&put, status, None)),
+      _ => Err(response.unexpected(&put)),
     }
   }
 
@@ -136,38 +152,23 @@ impl RegistryClient {
     store: &ContentStore,
   ) -> Result<()> {
     let document = store.path(&descriptor.digest)?;
-    let response_body = Scratch::temporary();
     let mut put = Request::new(Method::Put, url(reference, &format!("manifests/{target}"))?);
     put.content_type = Some(&descriptor.media_type);
     put.upload = Some(&document);
-    put.output = Some(response_body.path());
 
-    match self.send(reference, &put, Access::Push)?.status {
+    let response = self.send(reference, &put, Access::Push)?;
+    match response.status() {
       201 => Ok(()),
-      status => Err(unexpected(&put, status, Some(response_body.path()))),
+      _ => Err(response.unexpected(&put)),
     }
   }
 
-  /// GETs `path` under the repository into the file `body`, failing on any
-  /// status but 200. A body over `max_size` bytes is refused.
-  fn get(
-    &self,
-    reference: &Reference,
-    path: &str,
-    accept: Option<&str>,
-    body: &Path,
-    max_size: Option<u64>,
-  ) -> Result<Response> {
-    let mut get = Request::new(Method::Get, url(reference, path)?);
-    get.accept = accept;
-    get.output = Some(body);
-    get.max_size = max_size;
-    let response = self.send(reference, &get, Access::Pull)?;
-
-    match response.status {
-      200 => Ok(response),
-      status => Err(unexpected(&get, status, Some(body))),
-    }
+  /// GETs `request` from the repository, failing unless the response
+  /// carries what it asks for.
+  fn get(&self, reference: &Reference, request: &Request) -> Result<Response> {
+    self
+      .send(reference, request, Access::Pull)?
+      .content(request)
   }
 
   /// Sends `request` with any cached token. On a 401, authenticates as the
@@ -183,15 +184,15 @@ impl RegistryClient {
       .cloned();
     let auth = cached.map_or(Auth::None, Auth::Bearer);
 
-    let response = curl::send(request, &auth)?;
-    if response.status != 401 {
+    let response = http::send(&self.agent, request, auth.header().as_deref())?;
+    if response.status() != 401 {
       return Ok(response);
     }
-    let challenge = response
-      .header("www-authenticate")
-      .ok_or_else(|| unexpected(request, 401, request.output))?;
-    let auth = self.authorize(reference, &key, challenge)?;
-    curl::send(request, &auth)
+    let Some(challenge) = response.header("www-authenticate").map(str::to_string) else {
+      return Err(response.unexpected(request));
+    };
+    let auth = self.authorize(reference, &key, &challenge)?;
+    http::send(&self.agent, request, auth.header().as_deref())
   }
 
   /// The authorization a WWW-Authenticate challenge asks for: a bearer token
@@ -207,7 +208,7 @@ impl RegistryClient {
         .ok_or_else(|| Error::Invalid(format!("{} wants an account", reference.domain()))),
       "bearer" => {
         let url = token_url(reference, key.1, challenge, &parameters)?;
-        self.fetch_token(reference, key, &url).map(Auth::Bearer)
+        self.fetch_token(reference, key, url).map(Auth::Bearer)
       }
       _ => Err(Error::Invalid(format!(
         "{} asks for {scheme} authentication, which isn't supported",
@@ -218,19 +219,14 @@ impl RegistryClient {
 
   /// Fetches a bearer token from `url`, with basic auth if there are
   /// credentials, and caches it under `key`.
-  fn fetch_token(&self, reference: &Reference, key: &(String, Access), url: &Url) -> Result<Secret> {
+  fn fetch_token(&self, reference: &Reference, key: &(String, Access), url: Url) -> Result<Secret> {
     let auth = self.credentials.clone().map_or(Auth::None, Auth::Basic);
-    let body = Scratch::temporary();
-    let mut get = Request::new(Method::Get, url.clone());
-    get.output = Some(body.path());
-    let response = curl::send(&get, &auth)?;
-    let bytes = std::fs::read(body.path()).unwrap_or_default();
-    if response.status != 200 {
-      return Err(Error::Command {
-        command: format!("GET {url}"),
-        failure: format!("HTTP {}: {}", response.status, snippet(&bytes)),
-      });
+    let get = Request::new(Method::Get, url);
+    let response = http::send(&self.agent, &get, auth.header().as_deref())?;
+    if response.status() != 200 {
+      return Err(response.unexpected(&get));
     }
+    let bytes = response.body(&get, MAX_TOKEN)?;
 
     let token: TokenResponse = super::parse(&bytes, "the registry's token")?;
     let token: Secret = token
@@ -257,24 +253,6 @@ fn url(reference: &Reference, path: &str) -> Result<Url> {
   );
 
   Url::parse(&url).map_err(|error| Error::Invalid(format!("{url:?} is not a URL: {error}")))
-}
-
-/// The error for an unexpected `status`, quoting the start of `body`.
-fn unexpected(request: &Request, status: u16, body: Option<&Path>) -> Error {
-  let bytes = body
-    .and_then(|body| std::fs::read(body).ok())
-    .unwrap_or_default();
-
-  Error::Command {
-    command: format!("{} {}", request.method, request.url),
-    failure: format!("HTTP {status}: {}", snippet(&bytes)),
-  }
-}
-
-fn snippet(bytes: &[u8]) -> String {
-  let text = String::from_utf8_lossy(&bytes[..bytes.len().min(400)]);
-
-  text.trim().to_string()
 }
 
 /// A fetched manifest's media type: the Content-Type if it is a known type,
@@ -305,7 +283,7 @@ fn media_type_of(content_type: Option<&str>, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::oci::testing::FakeRegistry;
+  use crate::testing::FakeRegistry;
 
   #[test]
   fn debugs_without_its_secrets() {
@@ -415,5 +393,25 @@ mod tests {
       .fetch_manifest(&reference, &wrong, &store)
       .unwrap_err();
     assert!(matches!(error, Error::Checksum { .. }), "{error}");
+  }
+
+  #[test]
+  fn refuses_a_blob_longer_than_its_descriptor_says() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(root.path()).unwrap();
+    let blob = b"a blob longer than four bytes";
+    let registry = FakeRegistry::default().blob(blob).serve();
+    let reference = Reference::parse(&format!("{registry}/test/image:1")).unwrap();
+    let descriptor = Descriptor::new(media_type::LAYER, Digest::of(blob), 4);
+
+    let error = RegistryClient::default()
+      .fetch_blob(&reference, &descriptor, &store)
+      .unwrap_err();
+
+    assert!(
+      matches!(&error, Error::Guest(message) if message.ends_with("over the 4-byte limit")),
+      "{error}"
+    );
+    assert!(!store.has(&descriptor.digest));
   }
 }

@@ -4,11 +4,11 @@
 
 use crate::digest::sha256_file;
 use crate::error::{Error, Result};
-use crate::host::run;
+use crate::http::{self, Method, Request};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use url::Url;
 
 pub const RELEASE: &str = "15.1-RELEASE";
 pub const IMAGE: &str = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.raw.xz";
@@ -25,33 +25,41 @@ pub const USERLAND: &str = "FreeBSD-15.1-RELEASE-arm64-base.txz";
 const USERLAND_URL: &str = "https://download.freebsd.org/releases/arm64/aarch64/15.1-RELEASE/base.txz";
 const USERLAND_SHA256: &str = "5b7a46a0abfbe23a1d4454b5600e2efcfce16b705bc7e9c851c37470c035ef98";
 
-fn fetch(url: &str, destination: &Path) -> Result<()> {
-  if destination.exists() {
-    return Ok(());
-  }
-
-  let partial = destination.with_extension("partial");
-  run(
-    Command::new("curl")
-      .args(["-fsSL", "--retry", "3", "-o"])
-      .arg(&partial)
-      .arg(url),
-  )?;
-  std::fs::rename(&partial, destination).map_err(Error::io(format!("moving {} into place", destination.display())))
-}
-
-fn verify(path: &Path, expected: &str) -> Result<()> {
-  let (actual, _) = sha256_file(path)?;
-
-  if actual == expected {
-    Ok(())
+/// Downloads `url` to `destination` unless it is there already, and checks
+/// its sha256 against `expected`, if given. A download is hashed as it is
+/// written, and a file already there is read to hash it. A file whose
+/// sha256 differs is removed.
+fn fetch(url: &str, destination: &Path, expected: Option<&str>) -> Result<()> {
+  let actual = if destination.exists() {
+    match expected {
+      Some(_) => sha256_file(destination)?.0,
+      None => return Ok(()),
+    }
   } else {
-    let _ = std::fs::remove_file(path);
-    Err(Error::Checksum {
-      path: path.to_path_buf(),
-      actual,
-      expected: expected.to_string(),
-    })
+    let partial = destination.with_extension("partial");
+    let agent = http::agent();
+    let parsed = Url::parse(url).map_err(|error| Error::Invalid(format!("{url:?} is not a URL: {error}")))?;
+    let mut get = Request::new(Method::Get, parsed);
+    let what = get.to_string();
+    let downloaded = http::download(&partial, None, &what, |from| {
+      get.from = from;
+      http::send(&agent, &get, None)?.content(&get)
+    })?;
+    std::fs::rename(&partial, destination)
+      .map_err(Error::io(format!("moving {} into place", destination.display())))?;
+    downloaded.sha256
+  };
+
+  match expected {
+    Some(expected) if actual != expected => {
+      let _ = std::fs::remove_file(destination);
+      Err(Error::Checksum {
+        path: destination.to_path_buf(),
+        actual,
+        expected: expected.to_string(),
+      })
+    }
+    _ => Ok(()),
   }
 }
 
@@ -76,13 +84,11 @@ fn base_disk_from(directory: &str, cache: &Path) -> Result<PathBuf> {
   let sums = cache.join("CHECKSUM.SHA256");
   let compressed = cache.join(IMAGE);
 
-  fetch(&format!("{directory}/CHECKSUM.SHA256"), &sums)?;
-  fetch(&format!("{directory}/{IMAGE}"), &compressed)?;
-
+  fetch(&format!("{directory}/CHECKSUM.SHA256"), &sums, None)?;
   let sums = std::fs::read_to_string(&sums).map_err(Error::io("reading CHECKSUM.SHA256"))?;
   let expected =
     published_sha256(&sums, IMAGE).ok_or_else(|| Error::Guest(format!("CHECKSUM.SHA256 does not list {IMAGE}")))?;
-  verify(&compressed, expected)?;
+  fetch(&format!("{directory}/{IMAGE}"), &compressed, Some(expected))?;
 
   let partial = raw.with_extension("partial");
   decompress_sparse(&compressed, &partial)?;
@@ -108,8 +114,7 @@ fn pinned(cache: &Path, name: &str, url: &str, sha256: &str) -> Result<PathBuf> 
 
   if !path.exists() {
     std::fs::create_dir_all(cache).map_err(Error::io(format!("making {}", cache.display())))?;
-    fetch(url, &path)?;
-    verify(&path, sha256)?;
+    fetch(url, &path, Some(sha256))?;
   }
   Ok(path)
 }
@@ -165,6 +170,7 @@ fn decompress_sparse(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::testing::serve_files;
 
   #[test]
   fn reads_the_sha256_published_for_an_image() {
@@ -195,7 +201,7 @@ mod tests {
 
   /// Writes a release directory holding `data` as the image, with a
   /// `CHECKSUM.SHA256` listing `listed` or else its true sha256. Returns the
-  /// directory's `file://` URL.
+  /// URL of a server for the directory.
   fn release(directory: &Path, data: &[u8], listed: Option<&str>) -> String {
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
     encoder.write_all(data).unwrap();
@@ -211,7 +217,7 @@ mod tests {
     )
     .unwrap();
 
-    format!("file://{}", directory.display())
+    serve_files(directory.to_path_buf())
   }
 
   #[test]
@@ -241,10 +247,13 @@ mod tests {
 
   #[test]
   fn fails_when_the_release_is_missing() {
-    let cache = tempfile::tempdir().unwrap();
-    let missing = cache.path().join("missing");
+    let (source, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let empty = serve_files(source.path().to_path_buf());
 
-    let error = base_disk_from(&format!("file://{}", missing.display()), cache.path()).unwrap_err();
-    assert!(matches!(error, Error::Command { .. }), "{error}");
+    let error = base_disk_from(&empty, cache.path()).unwrap_err();
+    assert!(
+      matches!(&error, Error::Command { failure, .. } if failure.starts_with("HTTP 404")),
+      "{error}"
+    );
   }
 }

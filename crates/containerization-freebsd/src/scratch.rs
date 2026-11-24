@@ -22,11 +22,6 @@ impl Scratch {
     )))
   }
 
-  /// A new path in the system's temporary directory.
-  pub(crate) fn temporary() -> Self {
-    Self::new_in(&std::env::temp_dir(), "containerization-freebsd-")
-  }
-
   pub(crate) fn path(&self) -> &Path {
     &self.0
   }

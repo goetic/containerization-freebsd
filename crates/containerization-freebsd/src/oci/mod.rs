@@ -1,13 +1,10 @@
 //! Host-side OCI support: image references, image-spec documents, a
-//! distribution API client and a content-addressable store.
+//! distribution API client, and a content-addressable store.
 
 mod auth;
 mod content;
-mod curl;
 mod reference;
 mod registry;
-#[cfg(test)]
-pub(crate) mod testing;
 
 pub use crate::digest::Digest;
 pub use auth::{Credentials, Secret};

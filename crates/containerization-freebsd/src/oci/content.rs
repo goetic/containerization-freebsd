@@ -1,5 +1,5 @@
 use super::{Descriptor, Document, ImageConfig, Manifest, parse};
-use crate::digest::{Digest, Hashing, sha256_file};
+use crate::digest::{Digest, Hashing};
 use crate::error::{Error, Result};
 use crate::scratch::Scratch;
 use std::fs::File;
@@ -83,10 +83,10 @@ impl ContentStore {
   }
 
   /// Moves `partial`, from `partial()`, into the store as `descriptor`'s
-  /// blob, or drops it, removing the file, if its digest or size differs.
-  pub(crate) fn ingest_file(&self, partial: Scratch, descriptor: &Descriptor) -> Result<()> {
-    let (hex, size) = sha256_file(partial.path())?;
-    let digest = Digest::from_sha256(&hex);
+  /// blob, given the sha256 and size found as it was written. If either
+  /// differs from the descriptor's, `partial` is dropped, removing the file.
+  pub(crate) fn ingest_hashed(&self, partial: Scratch, descriptor: &Descriptor, sha256: &str, size: u64) -> Result<()> {
+    let digest = Digest::from_sha256(sha256);
 
     if digest != descriptor.digest || size != descriptor.size {
       return Err(Error::Checksum {
@@ -165,6 +165,7 @@ impl ContentStore {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::digest::sha256_file;
 
   #[test]
   fn keeps_blobs_by_their_digest() {
@@ -189,9 +190,12 @@ mod tests {
     let partial = store.partial();
     let path = partial.path().to_path_buf();
     std::fs::write(&path, b"other").unwrap();
+    let (sha256, size) = sha256_file(&path).unwrap();
     let descriptor = Descriptor::new(super::super::media_type::LAYER, Digest::of(b"blob"), 4);
 
-    let error = store.ingest_file(partial, &descriptor).unwrap_err();
+    let error = store
+      .ingest_hashed(partial, &descriptor, &sha256, size)
+      .unwrap_err();
 
     assert!(matches!(error, Error::Checksum { .. }), "{error}");
     assert!(!path.exists());
