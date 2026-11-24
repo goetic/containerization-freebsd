@@ -1,13 +1,17 @@
-//! The counters of a jail's network interfaces, read from inside the jail,
-//! since a VNET jail's interfaces are in its own network stack.
+//! The network interfaces of the guest's network stack, or of a jail's, read
+//! from inside the jail, since a VNET jail's interfaces are in its own stack.
 
 use crate::jail::JailId;
 use std::io;
 
-/// An interface's counters since it was created.
+/// A network interface, and its counters since it was created.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interface {
   pub name: String,
+  pub index: u16,
+  /// The link-level address, such as an Ethernet device's MAC address.
+  pub address: Vec<u8>,
+  pub link_up: bool,
   pub received_packets: u64,
   pub transmitted_packets: u64,
   pub received_bytes: u64,
@@ -16,6 +20,21 @@ pub struct Interface {
   pub transmitted_errors: u64,
   pub received_dropped: u64,
   pub transmitted_dropped: u64,
+}
+
+/// The interfaces' routing sysctl, `NET_RT_IFLIST`, for link addresses.
+#[cfg(target_os = "freebsd")]
+const LIST: [libc::c_int; 6] = [libc::CTL_NET, libc::PF_ROUTE, 0, libc::AF_LINK, libc::NET_RT_IFLIST, 0];
+
+/// The interfaces in the guest's network stack.
+#[cfg(target_os = "freebsd")]
+pub fn interfaces() -> io::Result<Vec<Interface>> {
+  Ok(parse(&crate::sysctl::value(&LIST)?))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn interfaces() -> io::Result<Vec<Interface>> {
+  crate::unsupported("listing the network interfaces")
 }
 
 /// The interfaces in `jail`'s network stack, as `NET_RT_IFLIST` lists them
@@ -46,7 +65,7 @@ pub fn interfaces_in(jail: JailId) -> io::Result<Vec<Interface>> {
 
   // Room for the messages of a few hundred interfaces.
   let mut buffer = vec![0u8; 64 << 10];
-  let mut mib = [libc::CTL_NET, libc::PF_ROUTE, 0, libc::AF_LINK, libc::NET_RT_IFLIST, 0];
+  let mut mib = LIST;
   let (ours, theirs) = UnixStream::pair()?;
 
   // SAFETY: the child only attaches, reads the sysctl into the buffer, writes
@@ -94,7 +113,7 @@ pub fn interfaces_in(_: JailId) -> io::Result<Vec<Interface>> {
 }
 
 /// The interfaces in routing messages: each RTM_IFINFO's counters, and the
-/// name in the link address that follows its header.
+/// name and address in the link address that follows its header.
 #[cfg(target_os = "freebsd")]
 fn parse(messages: &[u8]) -> Vec<Interface> {
   use std::mem::offset_of;
@@ -116,19 +135,33 @@ fn parse(messages: &[u8]) -> Vec<Interface> {
     // SAFETY: the message is an if_msghdr, as its type says and its length
     // allows, and read_unaligned copes with any alignment.
     let header = unsafe { std::ptr::read_unaligned(message.as_ptr().cast::<libc::if_msghdr>()) };
+    if header.ifm_addrs & libc::RTA_IFP == 0 {
+      continue;
+    }
+    // The link address's data is the name, then the address.
     let link = &message[HEADER..];
     let start = offset_of!(libc::sockaddr_dl, sdl_data);
-    let name = match link.get(offset_of!(libc::sockaddr_dl, sdl_nlen)) {
-      Some(&length) if header.ifm_addrs & libc::RTA_IFP != 0 => link.get(start..start + usize::from(length)),
-      _ => None,
+    let lengths = (
+      link.get(offset_of!(libc::sockaddr_dl, sdl_nlen)),
+      link.get(offset_of!(libc::sockaddr_dl, sdl_alen)),
+    );
+    let (Some(&name_length), Some(&address_length)) = lengths else {
+      continue;
     };
-    let Some(name) = name else {
+    let middle = start + usize::from(name_length);
+    let (Some(name), Some(address)) = (
+      link.get(start..middle),
+      link.get(middle..middle + usize::from(address_length)),
+    ) else {
       continue;
     };
     let data = header.ifm_data;
 
     interfaces.push(Interface {
       name: String::from_utf8_lossy(name).into_owned(),
+      index: header.ifm_index,
+      address: address.to_vec(),
+      link_up: i32::from(data.ifi_link_state) == libc::LINK_STATE_UP,
       received_packets: data.ifi_ipackets,
       transmitted_packets: data.ifi_opackets,
       received_bytes: data.ifi_ibytes,

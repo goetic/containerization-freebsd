@@ -73,6 +73,25 @@ pub fn sysctl(name: &str) -> io::Result<Vec<u8>> {
   Mib::named(name)?.value()
 }
 
+/// Sets the integer sysctl named `name` to `value`.
+pub fn set_int(name: &str, value: libc::c_int) -> io::Result<()> {
+  let Mib(mut mib) = Mib::named(name)?;
+
+  // SAFETY: sysctl reads the new value, which outlives the call, and writes
+  // nothing, since the old value's buffer and length are null.
+  check(unsafe {
+    libc::sysctl(
+      mib.as_mut_ptr(),
+      mib.len() as libc::c_uint,
+      ptr::null_mut(),
+      ptr::null_mut(),
+      (&raw const value).cast_mut().cast(),
+      size_of::<libc::c_int>(),
+    )
+  })?;
+  Ok(())
+}
+
 /// The text of a string value, up to its NUL.
 pub fn text(value: &[u8]) -> String {
   CStr::from_bytes_until_nul(value).map_or_else(
@@ -82,7 +101,7 @@ pub fn text(value: &[u8]) -> String {
 }
 
 /// The whole value at `mib`, however long.
-fn value(mib: &[libc::c_int]) -> io::Result<Vec<u8>> {
+pub(crate) fn value(mib: &[libc::c_int]) -> io::Result<Vec<u8>> {
   loop {
     let wanted = read(mib, ptr::null_mut(), 0)?;
     // Room to spare, in case the value grows between the two reads.

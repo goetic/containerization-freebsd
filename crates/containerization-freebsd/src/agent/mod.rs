@@ -23,8 +23,8 @@ pub use containerization_freebsd_protocol::{Exec, Exit, FileType, Limit, Resourc
 use crate::error::{Error, Result};
 use channel::Stream;
 use containerization_freebsd_protocol::{
-  Address, Call, Connect, Disk, FileCopy, GuestPath, JailWait, Listen, Message, Mount, Return, Rules, Statistics,
-  StatisticsOf,
+  Address, Addressing, Bridge, Call, Claim, Connect, Disk, FileCopy, GuestPath, JailWait, Lease, Listen, Message,
+  Mount, Return, Rules, Statistics, StatisticsOf,
 };
 use session::{Route, Shared};
 use std::io::{PipeReader, PipeWriter};
@@ -39,6 +39,8 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a quick guest command, such as one zfs(8) or ifconfig(8) call,
 /// may take.
 pub(crate) const QUICK: Duration = Duration::from_secs(60);
+/// How long the agent's dhclient may take to get a lease: its own timeout.
+const LEASING: Duration = Duration::from_secs(30);
 
 pub struct Agent {
   shared: Arc<Shared>,
@@ -128,6 +130,14 @@ impl Spawn for Agent {
 /// What a Call that returns Done returns.
 fn done(value: Return) -> Option<()> {
   matches!(value, Return::Done).then_some(())
+}
+
+/// What a Call that returns Name returns.
+fn name(value: Return) -> Option<String> {
+  match value {
+    Return::Name(name) => Some(name),
+    _ => None,
+  }
 }
 
 /// `exec`'s argv, and its jail if it has one, for error messages.
@@ -341,6 +351,50 @@ impl Agent {
   /// Waits up to `within` for the removed jail to finish dying.
   pub(crate) fn await_removal(&self, jail: &str, within: Duration) -> Result<()> {
     self.call_waiting(Call::AwaitRemoval, jail, within)
+  }
+
+  /// Moves the guest's network device with MAC address `mac` into the VNET
+  /// jail, and returns the device's name.
+  pub(crate) fn claim(&self, jail: &str, mac: &str) -> Result<String> {
+    let claim = Claim {
+      jail: jail.to_string(),
+      mac: mac.to_string(),
+    };
+
+    self.call(Call::Claim(claim), name)
+  }
+
+  /// Brings up the VNET jail's lo0, and sets up the device address and
+  /// default route that `addressing` asks for.
+  pub(crate) fn set_address(&self, addressing: Addressing) -> Result<()> {
+    self.call_for_nothing(Call::SetAddress(addressing))
+  }
+
+  /// Waits up to `within` for the guest's default route, and for its
+  /// interface's link to go active.
+  pub(crate) fn await_route(&self, within: Duration) -> Result<()> {
+    let seconds = u32::try_from(within.as_secs()).unwrap_or(u32::MAX);
+
+    self.call_within(Call::AwaitRoute(seconds), within + AGENT_TIMEOUT, done)
+  }
+
+  /// Creates an epair on `bridge`, setting up NAT first if this boot has no
+  /// bridge yet, and returns its `a` end's name.
+  pub(crate) fn create_epair(&self, bridge: Bridge) -> Result<String> {
+    self.call(Call::CreateEpair(bridge), name)
+  }
+
+  /// Leases an address from the NAT's DHCP server for the guest's network
+  /// device with MAC address `mac`, which may take the agent `LEASING`.
+  pub(crate) fn lease(&self, mac: &str) -> Result<Lease> {
+    self.call_within(
+      Call::Lease(mac.to_string()),
+      LEASING + AGENT_TIMEOUT,
+      |value| match value {
+        Return::Lease(lease) => Some(lease),
+        _ => None,
+      },
+    )
   }
 
   /// Makes the Call that `call` builds from a JailWait for `jail` and `wait`,

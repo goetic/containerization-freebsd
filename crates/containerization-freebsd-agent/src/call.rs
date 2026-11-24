@@ -1,7 +1,7 @@
 //! The Calls the host makes: things the agent does in the guest or a jail
 //! and reports back on.
 
-use crate::{jail, mount, sys};
+use crate::{jail, mount, net, sys};
 use containerization_freebsd_protocol::{Call, Disk, FileCopy, FileType, GuestPath, Return};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -38,6 +38,17 @@ pub(crate) fn answer(call: &Call) -> Answer {
       let wait = wait.clone();
       return Answer::Later(Box::new(move || jail::await_removal(&wait).map(done)));
     }
+    Call::Claim(claim) => net::claim(claim).map(Return::Name),
+    Call::SetAddress(addressing) => net::set_address(addressing).map(done),
+    Call::AwaitRoute(seconds) => {
+      let seconds = *seconds;
+      return Answer::Later(Box::new(move || net::await_route(seconds).map(done)));
+    }
+    Call::CreateEpair(bridge) => net::create_epair(bridge).map(Return::Name),
+    Call::Lease(mac) => match net::lease(mac) {
+      Ok(leasing) => return Answer::Later(Box::new(move || leasing().map(Return::Lease))),
+      Err(error) => Err(error),
+    },
   })
 }
 

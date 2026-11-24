@@ -255,6 +255,25 @@ pub enum Call {
   /// jail holds its root and network until everything it left closes.
   /// Returns Done, or Error if it is still dying.
   AwaitRemoval(JailWait),
+  /// Moves the guest's network device with the MAC address into the VNET
+  /// jail. Returns Name, the device's name.
+  Claim(Claim),
+  /// Brings up the VNET jail's lo0 at 127.0.0.1, unless it is up already,
+  /// gives a device in the jail an address, and routes the jail's traffic
+  /// through a gateway. Returns Done.
+  SetAddress(Addressing),
+  /// Waits up to the seconds for the guest's default route, and for its
+  /// interface's link to go active. Returns Done, or Error if they don't.
+  AwaitRoute(u32),
+  /// Creates an epair for a NAT jail, and adds its `a` end to the bridge. If
+  /// this boot has no bridge yet, it first creates one, turns on IP
+  /// forwarding, and has pf translate the subnet to the address of the
+  /// default route's interface. Returns Name, the `a` end's name.
+  CreateEpair(Bridge),
+  /// Leases an address from the NAT's DHCP server for the guest's network
+  /// device with the MAC address, without configuring the device, waiting up
+  /// to dhclient's 30 seconds. Returns Lease.
+  Lease(String),
 }
 
 /// Names what the call does, for errors: `finding the type of "/etc"`.
@@ -277,6 +296,15 @@ impl fmt::Display for Call {
       Self::Terminate(wait) => write!(formatter, "terminating jail {:?}'s processes", wait.jail),
       Self::DropConnections(jail) => write!(formatter, "dropping jail {jail:?}'s TCP connections"),
       Self::AwaitRemoval(wait) => write!(formatter, "waiting for jail {:?} to finish dying", wait.jail),
+      Self::Claim(claim) => write!(
+        formatter,
+        "moving the device with MAC address {} into jail {:?}",
+        claim.mac, claim.jail
+      ),
+      Self::SetAddress(addressing) => write!(formatter, "addressing jail {:?}", addressing.jail),
+      Self::AwaitRoute(_) => write!(formatter, "waiting for the guest's default route"),
+      Self::CreateEpair(bridge) => write!(formatter, "creating an epair on bridge {}", bridge.name),
+      Self::Lease(mac) => write!(formatter, "leasing an address for MAC address {mac}"),
     }
   }
 }
@@ -290,6 +318,54 @@ pub enum Return {
   Disks(Vec<Disk>),
   Path(String),
   Statistics(Statistics),
+  /// Such as a network interface's name.
+  Name(String),
+  Lease(Lease),
+}
+
+/// A network device to move into a VNET jail.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Claim {
+  pub jail: String,
+  /// The device's MAC address, such as `02:6d:2e:1f:a4:0b`.
+  pub mac: String,
+}
+
+/// What to set up in a VNET jail's network stack, besides lo0.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Addressing {
+  pub jail: String,
+  pub device: Option<DeviceAddress>,
+  /// The IPv4 address of the default route's gateway.
+  pub gateway: Option<String>,
+}
+
+/// A network device, and the address to give it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceAddress {
+  pub device: String,
+  /// An IPv4 address and prefix length, such as `10.66.0.2/16`.
+  pub address: String,
+}
+
+/// The guest bridge that NAT jails' epairs join.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bridge {
+  pub name: String,
+  /// The bridge's address and prefix length, such as `10.66.0.1/16`. The
+  /// address is the NAT jails' gateway.
+  pub address: String,
+  /// The NAT jails' subnet, which pf translates, such as `10.66.0.0/16`.
+  pub subnet: String,
+}
+
+/// An address that a DHCP server leased.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lease {
+  /// The IPv4 address and prefix length, such as `192.168.64.3/24`.
+  pub address: String,
+  /// The first router the lease names.
+  pub gateway: Option<String>,
 }
 
 /// A jail's rctl(8) rules.
@@ -623,6 +699,11 @@ record!(Disk { device, ident });
 record!(Rules { jail, rules });
 record!(StatisticsOf { jail, dataset });
 record!(JailWait { jail, seconds });
+record!(Claim { jail, mac });
+record!(Addressing { jail, device, gateway });
+record!(DeviceAddress { device, address });
+record!(Bridge { name, address, subnet });
+record!(Lease { address, gateway });
 record!(Statistics {
   cpu_seconds,
   cpu_percent,
@@ -677,6 +758,11 @@ tagged!(Call {
   9 => Terminate(wait),
   10 => DropConnections(jail),
   11 => AwaitRemoval(wait),
+  12 => Claim(claim),
+  13 => SetAddress(addressing),
+  14 => AwaitRoute(seconds),
+  15 => CreateEpair(bridge),
+  16 => Lease(mac),
 });
 tagged!(Return {
   0 => FileType(found),
@@ -684,6 +770,8 @@ tagged!(Return {
   2 => Disks(disks),
   3 => Path(path),
   4 => Statistics(statistics),
+  5 => Name(name),
+  6 => Lease(lease),
 });
 
 /// A file type is a u8 tag.
@@ -889,6 +977,31 @@ mod tests {
       })),
       Message::Call(Call::DropConnections("web".into())),
       Message::Call(Call::AwaitRemoval(JailWait::default())),
+      Message::Call(Call::Claim(Claim {
+        jail: "web".into(),
+        mac: "02:6d:2e:1f:a4:0b".into(),
+      })),
+      Message::Call(Call::SetAddress(Addressing {
+        jail: "web".into(),
+        device: Some(DeviceAddress {
+          device: "epair0b".into(),
+          address: "10.66.0.2/16".into(),
+        }),
+        gateway: Some("10.66.0.1".into()),
+      })),
+      Message::Call(Call::SetAddress(Addressing::default())),
+      Message::Call(Call::AwaitRoute(300)),
+      Message::Call(Call::CreateEpair(Bridge {
+        name: "cfbsd0".into(),
+        address: "10.66.0.1/16".into(),
+        subnet: "10.66.0.0/16".into(),
+      })),
+      Message::Call(Call::Lease("02:6d:2e:1f:a4:0b".into())),
+      Message::Return(Return::Name("epair0a".into())),
+      Message::Return(Return::Lease(Lease {
+        address: "192.168.64.3/24".into(),
+        gateway: Some("192.168.64.1".into()),
+      })),
       Message::Return(Return::FileType(FileType::Missing)),
       Message::Return(Return::FileType(FileType::Directory)),
       Message::Return(Return::FileType(FileType::File)),

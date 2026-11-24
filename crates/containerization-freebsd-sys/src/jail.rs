@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// The id of a running jail, which only `find_jail` returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JailId(libc::c_int);
+pub struct JailId(pub(crate) libc::c_int);
 
 /// The type of file a path names, following symlinks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

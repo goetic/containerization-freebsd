@@ -16,10 +16,5 @@ impl Script {
   }
 }
 
-pub(crate) const ADDRESS: Script = Script(include_str!("scripts/address.sh"));
 pub(crate) const APPLY: Script = Script(include_str!("scripts/apply.sh"));
-pub(crate) const CLAIM: Script = Script(include_str!("scripts/claim.sh"));
 pub(crate) const DECOMPRESS: Script = Script(include_str!("scripts/decompress.sh"));
-pub(crate) const EPAIR: Script = Script(include_str!("scripts/epair.sh"));
-pub(crate) const LEASE: Script = Script(include_str!("scripts/lease.sh"));
-pub(crate) const ROUTED: Script = Script(include_str!("scripts/routed.sh"));

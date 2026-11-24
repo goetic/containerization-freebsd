@@ -51,7 +51,8 @@ pub mod mux;
 pub use codec::DecodeError;
 pub use frame::{Decoder, Frame, MAGIC, MAX_PAYLOAD, Skipped};
 pub use message::{
-  Address, Call, Connect, DatasetIo, Disk, Exec, Exit, FileCopy, FileType, GuestPath, JailWait, Limit, Listen, Message,
-  Mount, NetworkStatistics, Resource, Return, Rules, Statistics, StatisticsOf, User, WindowSize,
+  Address, Addressing, Bridge, Call, Claim, Connect, DatasetIo, DeviceAddress, Disk, Exec, Exit, FileCopy, FileType,
+  GuestPath, JailWait, Lease, Limit, Listen, Message, Mount, NetworkStatistics, Resource, Return, Rules, Statistics,
+  StatisticsOf, User, WindowSize,
 };
 pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch, WINDOW};

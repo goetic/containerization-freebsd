@@ -10,6 +10,7 @@ mod call;
 mod jail;
 mod listener;
 mod mount;
+mod net;
 mod pipe;
 mod process;
 mod relay;

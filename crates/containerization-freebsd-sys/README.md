@@ -3,11 +3,12 @@
 Safe wrappers for the system calls that `containerization-freebsd-agent` needs
 and std does not provide: pseudo-terminals, raw mode, signals, waiting for an
 exit without reaping it, the clock, jails, pre-exec hooks, sockets and files
-opened from inside a jail, mounts, disks, sysctl(3), rctl(2), and a jail's
-interface counters. This crate holds all of the agent's unsafe code; the
-agent itself forbids unsafe code.
+opened from inside a jail, mounts, disks, sysctl(3), rctl(2), network
+interfaces, routes, kernel modules, and pf. This crate holds all of the
+agent's unsafe code; the agent itself forbids unsafe code.
 
 The functions take plain values, not the protocol's types. The crate also
 builds on macOS, where the agent's tests run; there, looking up a jail fails,
-so nothing ever enters one, and mounts, disks, and rctl(2) are unsupported.
+so nothing ever enters one, and mounts, disks, rctl(2), and networking are
+unsupported.
 It is not published, because only the agent uses it.

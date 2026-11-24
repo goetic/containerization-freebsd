@@ -5,10 +5,8 @@ use super::Jail;
 use crate::agent::{Agent, QUICK, Spawn};
 use crate::error::{Error, Result};
 use crate::machine::Mac;
-use crate::scripts;
-use containerization_freebsd_protocol::{FileCopy, GuestPath};
+use containerization_freebsd_protocol::{Addressing, Bridge, DeviceAddress, FileCopy, GuestPath, Lease};
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 /// The bridge that NAT jails' epairs join.
 const BRIDGE: &str = "cfbsd0";
@@ -73,37 +71,10 @@ impl Interface {
   /// Nothing renews the lease, but the server leases the same address to the
   /// same MAC again. Call this before a jail claims the device.
   pub fn leased(agent: &Agent, mac: Mac) -> Result<Self> {
-    let ran = agent.check(&scripts::LEASE.argv(&[&mac.to_string()]), LEASING)?;
-    let (address, gateway) =
-      lease(&ran.stdout).ok_or_else(|| Error::Guest(format!("the NAT's DHCP server leased {mac} no address")))?;
+    let Lease { address, gateway } = agent.lease(&mac.to_string())?;
 
     Ok(Self { mac, address, gateway })
   }
-}
-
-/// dhclient's 30-second timeout in `scripts::LEASE`, plus a margin.
-const LEASING: Duration = Duration::from_secs(45);
-
-/// Returns the address, with its prefix length, and the first router of the
-/// last lease in `leases`, a dhclient.leases(5) file.
-fn lease(leases: &str) -> Option<(String, Option<String>)> {
-  let (_, last) = leases.rsplit_once("lease {")?;
-  let value = |key: &str| {
-    last.lines().find_map(|line| {
-      line
-        .trim()
-        .strip_prefix(key)?
-        .strip_suffix(';')
-        .map(str::trim)
-    })
-  };
-  let address: Ipv4Addr = value("fixed-address ")?.parse().ok()?;
-  let mask: Ipv4Addr = value("option subnet-mask ")?.parse().ok()?;
-  let gateway = value("option routers ")
-    .and_then(|routers| routers.split(',').next())
-    .map(|router| router.trim().to_string());
-
-  Some((format!("{address}/{}", u32::from(mask).count_ones()), gateway))
 }
 
 impl Jail<'_> {
@@ -112,19 +83,16 @@ impl Jail<'_> {
   /// networked jail.
   pub(super) fn configure(&self, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
-      let (inside, address) = (format!("{}b", epair.name), format!("{}/{PREFIX}", epair.address));
-      self.set_address(&inside, &address, &GATEWAY.to_string())?;
+      let address = format!("{}/{PREFIX}", epair.address);
+      self.set_address(Some((format!("{}b", epair.name), address)), Some(GATEWAY.to_string()))?;
     }
     if let Network::Interfaces(interfaces) = network {
       if interfaces.is_empty() {
-        self.set_address("", "", "")?;
+        self.set_address(None, None)?;
       }
       for interface in interfaces {
-        let claimed = self
-          .agent
-          .check(&scripts::CLAIM.argv(&[&self.name, &interface.mac.to_string()]), QUICK)?;
-        let gateway = interface.gateway.as_deref().unwrap_or_default();
-        self.set_address(claimed.stdout.trim(), &interface.address, gateway)?;
+        let claimed = self.agent.claim(&self.name, &interface.mac.to_string())?;
+        self.set_address(Some((claimed, interface.address.clone())), interface.gateway.clone())?;
       }
     }
     if *network != Network::None {
@@ -155,14 +123,14 @@ impl Jail<'_> {
     }
   }
 
-  /// Runs `scripts::ADDRESS`, which brings up the VNET jail's lo0, gives a
-  /// non-empty `device` the `address`, and adds a default route through a
-  /// non-empty `gateway`.
-  fn set_address(&self, device: &str, address: &str, gateway: &str) -> Result<()> {
-    self
-      .agent
-      .check(&scripts::ADDRESS.argv(&[&self.name, device, address, gateway]), QUICK)
-      .map(|_| ())
+  /// Brings up the VNET jail's lo0, gives the device, if any, its address,
+  /// and routes the jail's traffic through the gateway, if any.
+  fn set_address(&self, device: Option<(String, String)>, gateway: Option<String>) -> Result<()> {
+    self.agent.set_address(Addressing {
+      jail: self.name.clone(),
+      device: device.map(|(device, address)| DeviceAddress { device, address }),
+      gateway,
+    })
   }
 }
 
@@ -184,11 +152,11 @@ impl Epair {
 }
 
 fn epair(agent: &Agent) -> Result<Epair> {
-  let created = agent.check(
-    &scripts::EPAIR.argv(&[BRIDGE, &format!("{GATEWAY}/{PREFIX}"), &format!("{SUBNET}/{PREFIX}")]),
-    QUICK,
-  )?;
-  let outside = created.stdout.trim();
+  let outside = agent.create_epair(Bridge {
+    name: BRIDGE.to_string(),
+    address: format!("{GATEWAY}/{PREFIX}"),
+    subnet: format!("{SUBNET}/{PREFIX}"),
+  })?;
   let name = outside
     .strip_suffix('a')
     .ok_or_else(|| Error::Guest(format!("ifconfig made {outside:?}, not an epair")))?
@@ -215,31 +183,6 @@ fn address(epair: &str) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn reads_the_last_lease() {
-    let leases = "lease {\n  interface \"vtnet1\";\n  fixed-address 192.168.64.98;\n  option subnet-mask 255.255.255.0;\n}\n\
-                  lease {\n  interface \"vtnet1\";\n  fixed-address 192.168.64.140;\n  option subnet-mask 255.255.0.0;\n  \
-                  option routers 192.168.64.1, 192.168.64.2;\n  renew 3 2026/11/18 02:00:00;\n}\n";
-
-    assert_eq!(
-      lease(leases),
-      Some(("192.168.64.140/16".into(), Some("192.168.64.1".into())))
-    );
-  }
-
-  #[test]
-  fn reads_a_lease_without_a_router() {
-    let leases = "lease {\n  fixed-address 10.0.0.5;\n  option subnet-mask 255.255.255.0;\n}\n";
-
-    assert_eq!(lease(leases), Some(("10.0.0.5/24".into(), None)));
-  }
-
-  #[test]
-  fn reads_no_lease_from_nothing() {
-    assert_eq!(lease(""), None);
-    assert_eq!(lease("lease {\n  option subnet-mask 255.255.255.0;\n}\n"), None);
-  }
 
   #[test]
   fn gives_each_epair_unit_its_own_address_after_the_gateway() {

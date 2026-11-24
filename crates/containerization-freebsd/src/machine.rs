@@ -6,7 +6,6 @@ use crate::clock::ClockSync;
 use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]
 use crate::kernel_messages::Memory;
-use crate::scripts;
 use containerization_freebsd_protocol::{GuestPath, Mount};
 use dispatch2::{DispatchQueue, DispatchRetained};
 use std::fmt;
@@ -538,18 +537,9 @@ impl Machine {
 
     self.agent.wait_ready(timeout)?;
     if self.nat {
-      match self
+      self
         .agent
-        .check(&scripts::ROUTED.argv(&[]), timeout.saturating_sub(started.elapsed()))
-      {
-        Err(Error::Timeout(_)) => {
-          return Err(Error::Timeout(format!(
-            "the guest's NAT network was not up within {}s",
-            timeout.as_secs()
-          )));
-        }
-        result => result?,
-      };
+        .await_route(timeout.saturating_sub(started.elapsed()))?;
     }
     Ok(())
   }
