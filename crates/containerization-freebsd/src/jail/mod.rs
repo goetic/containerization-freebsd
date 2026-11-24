@@ -6,14 +6,15 @@ mod network;
 pub use mount::Mount;
 pub use network::{Interface, Network};
 
-use crate::agent::{Agent, Exec, Process, QUICK, Ran, Relay, Spawn};
+use crate::agent::{Agent, Exec, FileType, Process, QUICK, Ran, Relay, Spawn};
 use crate::copy::{self, Parents};
 use crate::error::{Error, Result};
 use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
 use crate::statistics::{self, Statistics};
-use containerization_freebsd_protocol::{Address, Connect};
+use containerization_freebsd_protocol::{Address, Connect, GuestPath};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// How long `scripts::GONE` may wait: longer than TIME_WAIT, which is 2 × MSL
@@ -23,6 +24,8 @@ const DYING: Duration = Duration::from_secs(90);
 pub struct Jail<'a> {
   agent: &'a Agent,
   name: String,
+  /// The guest path of the jail's root, once it is known.
+  root: OnceLock<String>,
 }
 
 impl<'a> Jail<'a> {
@@ -53,7 +56,10 @@ impl<'a> Jail<'a> {
       }
       return Err(error);
     }
-    let jail = Self::running(agent, name);
+    let jail = Self {
+      root: OnceLock::from(path.to_string()),
+      ..Self::running(agent, name)
+    };
 
     match jail.configure(path, network, epair.as_ref()) {
       Ok(()) => Ok(jail),
@@ -69,6 +75,7 @@ impl<'a> Jail<'a> {
     Self {
       agent,
       name: name.to_string(),
+      root: OnceLock::new(),
     }
   }
 
@@ -96,6 +103,15 @@ impl<'a> Jail<'a> {
   pub fn connect_unix(&self, path: &str) -> Result<Relay> {
     self.agent.relay(Connect {
       to: Address::Unix(path.to_string()),
+      jail: Some(self.name.clone()),
+    })
+  }
+
+  /// The type of file at `path` in the jail, following symlinks as the jail
+  /// sees them.
+  pub fn file_type(&self, path: &str) -> Result<FileType> {
+    self.agent.file_type_at(GuestPath {
+      path: path.to_string(),
       jail: Some(self.name.clone()),
     })
   }
@@ -138,25 +154,35 @@ impl<'a> Jail<'a> {
 
   /// The jail's aggregate racct usage (`rctl -u`) and its interface counters.
   pub fn statistics(&self) -> Result<Statistics> {
-    let ran = self
-      .agent
-      .check(&["rctl", "-u", &format!("jail:{}", self.name)], QUICK)?;
-    let mut statistics = statistics::rctl_usage(&ran.stdout)?;
-    let ran = self
-      .agent
-      .check(&scripts::INTERFACES.argv(&[&self.name]), QUICK)?;
-    statistics.networks = statistics::networks(&ran.stdout)?;
-
-    Ok(statistics)
+    self.statistics_with(None)
   }
 
-  /// The guest path of the jail's root.
-  fn root(&self) -> Result<String> {
+  /// Like `statistics`, with the ZFS I/O counters of `dataset` if one is
+  /// given, all from one script.
+  pub(crate) fn statistics_with(&self, dataset: Option<&str>) -> Result<Statistics> {
+    let ran = self.agent.check(
+      &scripts::STATISTICS.argv(&[&self.name, dataset.unwrap_or_default()]),
+      QUICK,
+    )?;
+
+    statistics::parse(&ran.stdout, dataset)
+  }
+
+  /// The guest path of the jail's root, which `jls` reports if the jail was
+  /// found rather than started.
+  fn root(&self) -> Result<&str> {
+    if let Some(root) = self.root.get() {
+      return Ok(root);
+    }
     let ran = self
       .agent
       .check(&["jls", "-j", &self.name, "path"], QUICK)?;
 
-    Ok(ran.stdout.trim_end_matches('\n').to_string())
+    Ok(
+      self
+        .root
+        .get_or_init(|| ran.stdout.trim_end_matches('\n').to_string()),
+    )
   }
 
   /// Stops the jail: kills its processes, drops the TCP connections they

@@ -60,8 +60,7 @@ impl<'a> Builder<'a> {
   /// before, with their stdout and stderr to `output`. Builds into one store
   /// must not run concurrently.
   pub fn build(&self, from: &str, steps: &[Step], output: &mut dyn FnMut(&[u8])) -> Result<Built> {
-    self.zfs.create_mounted(&self.store)?;
-    let chain = SnapshotChain::new(&self.zfs, &self.store, BUILT);
+    let chain = SnapshotChain::open(&self.zfs, &self.store, BUILT)?;
     let mut built = Built {
       snapshot: from.to_string(),
       ran: 0,
@@ -71,8 +70,8 @@ impl<'a> Builder<'a> {
     for (index, step) in steps.iter().enumerate() {
       let key = key(&built.snapshot, step);
       let (snapshot, cache) = chain
-        .link(Some(&built.snapshot), &key, |dataset| {
-          self.in_jail(dataset, &key, step, output)
+        .link(Some(&built.snapshot), &key, |_, root| {
+          self.in_jail(root, &key, step, output)
         })
         .map_err(|error| error.context(format!("step {} of {}", index + 1, steps.len())))?;
       match cache {
@@ -84,18 +83,17 @@ impl<'a> Builder<'a> {
     Ok(built)
   }
 
-  /// Runs `step` in a jail on `dataset`.
-  fn in_jail(&self, dataset: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
-    let root = self.zfs.mountpoint(dataset)?;
+  /// Runs `step` in a jail rooted at `root`, a step's dataset.
+  fn in_jail(&self, root: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
     let name = format!("cfbsd-build-{}", &key[..16]);
-    let jail = Jail::start(self.agent, &name, &root, &step.network, &["mount.devfs"])?;
+    let jail = Jail::start(self.agent, &name, root, &step.network, &["mount.devfs"])?;
 
     let exit = run_script(&jail, &step.script, output);
     jail.stop()?;
     if step.network != Network::None {
       self
         .agent
-        .check(&scripts::REMOVE_RESOLV_CONF.argv(&[&root]), QUICK)?;
+        .check(&scripts::REMOVE_RESOLV_CONF.argv(&[root]), QUICK)?;
     }
 
     match exit? {

@@ -5,6 +5,7 @@
 //! [`serve`] works over any byte stream, so the tests drive it over a socket
 //! pair; the binary passes it `/dev/ttyV0.0`.
 
+mod call;
 mod listener;
 mod pipe;
 mod process;

@@ -2,14 +2,14 @@
 //! that stands in for the console.
 
 use containerization_freebsd_protocol::{
-  Address, CONTROL, Connect, Decoder, Exec, Exit, Frame, Limit, Listen, Message, Mux, Resource, Side, User, VERSION,
-  WindowSize,
+  Address, CONTROL, Call, Connect, Decoder, Exec, Exit, FileType, Frame, GuestPath, Limit, Listen, Message, Mux,
+  Resource, Return, Side, User, VERSION, WindowSize,
 };
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -585,6 +585,52 @@ fn a_new_session_kills_the_old_ones_processes() {
   // Nothing from the old channel arrives in the new session.
   host.send(CONTROL, Message::Ping(1));
   assert_eq!(host.next(), (CONTROL, Message::Pong(1)));
+}
+
+#[test]
+fn says_what_type_of_file_is_at_a_path() {
+  let mut host = Host::start();
+  let root = std::env::temp_dir().join(format!("cfbsd-agent-file-type-{}", std::process::id()));
+  std::fs::create_dir_all(&root).unwrap();
+  std::fs::write(root.join("file"), "").unwrap();
+  std::os::unix::fs::symlink("missing", root.join("dangling")).unwrap();
+  let mut file_type = |path: &Path, jail: Option<&str>| {
+    let channel = host.open(Message::Call(Call::FileType(GuestPath {
+      path: path.to_str().unwrap().into(),
+      jail: jail.map(str::to_string),
+    })));
+    let (answered, answer) = host.next();
+    assert_eq!(answered, channel);
+    assert!(!host.mux.is_open(channel));
+    answer
+  };
+
+  let answers = [
+    file_type(&root, None),
+    file_type(&root.join("file"), None),
+    file_type(Path::new("/dev/null"), None),
+    file_type(&root.join("missing"), None),
+    file_type(&root.join("dangling"), None),
+    file_type(&root, Some("cfbsd-no-such-jail")),
+  ];
+  std::fs::remove_dir_all(&root).unwrap();
+
+  let returned = |found| Message::Return(Return::FileType(found));
+  assert_eq!(
+    answers[..5],
+    [
+      returned(FileType::Directory),
+      returned(FileType::File),
+      returned(FileType::Other),
+      returned(FileType::Missing),
+      returned(FileType::Missing),
+    ]
+  );
+  assert!(
+    matches!(&answers[5], Message::Error(reason) if reason.contains("cfbsd-no-such-jail")),
+    "{:?}",
+    answers[5]
+  );
 }
 
 /// The agent's end of the console, counting the agent's writes to it.

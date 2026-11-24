@@ -60,9 +60,7 @@ impl<'a> Unpacker<'a> {
       )));
     }
 
-    self.zfs.create_mounted(&self.store)?;
-    let directory = self.zfs.mountpoint(&self.store)?;
-    let layers = SnapshotChain::new(&self.zfs, &self.store, UNPACKED);
+    let layers = SnapshotChain::open(&self.zfs, &self.store, UNPACKED)?;
     let mut unpacked = Unpacked {
       snapshot: String::new(),
       unpacked: 0,
@@ -72,10 +70,11 @@ impl<'a> Unpacker<'a> {
 
     for (index, (layer, chain_id)) in manifest.layers.iter().zip(config.chain_ids()).enumerate() {
       let hex = chain_id.require_sha256()?;
+      let staging = format!("{}/.{hex}.tar", layers.mountpoint());
       let (snapshot, cache) = layers
-        .link(below.as_deref(), hex, |dataset| {
+        .link(below.as_deref(), hex, |_, root| {
           let diff_id = diff_ids[index].require_sha256()?;
-          self.layer(image, layer, diff_id, dataset, &format!("{directory}/.{hex}.tar"))
+          self.layer(image, layer, diff_id, root, &staging)
         })
         .map_err(|error| {
           error.context(format!(
@@ -96,21 +95,23 @@ impl<'a> Unpacker<'a> {
     Ok(unpacked)
   }
 
-  /// Applies `layer` to `dataset` via the decompressed tarball at `staging`.
-  /// The tarball, and the sha256 and whiteout list beside it, are always
-  /// removed.
-  fn layer(&self, image: &Image, layer: &Descriptor, diff_id: &str, dataset: &str, staging: &str) -> Result<()> {
+  /// Applies `layer` to the dataset mounted at `root` via the decompressed
+  /// tarball at `staging`. The tarball, and the sha256 and whiteout list
+  /// beside it, are always removed: by `scripts::APPLY` as it exits, or here
+  /// if anything failed.
+  fn layer(&self, image: &Image, layer: &Descriptor, diff_id: &str, root: &str, staging: &str) -> Result<()> {
     let result = self.receive(image, layer, staging).and_then(|()| {
-      let root = self.zfs.mountpoint(dataset)?;
       self
         .agent
-        .check(&scripts::APPLY.argv(&[&root, staging, diff_id]), UNPACKING)
+        .check(&scripts::APPLY.argv(&[root, staging, diff_id]), UNPACKING)
         .map(|_| ())
     });
-    let (sha256, whiteouts) = (format!("{staging}.sha256"), format!("{staging}.whiteouts"));
-    let _ = self
-      .agent
-      .run(&["rm", "-f", staging, &sha256, &whiteouts], QUICK);
+    if result.is_err() {
+      let (sha256, whiteouts) = (format!("{staging}.sha256"), format!("{staging}.whiteouts"));
+      let _ = self
+        .agent
+        .run(&["rm", "-f", staging, &sha256, &whiteouts], QUICK);
+    }
     result
   }
 

@@ -29,7 +29,7 @@ mod testing;
 pub mod unpack;
 pub mod zfs;
 
-pub use agent::{Agent, Exec, Exit, Limit, Output, Process, Ran, Relay, Resource, Spawn, User, WindowSize};
+pub use agent::{Agent, Exec, Exit, FileType, Limit, Output, Process, Ran, Relay, Resource, Spawn, User, WindowSize};
 pub use build::{Builder, Built, Step};
 pub use container::{Configuration, Container, Containers, Dns, Host};
 pub use copy::Parents;

@@ -387,6 +387,24 @@ impl Stream {
     }
   }
 
+  /// Waits for the agent's answer on a channel that carries just one message
+  /// from it, such as a Call channel. An Error fails the channel.
+  pub(super) fn answer(&self) -> Result<Message> {
+    match self.recv_timeout(AGENT_TIMEOUT)? {
+      Some(message) => Ok(message),
+      None => Err(Error::Timeout(format!(
+        "{}: the agent did not answer within {}s",
+        self.what,
+        AGENT_TIMEOUT.as_secs()
+      ))),
+    }
+  }
+
+  /// The error for a message from the agent that the channel didn't expect.
+  pub(super) fn unexpected(&self, message: &Message) -> Error {
+    Error::Guest(format!("{}: the agent sent {}", self.what, message.name()))
+  }
+
   fn send(&self, message: Message) -> Result<()> {
     let written = self.shared.lock().send(self.channel, message, &self.what)?;
     written.wait()

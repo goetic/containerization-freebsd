@@ -1,10 +1,11 @@
 #!/bin/sh
 # Applies the OCI layer tarball $2, whose sha256 must be $3, to the root $1.
 # It reads the tarball's sha256 from $2.sha256 and its whiteout entries from
-# $2.whiteouts, both written by decompress.sh. Whiteouts delete from the
-# layers beneath, so they go before extraction. A whiteout resolving outside
-# the root is an error.
+# $2.whiteouts, both written by decompress.sh, and removes all three files
+# when it exits. Whiteouts delete from the layers beneath, so they go before
+# extraction. A whiteout resolving outside the root is an error.
 set -e
+trap 'rm -f -- "$2" "$2.sha256" "$2.whiteouts"' EXIT
 root=$(realpath -- "$1")
 layer=$2
 actual=$(cat -- "$layer.sha256")

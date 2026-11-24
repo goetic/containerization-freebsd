@@ -112,21 +112,18 @@ impl Jail<'_> {
   pub(super) fn configure(&self, path: &str, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
       let (inside, address) = (format!("{}b", epair.name), format!("{}/{PREFIX}", epair.address));
-      self.rescue(&["ifconfig", "lo0", "inet", "127.0.0.1/8", "up"])?;
-      self.rescue(&["ifconfig", &inside, "inet", &address, "up"])?;
-      self.rescue(&["route", "-q", "add", "default", &GATEWAY.to_string()])?;
+      self.set_address(&inside, &address, &GATEWAY.to_string())?;
     }
     if let Network::Interfaces(interfaces) = network {
-      self.rescue(&["ifconfig", "lo0", "inet", "127.0.0.1/8", "up"])?;
+      if interfaces.is_empty() {
+        self.set_address("", "", "")?;
+      }
       for interface in interfaces {
         let claimed = self
           .agent
           .check(&scripts::CLAIM.argv(&[&self.name, &interface.mac.to_string()]), QUICK)?;
-        let device = claimed.stdout.trim();
-        self.rescue(&["ifconfig", device, "inet", &interface.address, "up"])?;
-        if let Some(gateway) = &interface.gateway {
-          self.rescue(&["route", "-q", "add", "default", gateway])?;
-        }
+        let gateway = interface.gateway.as_deref().unwrap_or_default();
+        self.set_address(claimed.stdout.trim(), &interface.address, gateway)?;
       }
     }
     if *network != Network::None {
@@ -135,6 +132,16 @@ impl Jail<'_> {
         .check(&scripts::COPY_RESOLV_CONF.argv(&[path]), QUICK)?;
     }
     Ok(())
+  }
+
+  /// Runs `scripts::ADDRESS`, which brings up the VNET jail's lo0, gives a
+  /// non-empty `device` the `address`, and adds a default route through a
+  /// non-empty `gateway`.
+  fn set_address(&self, device: &str, address: &str, gateway: &str) -> Result<()> {
+    self
+      .agent
+      .check(&scripts::ADDRESS.argv(&[&self.name, device, address, gateway]), QUICK)
+      .map(|_| ())
   }
 }
 
@@ -156,20 +163,17 @@ impl Epair {
 }
 
 fn epair(agent: &Agent) -> Result<Epair> {
-  agent.check(
-    &scripts::NAT.argv(&[BRIDGE, &format!("{GATEWAY}/{PREFIX}"), &format!("{SUBNET}/{PREFIX}")]),
+  let created = agent.check(
+    &scripts::EPAIR.argv(&[BRIDGE, &format!("{GATEWAY}/{PREFIX}"), &format!("{SUBNET}/{PREFIX}")]),
     QUICK,
   )?;
-  let created = agent.check(&["ifconfig", "epair", "create"], QUICK)?;
-  let outside = created.stdout.trim().to_string();
+  let outside = created.stdout.trim();
   let name = outside
     .strip_suffix('a')
     .ok_or_else(|| Error::Guest(format!("ifconfig made {outside:?}, not an epair")))?
     .to_string();
   let address = address(&name).ok_or_else(|| Error::Guest(format!("no address for {name}")))?;
 
-  agent.check(&["ifconfig", BRIDGE, "addm", &outside], QUICK)?;
-  agent.check(&["ifconfig", &outside, "up"], QUICK)?;
   Ok(Epair { name, address })
 }
 

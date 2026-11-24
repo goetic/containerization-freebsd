@@ -8,9 +8,8 @@ use crate::agent::{Agent, Exec, Process, QUICK, Relay, Spawn};
 use crate::copy::Parents;
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
-use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
-use crate::statistics::{self, Statistics};
+use crate::statistics::Statistics;
 use crate::zfs::Zfs;
 use std::mem;
 use std::path::Path;
@@ -166,13 +165,7 @@ impl<'a> Container<'a> {
   /// `Jail::statistics`, plus the ZFS I/O counters of the container's
   /// dataset.
   pub fn statistics(&self) -> Result<Statistics> {
-    let mut statistics = self.jail.statistics()?;
-    let ran = self
-      .agent
-      .check(&scripts::DATASET_IO.argv(&[&self.dataset]), QUICK)?;
-    statistics.block_io = vec![statistics::dataset_io(&self.dataset, &ran.stdout)?];
-
-    Ok(statistics)
+    self.jail.statistics_with(Some(&self.dataset))
   }
 
   /// Closes the socket relays and stops the jail: its processes get SIGTERM

@@ -3,7 +3,7 @@
 
 use crate::jail::{JailId, attach};
 use crate::process::reap;
-use crate::{c_string, check, close_on_exec, retry};
+use crate::{c_string, check, close_on_exec, errno, retry};
 use std::ffi::CStr;
 use std::io;
 use std::mem::{self, MaybeUninit};
@@ -262,12 +262,6 @@ unsafe fn in_jail(
     0 => received,
     errno => Err(io::Error::from_raw_os_error(errno)),
   }
-}
-
-fn errno() -> libc::c_int {
-  io::Error::last_os_error()
-    .raw_os_error()
-    .unwrap_or(libc::EIO)
 }
 
 /// The size of a control message carrying one descriptor.

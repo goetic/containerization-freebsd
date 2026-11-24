@@ -2,8 +2,8 @@
 //! encoded byte stream as the console would.
 
 use containerization_freebsd_protocol::{
-  Address, CONTROL, Connect, Decoder, Error, Exec, Exit, Frame, Listen, MAX_PAYLOAD, Message, Mux, Side, VERSION,
-  VersionMismatch, WindowSize,
+  Address, CONTROL, Call, Connect, Decoder, Error, Exec, Exit, FileType, Frame, GuestPath, Listen, MAX_PAYLOAD,
+  Message, Mux, Return, Side, VERSION, VersionMismatch, WindowSize,
 };
 
 const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
@@ -264,6 +264,40 @@ fn closes_a_refused_relay() {
     [(relay, Message::Error("connection refused".into()))]
   );
   assert!(!host.is_open(relay) && !guest.is_open(relay));
+}
+
+#[test]
+fn closes_a_call_channel_with_its_answer() {
+  let (mut host, mut guest) = session();
+  let call = || {
+    Message::Call(Call::FileType(GuestPath {
+      path: "/etc".into(),
+      jail: None,
+    }))
+  };
+  let (answered, open) = host.open(call()).unwrap();
+  let (refused, also_open) = host.open(call()).unwrap();
+  deliver(&mut guest, [open, also_open]);
+  assert_eq!(
+    host
+      .send(answered, Message::Data(b"x".to_vec()))
+      .unwrap_err(),
+    not_allowed(answered, "data")
+  );
+  assert_eq!(
+    guest.send(answered, Message::Opened).unwrap_err(),
+    not_allowed(answered, "opened")
+  );
+
+  let answer = guest
+    .send(answered, Message::Return(Return::FileType(FileType::Directory)))
+    .unwrap();
+  let refusal = guest
+    .send(refused, Message::Error("no jail is named \"web\"".into()))
+    .unwrap();
+  deliver(&mut host, [answer, refusal]);
+  assert!(!host.is_open(answered) && !guest.is_open(answered));
+  assert!(!host.is_open(refused) && !guest.is_open(refused));
 }
 
 #[test]

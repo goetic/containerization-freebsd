@@ -21,7 +21,7 @@
 //! console the agent has read. The console drops bytes it cannot buffer, so
 //! the host keeps at most [`WINDOW`] bytes in flight.
 //!
-//! The host opens other channels with one of three messages:
+//! The host opens other channels with one of four messages:
 //!
 //! - Exec runs a process on pipes or a pty, in the guest or a jail, as a
 //!   given user, with a umask and resource limits.
@@ -29,6 +29,9 @@
 //!   guest or a jail.
 //! - Listen makes the agent listen on a Unix socket. The agent relays each
 //!   connection on a new channel that it opens with Accepted.
+//! - Call asks the agent to do one thing and report back, such as find the
+//!   type of file at a path in the guest or a jail. The agent answers with
+//!   Return, which closes the channel.
 //!
 //! The side that opens a channel is its initiator, and the other side its
 //! responder. The initiator sends Data (stdin or relay bytes), Resize, and
@@ -46,5 +49,7 @@ pub mod mux;
 
 pub use codec::DecodeError;
 pub use frame::{Decoder, Frame, MAGIC, MAX_PAYLOAD, Skipped};
-pub use message::{Address, Connect, Exec, Exit, Limit, Listen, Message, Resource, User, WindowSize};
+pub use message::{
+  Address, Call, Connect, Exec, Exit, FileType, GuestPath, Limit, Listen, Message, Resource, Return, User, WindowSize,
+};
 pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch, WINDOW};

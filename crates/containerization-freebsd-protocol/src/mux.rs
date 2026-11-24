@@ -14,7 +14,7 @@ use std::{fmt, mem};
 pub const CONTROL: u32 = 0;
 
 /// The protocol version this crate speaks. The other side must speak the same.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// The flow-control window: the most bytes the host may write to the console
 /// before the agent reports them with Received. FreeBSD's virtio console
@@ -55,7 +55,7 @@ impl Side {
 
   fn opens(self, message: &Message) -> bool {
     match message {
-      Message::Exec(_) | Message::Connect(_) | Message::Listen(_) => self == Self::Host,
+      Message::Exec(_) | Message::Connect(_) | Message::Listen(_) | Message::Call(_) => self == Self::Host,
       Message::Accepted { .. } => self == Self::Guest,
       _ => false,
     }
@@ -94,6 +94,7 @@ enum Kind {
   Exec { pty: bool },
   Relay,
   Listener,
+  Call,
 }
 
 impl Kind {
@@ -104,6 +105,7 @@ impl Kind {
       }),
       Message::Connect(_) | Message::Accepted { .. } => Some(Self::Relay),
       Message::Listen(_) => Some(Self::Listener),
+      Message::Call(_) => Some(Self::Call),
       _ => None,
     }
   }
@@ -150,6 +152,12 @@ impl Channel {
   /// message now. The channel itself is left as it is.
   fn after(mut self, sender: Role, message: &Message) -> Option<(Self, Status)> {
     let (initiator, responder) = (sender == Role::Initiator, sender == Role::Responder);
+    // A Call channel carries only the responder's Return, or an Error, and
+    // either closes it.
+    if self.kind == Kind::Call {
+      let allowed = matches!(message, Message::Error(_)) || (responder && matches!(message, Message::Return(_)));
+      return allowed.then_some((self, Status::Closed));
+    }
     let process = matches!(self.kind, Kind::Exec { .. });
     let ended = if initiator {
       self.initiator_eof

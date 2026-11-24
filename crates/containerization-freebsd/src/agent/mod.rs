@@ -18,11 +18,11 @@ mod session;
 
 pub(crate) use channel::Listener;
 pub use channel::{Output, Process, Relay};
-pub use containerization_freebsd_protocol::{Exec, Exit, Limit, Resource, User, WindowSize};
+pub use containerization_freebsd_protocol::{Exec, Exit, FileType, Limit, Resource, User, WindowSize};
 
 use crate::error::{Error, Result};
 use channel::Stream;
-use containerization_freebsd_protocol::{Address, Connect, Listen, Message};
+use containerization_freebsd_protocol::{Address, Call, Connect, GuestPath, Listen, Message, Return};
 use session::{Route, Shared};
 use std::io::{PipeReader, PipeWriter};
 use std::path::PathBuf;
@@ -242,9 +242,40 @@ impl Agent {
     ended.wait()
   }
 
+  /// The type of file at `path` in the guest, following symlinks.
+  pub fn file_type(&self, path: &str) -> Result<FileType> {
+    self.file_type_at(GuestPath {
+      path: path.to_string(),
+      jail: None,
+    })
+  }
+
+  /// The type of file at `path`, which the agent looks up from inside the
+  /// jail if `path` names one.
+  pub(crate) fn file_type_at(&self, path: GuestPath) -> Result<FileType> {
+    let Return::FileType(found) = self.call(Call::FileType(path))?;
+    Ok(found)
+  }
+
+  /// Makes `call` and returns the agent's answer.
+  fn call(&self, call: Call) -> Result<Return> {
+    let what = call.to_string();
+    let stream = self.open_unanswered(Message::Call(call), what, None)?;
+
+    match stream.answer()? {
+      Message::Return(value) => Ok(value),
+      other => Err(stream.unexpected(&other)),
+    }
+  }
+
   /// Opens a channel with `message` and waits for the agent to send Opened.
   /// For a Listen channel, connections are relayed to `host`.
   fn open(&self, message: Message, what: String, host: Option<PathBuf>) -> Result<Stream> {
+    self.open_unanswered(message, what, host)?.opened()
+  }
+
+  /// Opens a channel with `message`, without waiting for the agent.
+  fn open_unanswered(&self, message: Message, what: String, host: Option<PathBuf>) -> Result<Stream> {
     let (sender, receiver) = mpsc::channel();
     let (channel, written) = {
       let mut state = self.shared.lock();
@@ -256,7 +287,7 @@ impl Agent {
     };
 
     written.wait()?;
-    Stream::new(channel, self.shared.clone(), receiver, what).opened()
+    Ok(Stream::new(channel, self.shared.clone(), receiver, what))
   }
 }
 
@@ -428,6 +459,28 @@ pub(crate) mod tests {
       .unwrap();
 
     assert!(error.to_string().contains("/nonexistent/command"), "{error}");
+  }
+
+  #[test]
+  fn finds_the_type_of_file_at_a_path() {
+    let agent = started();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_str().unwrap();
+    std::fs::write(directory.path().join("file"), "").unwrap();
+
+    assert_eq!(agent.file_type(root).unwrap(), FileType::Directory);
+    assert_eq!(agent.file_type(&format!("{root}/file")).unwrap(), FileType::File);
+    assert_eq!(
+      agent.file_type(&format!("{root}/file/under")).unwrap(),
+      FileType::Missing
+    );
+    let error = agent
+      .file_type_at(GuestPath {
+        path: root.to_string(),
+        jail: Some("cfbsd-no-such-jail".into()),
+      })
+      .unwrap_err();
+    assert!(error.to_string().contains("cfbsd-no-such-jail"), "{error}");
   }
 
   #[test]

@@ -57,7 +57,7 @@ impl Jail<'_> {
     let root = self.root()?;
     let resolved = self
       .agent
-      .check(&scripts::RESOLVE.argv(&[&root, &mount.destination]), QUICK)?
+      .check(&scripts::RESOLVE.argv(&[root, &mount.destination]), QUICK)?
       .stdout;
     let point = resolved.strip_suffix('\n').unwrap_or(&resolved);
     let options = mount.options.join(",");

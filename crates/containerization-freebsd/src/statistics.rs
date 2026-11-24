@@ -56,8 +56,24 @@ pub struct DatasetIo {
   pub write_operations: u64,
 }
 
+/// Parses what `scripts::STATISTICS` prints for a jail, with the counters
+/// of `dataset` if one is given.
+pub(crate) fn parse(output: &str, dataset: Option<&str>) -> Result<Statistics> {
+  let parts: Vec<&str> = output.split("%%\n").collect();
+  let [usage, interfaces, counters, ..] = parts.as_slice() else {
+    return Err(Error::Guest(format!("the statistics script printed {output:?}")));
+  };
+  let mut statistics = rctl_usage(usage)?;
+  statistics.networks = networks(interfaces)?;
+  if let Some(dataset) = dataset {
+    statistics.block_io = vec![dataset_io(dataset, counters)?];
+  }
+
+  Ok(statistics)
+}
+
 /// Parses the output of `rctl -u`.
-pub(crate) fn rctl_usage(usage: &str) -> Result<Statistics> {
+fn rctl_usage(usage: &str) -> Result<Statistics> {
   let values: HashMap<&str, &str> = usage
     .lines()
     .filter_map(|line| line.split_once('='))
@@ -85,9 +101,9 @@ pub(crate) fn rctl_usage(usage: &str) -> Result<Statistics> {
   })
 }
 
-/// Parses the `<Link#n>` rows of `scripts::INTERFACES`'s netstat output,
-/// finding columns by header name.
-pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
+/// Parses the `<Link#n>` rows of netstat's interface table, finding columns
+/// by header name.
+fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
   let unreadable = || Error::Guest(format!("netstat printed {table:?}"));
   let mut lines = table.lines();
   let Some(header) = lines.next() else {
@@ -130,8 +146,8 @@ pub(crate) fn networks(table: &str) -> Result<Vec<NetworkStatistics>> {
     .collect()
 }
 
-/// Parses `scripts::DATASET_IO`'s output for `dataset`.
-pub(crate) fn dataset_io(dataset: &str, counters: &str) -> Result<DatasetIo> {
+/// Parses the counters of `dataset`, one to a line.
+fn dataset_io(dataset: &str, counters: &str) -> Result<DatasetIo> {
   let values = counters
     .lines()
     .map(|line| line.trim().parse().ok())
@@ -230,5 +246,20 @@ epair0b     - 10.66.0.0/16  10.66.0.2               40     -     -       3200   
       }
     );
     assert!(dataset_io("zroot/c/web", "7\n4096\n").is_err());
+  }
+
+  #[test]
+  fn reads_each_part_of_what_the_script_prints() {
+    let usage = "cputime=1\nmemoryuse=2\nmaxproc=3\nnthr=4\nopenfiles=5\npcpu=6\nreadbps=7\nwritebps=8\n\
+                 readiops=9\nwriteiops=10\n";
+
+    let container = parse(&format!("{usage}%%\n%%\n7\n4096\n3\n512\n%%\n"), Some("zroot/c/web")).unwrap();
+    let jail = parse(&format!("{usage}%%\n%%\n%%\n"), None).unwrap();
+
+    assert_eq!(container.processes, 3);
+    assert!(container.networks.is_empty());
+    assert_eq!(container.block_io[0].read_bytes, 4096);
+    assert!(jail.block_io.is_empty());
+    assert!(parse(usage, None).is_err());
   }
 }

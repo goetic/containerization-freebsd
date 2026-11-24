@@ -3,6 +3,8 @@
 
 use crate::agent::{Agent, QUICK, Spawn};
 use crate::error::{Error, Result};
+use crate::scripts;
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Extracting a base system from a share takes about a minute.
@@ -56,17 +58,16 @@ impl<'a> Zfs<'a> {
     self.check(&["zfs", "create", "-p", dataset], QUICK)
   }
 
-  /// Creates `dataset` if needed and ensures ZFS mounts it. A dataset whose
-  /// mountpoint is `none` or `legacy`, as under the pool of FreeBSD's VM
-  /// image, gets `/<dataset>`, which its children inherit.
-  pub fn create_mounted(&self, dataset: &str) -> Result<()> {
-    if !self.exists(dataset)? {
-      self.create(dataset)?;
-    }
-    if unmounted(&self.mountpoint_property(dataset)?) {
-      self.check(&["zfs", "set", &format!("mountpoint=/{dataset}"), dataset], QUICK)?;
-    }
-    Ok(())
+  /// Creates `dataset` if needed, ensures ZFS mounts it, and returns the
+  /// directory it is mounted at. A dataset whose mountpoint is `none` or
+  /// `legacy`, as under the pool of FreeBSD's VM image, gets `/<dataset>`,
+  /// which its children inherit.
+  pub fn create_mounted(&self, dataset: &str) -> Result<String> {
+    let ran = self
+      .agent
+      .check(&scripts::CREATE_MOUNTED.argv(&[dataset]), QUICK)?;
+
+    Ok(ran.stdout.trim().to_string())
   }
 
   /// `snapshot` is `<dataset>@<name>`.
@@ -83,6 +84,27 @@ impl<'a> Zfs<'a> {
   /// depends on it, since `-r` doesn't destroy dependents.
   pub fn destroy(&self, name: &str) -> Result<()> {
     self.check(&["zfs", "destroy", "-r", name], QUICK)
+  }
+
+  /// The full names of `dataset`, its snapshots, and the filesystems and
+  /// snapshots under it.
+  fn names_under(&self, dataset: &str) -> Result<Vec<String>> {
+    let ran = self.agent.check(
+      &[
+        "zfs",
+        "list",
+        "-H",
+        "-o",
+        "name",
+        "-t",
+        "filesystem,snapshot",
+        "-r",
+        dataset,
+      ],
+      QUICK,
+    )?;
+
+    Ok(ran.lines().into_iter().map(str::to_string).collect())
   }
 
   /// The full names of the filesystems directly under `dataset`.
@@ -155,6 +177,11 @@ pub(crate) struct SnapshotChain<'a> {
   zfs: &'a Zfs<'a>,
   store: &'a str,
   tag: &'static str,
+  /// Where the store is mounted. Each dataset inherits a mountpoint under it.
+  mountpoint: String,
+  /// The datasets and snapshots that were in the store when the chain was
+  /// opened.
+  existing: HashSet<String>,
 }
 
 /// Whether `SnapshotChain::link` reused an existing snapshot.
@@ -165,35 +192,53 @@ pub(crate) enum Cache {
 }
 
 impl<'a> SnapshotChain<'a> {
-  pub(crate) fn new(zfs: &'a Zfs<'a>, store: &'a str, tag: &'static str) -> Self {
-    Self { zfs, store, tag }
+  /// Creates and mounts `store` if needed, and notes the datasets and
+  /// snapshots already in it, so that no link needs to ask the guest.
+  pub(crate) fn open(zfs: &'a Zfs<'a>, store: &'a str, tag: &'static str) -> Result<Self> {
+    let mountpoint = zfs.create_mounted(store)?;
+    let existing = zfs.names_under(store)?.into_iter().collect();
+
+    Ok(Self {
+      zfs,
+      store,
+      tag,
+      mountpoint,
+      existing,
+    })
+  }
+
+  /// Where the store is mounted.
+  pub(crate) fn mountpoint(&self) -> &str {
+    &self.mountpoint
   }
 
   /// The snapshot of `<store>/<name>`, on top of the snapshot `below`. If it
-  /// doesn't exist yet, makes the dataset, runs `fill` on it, and snapshots
-  /// it; if `fill` fails, the dataset is destroyed.
+  /// didn't exist when the chain was opened, makes the dataset, runs `fill`
+  /// with the dataset and the directory it is mounted at, and snapshots it;
+  /// if `fill` fails, the dataset is destroyed.
   pub(crate) fn link(
     &self,
     below: Option<&str>,
     name: &str,
-    fill: impl FnOnce(&str) -> Result<()>,
+    fill: impl FnOnce(&str, &str) -> Result<()>,
   ) -> Result<(String, Cache)> {
     let dataset = format!("{}/{name}", self.store);
     let snapshot = format!("{dataset}@{}", self.tag);
-    if self.zfs.exists(&snapshot)? {
+    if self.existing.contains(&snapshot) {
       return Ok((snapshot, Cache::Hit));
     }
 
     // An earlier attempt that failed without cleaning up, such as when the
     // guest stopped, can leave the dataset behind.
-    if self.zfs.exists(&dataset)? {
+    if self.existing.contains(&dataset) {
       self.zfs.destroy(&dataset)?;
     }
     match below {
       Some(below) => self.zfs.clone(below, &dataset)?,
       None => self.zfs.create(&dataset)?,
     }
-    fill(&dataset).inspect_err(|_| {
+    let root = format!("{}/{name}", self.mountpoint.trim_end_matches('/'));
+    fill(&dataset, &root).inspect_err(|_| {
       let _ = self.zfs.destroy(&dataset);
     })?;
     self.zfs.snapshot(&snapshot)?;

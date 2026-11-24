@@ -1,11 +1,85 @@
-//! Looking up jails by name, and attaching to them.
+//! Looking up jails by name, attaching to them, and finding the type of file
+//! at a path in one.
 
+use crate::process::reap;
+use crate::{c_string, check, errno};
 use std::io;
-use std::path::PathBuf;
+use std::mem::MaybeUninit;
+use std::path::{Path, PathBuf};
 
 /// The id of a running jail, which only `find_jail` returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JailId(libc::c_int);
+
+/// The type of file a path names, following symlinks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileType {
+  Directory,
+  /// A regular file.
+  File,
+  /// A FIFO, device, or socket.
+  Other,
+}
+
+/// The type of file at `path` in `jail`, or `None` if nothing is there or a
+/// symlink there leads nowhere. A child process attached to the jail calls
+/// stat(2), so the path, and any symlinks along it, resolve as they do in the
+/// jail.
+pub fn file_type_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<Option<FileType>> {
+  // The child's exit status for each answer. A failure exits with its
+  // errno, which is always lower.
+  const MISSING: libc::c_int = 128;
+  const DIRECTORY: libc::c_int = 129;
+  const FILE: libc::c_int = 130;
+  const OTHER: libc::c_int = 131;
+  let path = c_string(path.as_ref())?;
+
+  // SAFETY: the child only attaches, calls stat(2), and exits. Those calls
+  // are async-signal-safe and allocate nothing, so they are safe after fork.
+  let pid = check(unsafe { libc::fork() })?;
+  if pid == 0 {
+    let status = match attach(jail) {
+      Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
+      Ok(()) => {
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: stat fills the stat when it succeeds, and the stat is read
+        // only after that.
+        unsafe {
+          if libc::stat(path.as_ptr(), stat.as_mut_ptr()) == -1 {
+            match errno() {
+              libc::ENOENT | libc::ENOTDIR => MISSING,
+              error => error,
+            }
+          } else {
+            match stat.assume_init().st_mode & libc::S_IFMT {
+              libc::S_IFDIR => DIRECTORY,
+              libc::S_IFREG => FILE,
+              _ => OTHER,
+            }
+          }
+        }
+      }
+    };
+    // SAFETY: _exit ends the child at once, without running the parent's
+    // exit handlers or destructors.
+    unsafe { libc::_exit(status) }
+  }
+
+  let status = reap(pid)?;
+  if !libc::WIFEXITED(status) {
+    return Err(io::Error::other(format!(
+      "the child died of signal {}",
+      libc::WTERMSIG(status)
+    )));
+  }
+  match libc::WEXITSTATUS(status) {
+    MISSING => Ok(None),
+    DIRECTORY => Ok(Some(FileType::Directory)),
+    FILE => Ok(Some(FileType::File)),
+    OTHER => Ok(Some(FileType::Other)),
+    errno => Err(io::Error::from_raw_os_error(errno)),
+  }
+}
 
 /// Finds the running jail named `name` and returns its id and the path of
 /// its root in the guest.

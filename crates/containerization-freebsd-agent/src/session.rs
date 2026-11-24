@@ -7,9 +7,9 @@ use crate::listener::{self, Listening};
 use crate::pipe::{READ, Stopped, read_chunks};
 use crate::process::{self, Process};
 use crate::relay::{self, Connection};
-use crate::sys;
+use crate::{call, sys};
 use containerization_freebsd_protocol::{
-  CONTROL, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
+  CONTROL, Call, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
 };
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -279,6 +279,7 @@ impl<W: Write> Agent<W> {
       Ok((_, Message::Exec(exec))) => self.exec(channel, &exec),
       Ok((_, Message::Connect(connect))) => self.connect(channel, &connect),
       Ok((_, Message::Listen(listen))) => self.listen(channel, &listen),
+      Ok((_, Message::Call(call))) => self.call(channel, &call),
       Ok((_, message)) => self.deliver(channel, message),
       // The host has a session that the agent does not. The agent announces
       // itself once so the host starts a new one; frames still arriving
@@ -348,6 +349,17 @@ impl<W: Write> Agent<W> {
     self.start(channel, |outbox| {
       listener::listen(listen, outbox).map_err(|error| format!("listening on {listen}: {error}"))
     });
+  }
+
+  /// Answers the Call channel `channel` with what the call returns, or with
+  /// an Error. Either answer closes the channel. A call in a jail forks,
+  /// which only the session loop may do.
+  fn call(&mut self, channel: u32, call: &Call) {
+    let answer = match call::answer(call) {
+      Ok(value) => Message::Return(value),
+      Err(error) => Message::Error(format!("{call}: {error}")),
+    };
+    self.send(channel, answer);
   }
 
   /// Calls `start` to start the process, relay, or listener that opening

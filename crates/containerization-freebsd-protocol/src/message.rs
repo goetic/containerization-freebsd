@@ -41,6 +41,12 @@ pub enum Message {
   Accepted {
     listener: u32,
   },
+  /// Opens a channel, from the host, that asks the agent to do one thing and
+  /// report back. The agent answers with Return or Error, either of which
+  /// closes the channel.
+  Call(Call),
+  /// The agent's answer to a Call.
+  Return(Return),
   /// The responder started the process, connected the relay, or is
   /// listening.
   Opened,
@@ -208,6 +214,58 @@ pub struct Listen {
   pub mode: Option<u16>,
 }
 
+/// What a Call asks the agent to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Call {
+  /// Finds the type of file at the path, following symlinks.
+  FileType(GuestPath),
+}
+
+/// Names what the call does, for errors: `finding the type of "/etc"`.
+impl fmt::Display for Call {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::FileType(path) => write!(formatter, "finding the type of {path}"),
+    }
+  }
+}
+
+/// What the agent reports for a Call, in the variant of the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Return {
+  FileType(FileType),
+}
+
+/// A path in the guest, or in a jail if one is named. The agent works from
+/// inside the jail, so that the path, and any symlinks along it, resolve as
+/// they do there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestPath {
+  pub path: String,
+  /// The name of the jail. `None` means the guest.
+  pub jail: Option<String>,
+}
+
+/// The path in quotes, then the jail if there is one.
+impl fmt::Display for GuestPath {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(formatter, "{:?}", self.path)?;
+    in_jail(formatter, self.jail.as_deref())
+  }
+}
+
+/// The type of file at a path, following symlinks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileType {
+  /// Nothing is there, or a symlink there leads nowhere.
+  Missing,
+  Directory,
+  /// A regular file.
+  File,
+  /// A FIFO, device, or socket.
+  Other,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowSize {
   pub rows: u16,
@@ -248,6 +306,7 @@ mod kind {
   pub const CONNECT: u8 = 0x11;
   pub const LISTEN: u8 = 0x12;
   pub const ACCEPTED: u8 = 0x13;
+  pub const CALL: u8 = 0x14;
   pub const OPENED: u8 = 0x20;
   pub const DATA: u8 = 0x21;
   pub const STDERR: u8 = 0x22;
@@ -256,6 +315,7 @@ mod kind {
   pub const SIGNAL: u8 = 0x25;
   pub const EXITED: u8 = 0x26;
   pub const ERROR: u8 = 0x27;
+  pub const RETURN: u8 = 0x28;
 }
 
 impl Message {
@@ -270,6 +330,8 @@ impl Message {
       Self::Connect(_) => "connect",
       Self::Listen(_) => "listen",
       Self::Accepted { .. } => "accepted",
+      Self::Call(_) => "call",
+      Self::Return(_) => "return",
       Self::Opened => "opened",
       Self::Data(_) => "data",
       Self::Stderr(_) => "stderr",
@@ -294,6 +356,8 @@ impl Message {
       Self::Connect(connect) => (kind::CONNECT, encode(&connect)),
       Self::Listen(listen) => (kind::LISTEN, encode(&listen)),
       Self::Accepted { listener } => (kind::ACCEPTED, encode(&listener)),
+      Self::Call(call) => (kind::CALL, encode(&call)),
+      Self::Return(value) => (kind::RETURN, encode(&value)),
       Self::Opened => (kind::OPENED, Vec::new()),
       Self::Data(bytes) => (kind::DATA, bytes),
       Self::Stderr(bytes) => (kind::STDERR, bytes),
@@ -340,6 +404,8 @@ impl Message {
       kind::ACCEPTED => Self::Accepted {
         listener: reader.get()?,
       },
+      kind::CALL => Self::Call(reader.get()?),
+      kind::RETURN => Self::Return(reader.get()?),
       kind::OPENED => Self::Opened,
       kind::EOF => Self::Eof,
       kind::RESIZE => Self::Resize(reader.get()?),
@@ -368,9 +434,37 @@ record!(User { name, group, groups });
 record!(Limit { resource, soft, hard });
 record!(Connect { to, jail });
 record!(Listen { path, jail, mode });
+record!(GuestPath { path, jail });
 record!(WindowSize { rows, columns });
 tagged!(Address { 0 => Port, 1 => Unix });
 tagged!(Exit { 0 => Code, 1 => Signal });
+tagged!(Call { 0 => FileType });
+tagged!(Return { 0 => FileType });
+
+/// A file type is a u8 tag.
+impl Encode for FileType {
+  fn encode(&self, out: &mut Writer) {
+    let tag: u8 = match self {
+      Self::Missing => 0,
+      Self::Directory => 1,
+      Self::File => 2,
+      Self::Other => 3,
+    };
+    out.put(&tag);
+  }
+}
+
+impl Decode for FileType {
+  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+    match reader.get::<u8>()? {
+      0 => Ok(Self::Missing),
+      1 => Ok(Self::Directory),
+      2 => Ok(Self::File),
+      3 => Ok(Self::Other),
+      tag => Err(DecodeError::UnknownTag(tag)),
+    }
+  }
+}
 
 /// A resource is its number on the wire.
 impl Encode for Resource {
@@ -508,6 +602,15 @@ mod tests {
       }),
       Message::Listen(Listen::default()),
       Message::Accepted { listener: 4 },
+      Message::Call(Call::FileType(GuestPath {
+        path: "/etc/rc.conf".into(),
+        jail: Some("web".into()),
+      })),
+      Message::Call(Call::FileType(GuestPath::default())),
+      Message::Return(Return::FileType(FileType::Missing)),
+      Message::Return(Return::FileType(FileType::Directory)),
+      Message::Return(Return::FileType(FileType::File)),
+      Message::Return(Return::FileType(FileType::Other)),
       Message::Opened,
       Message::Data(b"stdin".to_vec()),
       Message::Stderr(vec![0xFF]),
@@ -587,6 +690,12 @@ mod tests {
     };
     assert_eq!(hello.frame(0).payload, [2, 0, 1]);
     assert_eq!(Message::Exited(Exit::Signal(9)).frame(0).payload, [1, 9, 0, 0, 0]);
+    assert_eq!(
+      Message::Return(Return::FileType(FileType::Other))
+        .frame(0)
+        .payload,
+      [0, 3]
+    );
   }
 
   #[test]
