@@ -195,7 +195,12 @@ impl Process {
       Output::Stderr(bytes) => stderr.write_all(&bytes),
       Output::Exited(exit) => return Ok(Some(exit)),
     };
-    written.map_err(Error::io(format!("writing the output of {}", self.stream.what)))?;
+    // This runs for every chunk of output, so the message is built only on
+    // failure.
+    written.map_err(|error| Error::Io {
+      action: format!("writing the output of {}", self.stream.what),
+      error,
+    })?;
     Ok(None)
   }
 

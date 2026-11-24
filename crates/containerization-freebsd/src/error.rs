@@ -68,22 +68,30 @@ impl Error {
     }
   }
 
+  /// The `Io` error that `map_err` makes of an `io::Error`, for `action`.
+  /// `action` becomes a `String` only on failure, so a `&str` costs nothing
+  /// on success; a `format!` argument, though, is built either way.
   pub(crate) fn io(action: impl Into<String>) -> impl FnOnce(std::io::Error) -> Self {
-    let action = action.into();
-
-    move |error| Self::Io { action, error }
+    move |error| Self::Io {
+      action: action.into(),
+      error,
+    }
   }
 
+  /// Like `io`, for the protocol's errors.
   pub(crate) fn protocol(what: impl Into<String>) -> impl FnOnce(containerization_freebsd_protocol::Error) -> Self {
-    let what = what.into();
-
-    move |error| Self::Protocol { what, error }
+    move |error| Self::Protocol {
+      what: what.into(),
+      error,
+    }
   }
 
+  /// Like `io`, for Virtualization's errors.
   pub(crate) fn virtualization(action: impl Into<String>) -> impl FnOnce(virtualization::Error) -> Self {
-    let action = action.into();
-
-    move |error| Self::Virtualization { action, error }
+    move |error| Self::Virtualization {
+      action: action.into(),
+      error,
+    }
   }
 }
 

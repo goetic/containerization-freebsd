@@ -180,7 +180,10 @@ pub(crate) fn send(agent: &Agent, request: &Request, authorization: Option<&str>
       .upload
       .map(File::open)
       .transpose()
-      .map_err(Error::io(format!("reading the body of {request}")))?;
+      .map_err(|error| Error::Io {
+        action: format!("reading the body of {request}"),
+        error,
+      })?;
     let wait = match exchange(agent, request, authorization, upload) {
       Ok(response) if retries < RETRIES && TRANSIENT.contains(&response.status()) => {
         response.retry_after().unwrap_or_else(|| backoff(retries))
