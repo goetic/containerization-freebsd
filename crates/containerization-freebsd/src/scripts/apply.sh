@@ -1,16 +1,18 @@
 #!/bin/sh
 # Applies the OCI layer tarball $2, whose sha256 must be $3, to the root $1.
-# Whiteouts delete from the layers beneath, so they go before extraction. A
-# whiteout resolving outside the root is an error.
+# It reads the tarball's sha256 from $2.sha256 and its whiteout entries from
+# $2.whiteouts, both written by decompress.sh. Whiteouts delete from the
+# layers beneath, so they go before extraction. A whiteout resolving outside
+# the root is an error.
 set -e
 root=$(realpath -- "$1")
 layer=$2
-actual=$(sha256 -q -- "$layer")
+actual=$(cat -- "$layer.sha256")
 if [ "$actual" != "$3" ]; then
   echo "its sha256 is $actual, not the config's $3" >&2
   exit 1
 fi
-tar -tf "$layer" | grep -E '(^|/)\.wh\.[^/]+$' | while IFS= read -r entry; do
+while IFS= read -r entry; do
   case "$entry" in
     */*) directory=${entry%/*} ;;
     *) directory=. ;;
@@ -34,5 +36,5 @@ tar -tf "$layer" | grep -E '(^|/)\.wh\.[^/]+$' | while IFS= read -r entry; do
       rm -rf -- "${parent:?}/$hidden"
     fi
   fi
-done
+done <"$layer.whiteouts"
 tar -xpf "$layer" -C "$root" --numeric-owner --exclude '.wh.*'

@@ -96,8 +96,9 @@ impl<'a> Unpacker<'a> {
     Ok(unpacked)
   }
 
-  /// Applies `layer` to `dataset` via the decompressed tarball at `staging`,
-  /// which is always removed.
+  /// Applies `layer` to `dataset` via the decompressed tarball at `staging`.
+  /// The tarball, and the sha256 and whiteout list beside it, are always
+  /// removed.
   fn layer(&self, image: &Image, layer: &Descriptor, diff_id: &str, dataset: &str, staging: &str) -> Result<()> {
     let result = self.receive(image, layer, staging).and_then(|()| {
       let root = self.zfs.mountpoint(dataset)?;
@@ -106,12 +107,15 @@ impl<'a> Unpacker<'a> {
         .check(&scripts::APPLY.argv(&[&root, staging, diff_id]), UNPACKING)
         .map(|_| ())
     });
-    let _ = self.agent.run(&["rm", "-f", staging], QUICK);
+    let (sha256, whiteouts) = (format!("{staging}.sha256"), format!("{staging}.whiteouts"));
+    let _ = self
+      .agent
+      .run(&["rm", "-f", staging, &sha256, &whiteouts], QUICK);
     result
   }
 
   /// Streams `layer`'s blob to the guest, which decompresses it to
-  /// `staging`.
+  /// `staging`, hashing it and listing its whiteouts as it goes.
   fn receive(&self, image: &Image, layer: &Descriptor, staging: &str) -> Result<()> {
     let compression = compression(&layer.media_type)?;
     let path = image.content().path(&layer.digest)?;
