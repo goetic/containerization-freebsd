@@ -7,6 +7,7 @@ use super::session::Event;
 use crate::error::{Error, Result};
 use containerization_freebsd_protocol::{CONTROL, Decoder, Frame, Message, Skipped, WINDOW};
 use std::io::{PipeReader, PipeWriter, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Condvar, Mutex, PoisonError};
 
@@ -59,7 +60,7 @@ impl Credit {
     }
     let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
 
-    match Message::from_frame(frame.clone()) {
+    match Message::peek(frame) {
       Ok(Message::Received(bytes)) => {
         window.unreceived = window.unreceived.saturating_sub(bytes as usize);
       }
@@ -81,23 +82,23 @@ impl Credit {
   }
 }
 
-/// A frame for the writer thread, and where to report how writing it went.
+/// An encoded frame for the writer thread, and where to report how writing
+/// it went.
 pub(super) struct Outgoing {
-  pub(super) frame: Frame,
+  pub(super) bytes: Vec<u8>,
   pub(super) done: SyncSender<Result<()>>,
 }
 
 /// Writes each frame from `queue` to the console in order, in slices as the
 /// window makes room for them, and reports how each went.
 pub(super) fn write(queue: &Receiver<Outgoing>, mut input: PipeWriter, credit: &Credit) {
-  for Outgoing { frame, done } in queue {
-    let _ = done.send(write_frame(&mut input, credit, &frame));
+  for Outgoing { bytes, done } in queue {
+    let _ = done.send(write_frame(&mut input, credit, &bytes));
   }
 }
 
-fn write_frame(input: &mut PipeWriter, credit: &Credit, frame: &Frame) -> Result<()> {
-  let bytes = frame.to_bytes();
-  let mut rest = bytes.as_slice();
+fn write_frame(input: &mut PipeWriter, credit: &Credit, bytes: &[u8]) -> Result<()> {
+  let mut rest = bytes;
 
   while !rest.is_empty() {
     let (now, later) = rest.split_at(credit.take(rest.len())?);
@@ -111,13 +112,17 @@ fn write_frame(input: &mut PipeWriter, credit: &Credit, frame: &Frame) -> Result
 
 /// Reads the console, counts the agent's Received reports, and passes
 /// everything to the handler thread. Counting them here, rather than in the
-/// handler thread, reopens the window however busy that thread is.
-pub(super) fn read(mut output: PipeReader, credit: &Credit, events: &mpsc::Sender<Event>) {
+/// handler thread, reopens the window however busy that thread is. The raw
+/// bytes are passed only while `session` is false, since the handler shows
+/// console text only before a session starts.
+pub(super) fn read(mut output: PipeReader, credit: &Credit, session: &AtomicBool, events: &mpsc::Sender<Event>) {
   let mut decoder = Decoder::new();
   let mut buffer = vec![0; 64 << 10];
 
   while let Ok(read @ 1..) = output.read(&mut buffer) {
-    let _ = events.send(Event::Read(buffer[..read].to_vec()));
+    if !session.load(Ordering::Relaxed) {
+      let _ = events.send(Event::Read(buffer[..read].to_vec()));
+    }
     decoder.push(&buffer[..read]);
 
     while let Some(decoded) = decoder.decode() {

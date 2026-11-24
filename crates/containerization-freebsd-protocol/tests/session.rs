@@ -267,6 +267,33 @@ fn closes_a_refused_relay() {
 }
 
 #[test]
+fn sends_data_from_borrowed_bytes_as_send_does() {
+  let (mut host, mut guest) = session();
+  let (channel, open) = host.open(exec(&["cat"], None)).unwrap();
+  deliver(&mut guest, [open]);
+  let mut encoded = Vec::new();
+
+  host.send_data(channel, b"stdin", &mut encoded).unwrap();
+  let mut decoder = Decoder::new();
+  decoder.push(&encoded);
+  let frame = decoder.decode().unwrap().unwrap();
+  assert_eq!(
+    guest.receive(frame).unwrap(),
+    (channel, Message::Data(b"stdin".to_vec()))
+  );
+
+  deliver(&mut guest, [host.send(channel, Message::Eof).unwrap()]);
+  assert_eq!(
+    host.send_data(channel, b"late", &mut encoded).unwrap_err(),
+    not_allowed(channel, "data")
+  );
+  assert_eq!(
+    host.send_data(CONTROL, b"x", &mut encoded).unwrap_err(),
+    not_allowed(CONTROL, "data")
+  );
+}
+
+#[test]
 fn closes_a_call_channel_with_its_answer() {
   let (mut host, mut guest) = session();
   let call = || {

@@ -47,30 +47,49 @@ impl Frame {
   ///
   /// Panics if the payload is larger than [`MAX_PAYLOAD`].
   pub fn encode(&self, out: &mut Vec<u8>) {
-    assert!(
-      self.payload.len() <= MAX_PAYLOAD,
-      "a {}-byte payload is over MAX_PAYLOAD",
-      self.payload.len()
-    );
-    let mut header = [0; HEADER];
-    header[..4].copy_from_slice(&self.channel.to_le_bytes());
-    header[4] = self.kind;
-    header[5..9].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
-    let crc = crc32(&header[..9]);
-    header[9..].copy_from_slice(&crc.to_le_bytes());
-
-    out.extend_from_slice(&MAGIC);
-    escape(&header, out);
-    escape(&self.payload, out);
-    escape(&crc32(&self.payload).to_le_bytes(), out);
+    encode_frame(self.channel, self.kind, &self.payload, out);
   }
 
+  /// The frame's bytes, in a buffer with room for every escape.
   pub fn to_bytes(&self) -> Vec<u8> {
-    let mut out = Vec::with_capacity(MAGIC.len() + HEADER + self.payload.len() + TRAILER);
+    let mut out = Vec::with_capacity(encoded_len(&self.payload));
 
     self.encode(&mut out);
     out
   }
+}
+
+/// The most bytes a frame with `payload` can take on the stream: its
+/// unescaped bytes, an escape for each F5 in the payload, and room for an
+/// escape after each byte of the header and trailer, which can hold F5s too.
+pub(crate) fn encoded_len(payload: &[u8]) -> usize {
+  let escapes = payload.iter().filter(|&&byte| byte == MAGIC[0]).count();
+
+  MAGIC.len() + 2 * (HEADER + TRAILER) + payload.len() + escapes
+}
+
+/// Appends the bytes of the frame with these parts to `out`.
+///
+/// # Panics
+///
+/// Panics if `payload` is larger than [`MAX_PAYLOAD`].
+pub(crate) fn encode_frame(channel: u32, kind: u8, payload: &[u8], out: &mut Vec<u8>) {
+  assert!(
+    payload.len() <= MAX_PAYLOAD,
+    "a {}-byte payload is over MAX_PAYLOAD",
+    payload.len()
+  );
+  let mut header = [0; HEADER];
+  header[..4].copy_from_slice(&channel.to_le_bytes());
+  header[4] = kind;
+  header[5..9].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+  let crc = crc32(&header[..9]);
+  header[9..].copy_from_slice(&crc.to_le_bytes());
+
+  out.extend_from_slice(&MAGIC);
+  escape(&header, out);
+  escape(payload, out);
+  escape(&crc32(payload).to_le_bytes(), out);
 }
 
 fn escape(bytes: &[u8], out: &mut Vec<u8>) {
@@ -91,8 +110,18 @@ pub struct Skipped(pub usize);
 #[derive(Debug, Default)]
 pub struct Decoder {
   state: State,
-  /// The unescaped bytes of the current frame after its magic, so far.
-  body: Vec<u8>,
+  /// The current frame's header, unescaped.
+  header: [u8; HEADER],
+  /// The current frame's payload, unescaped, so far. It becomes the frame's
+  /// payload without a copy.
+  payload: Vec<u8>,
+  /// The payload's length, once the header has arrived and checked out.
+  length: usize,
+  /// The current frame's payload CRC.
+  trailer: [u8; TRAILER],
+  /// How many of the current frame's unescaped bytes after its magic have
+  /// arrived: the header's, then the payload's, then the trailer's.
+  received: usize,
   /// The current frame's length on the stream, including magic and escapes.
   taken: usize,
   skipped: usize,
@@ -118,9 +147,30 @@ impl Decoder {
     Self::default()
   }
 
-  pub fn push(&mut self, bytes: &[u8]) {
-    for &byte in bytes {
-      self.byte(byte);
+  pub fn push(&mut self, mut bytes: &[u8]) {
+    while let Some(&first) = bytes.first() {
+      // Between frames and inside one, the bytes up to the next F5 are taken
+      // as a run. Each F5 goes through the state machine on its own.
+      let run = match self.state {
+        State::Magic(0) => {
+          let run = until_magic(bytes, bytes.len());
+          self.skipped += run;
+          run
+        }
+        State::Frame { escaping: false } => {
+          let run = until_magic(bytes, self.wanted());
+          self.taken += run;
+          self.take(&bytes[..run]);
+          run
+        }
+        _ => 0,
+      };
+      if run == 0 {
+        self.byte(first);
+        bytes = &bytes[1..];
+      } else {
+        bytes = &bytes[run..];
+      }
     }
     self.report_skipped();
   }
@@ -136,7 +186,9 @@ impl Decoder {
       State::Magic(matched) if byte == MAGIC[matched] => {
         if matched + 1 == MAGIC.len() {
           self.state = State::Frame { escaping: false };
-          self.body.clear();
+          self.received = 0;
+          self.length = 0;
+          self.payload.clear();
           self.taken = MAGIC.len();
         } else {
           self.state = State::Magic(matched + 1);
@@ -153,7 +205,7 @@ impl Decoder {
       State::Frame { escaping: true } if byte == ESCAPED => {
         self.taken += 1;
         self.state = State::Frame { escaping: false };
-        self.take(MAGIC[0]);
+        self.take(&[MAGIC[0]]);
       }
       State::Frame { escaping: true } => {
         // The previous F5 started a magic, which cuts this frame short.
@@ -166,38 +218,62 @@ impl Decoder {
         if byte == MAGIC[0] {
           self.state = State::Frame { escaping: true };
         } else {
-          self.take(byte);
+          self.take(&[byte]);
         }
       }
     }
   }
 
-  /// Adds an unescaped byte to the frame. The frame ends early if its header
-  /// is invalid, and otherwise at its last byte.
-  fn take(&mut self, byte: u8) {
-    self.body.push(byte);
-    if self.body.len() < HEADER {
-      return;
-    }
-    let length = u32_at(&self.body, 5) as usize;
+  /// How many more unescaped bytes the part of the frame being read needs:
+  /// the header, the payload, or the trailer. Always at least one.
+  fn wanted(&self) -> usize {
+    let (header, payload) = (HEADER, HEADER + self.length);
 
-    if self.body.len() == HEADER {
-      if crc32(&self.body[..9]) != u32_at(&self.body, 9) || length > MAX_PAYLOAD {
-        self.drop_frame();
-      }
-    } else if self.body.len() == HEADER + length + TRAILER {
-      self.finish(length);
+    if self.received < header {
+      header - self.received
+    } else if self.received < payload {
+      payload - self.received
+    } else {
+      payload + TRAILER - self.received
     }
   }
 
-  fn finish(&mut self, length: usize) {
-    let payload = &self.body[HEADER..HEADER + length];
+  /// Adds unescaped bytes to the frame, no more than `wanted`. The frame ends
+  /// early if its header is invalid, and otherwise at its last byte.
+  fn take(&mut self, bytes: &[u8]) {
+    let start = self.received;
+    self.received += bytes.len();
 
-    if crc32(payload) == u32_at(&self.body, HEADER + length) {
+    if start < HEADER {
+      self.header[start..self.received].copy_from_slice(bytes);
+      if self.received < HEADER {
+        return;
+      }
+      let length = u32_at(&self.header, 5) as usize;
+      if crc32(&self.header[..9]) != u32_at(&self.header, 9) || length > MAX_PAYLOAD {
+        self.drop_frame();
+        return;
+      }
+      self.length = length;
+      self.payload.reserve(length);
+    } else if start < HEADER + self.length {
+      self.payload.extend_from_slice(bytes);
+    } else {
+      let at = start - HEADER - self.length;
+      self.trailer[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    if self.received == HEADER + self.length + TRAILER {
+      self.finish();
+    }
+  }
+
+  fn finish(&mut self) {
+    if crc32(&self.payload) == u32::from_le_bytes(self.trailer) {
       let frame = Frame {
-        channel: u32_at(&self.body, 0),
-        kind: self.body[4],
-        payload: payload.to_vec(),
+        channel: u32_at(&self.header, 0),
+        kind: self.header[4],
+        payload: mem::take(&mut self.payload),
       };
       self.state = State::Magic(0);
       self.report_skipped();
@@ -219,6 +295,16 @@ impl Decoder {
         .push_back(Err(Skipped(mem::take(&mut self.skipped))));
     }
   }
+}
+
+/// How many of the first `limit` bytes come before the next F5.
+fn until_magic(bytes: &[u8], limit: usize) -> usize {
+  let limit = limit.min(bytes.len());
+
+  bytes[..limit]
+    .iter()
+    .position(|&byte| byte == MAGIC[0])
+    .unwrap_or(limit)
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
@@ -288,6 +374,34 @@ mod tests {
     }
 
     assert_eq!(decoded, frames.map(Ok::<_, Skipped>));
+  }
+
+  #[test]
+  fn decodes_frames_pushed_in_pieces_of_every_size() {
+    let payload: Vec<u8> = (0..1000u32).map(|index| (index * 37 % 256) as u8).collect();
+    let frames = [frame(0xF5F5_F5F5, &payload), frame(2, b""), frame(4, &[0xF5, 0, 0xF5])];
+    let bytes: Vec<u8> = frames.iter().flat_map(Frame::to_bytes).collect();
+
+    for size in 1..=40 {
+      let mut decoder = Decoder::new();
+      let mut decoded = Vec::new();
+      for piece in bytes.chunks(size) {
+        decoder.push(piece);
+        decoded.extend(decode_all(&mut decoder));
+      }
+
+      assert_eq!(decoded, frames.clone().map(Ok::<_, Skipped>), "pieces of {size}");
+    }
+  }
+
+  #[test]
+  fn makes_room_for_every_escape() {
+    let frames = [frame(0xF5F5_F5F5, &[0xF5; 100]), frame(1, b"plain")];
+
+    for frame in frames {
+      let bytes = frame.to_bytes();
+      assert!(bytes.len() <= encoded_len(&frame.payload));
+    }
   }
 
   #[test]

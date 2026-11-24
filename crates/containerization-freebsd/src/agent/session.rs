@@ -8,6 +8,7 @@ use containerization_freebsd_protocol::{CONTROL, Frame, Message, Mux, Side, Vers
 use std::collections::HashMap;
 use std::io::{PipeReader, PipeWriter};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +17,9 @@ pub(super) struct Shared {
   state: Mutex<State>,
   /// Notified when a session starts or fails, or the console closes.
   pub(super) changed: Condvar,
+  /// Whether the mux is in a session, as of the handler thread's last event.
+  /// The console reader reads it without locking the state.
+  in_session: AtomicBool,
 }
 
 pub(super) struct State {
@@ -55,6 +59,7 @@ enum Heard {
 /// What the console reader passes to the handler thread.
 pub(super) enum Event {
   /// Raw bytes as read, so that console text before a session can be shown.
+  /// The reader stops passing them once a session starts.
   Read(Vec<u8>),
   Frame(Frame),
   Skipped,
@@ -100,10 +105,11 @@ impl Shared {
         sessions: 0,
       }),
       changed: Condvar::new(),
+      in_session: AtomicBool::new(false),
     });
     let (events, inbound) = mpsc::channel();
-    let reader = credit.clone();
-    std::thread::spawn(move || console::read(output, &reader, &events));
+    let (reader, session) = (credit.clone(), shared.clone());
+    std::thread::spawn(move || console::read(output, &reader, &session.in_session, &events));
     std::thread::spawn(move || console::write(&queue, input, &credit));
     let handler = shared.clone();
     std::thread::spawn(move || handle(&inbound, &handler));
@@ -119,10 +125,14 @@ impl Shared {
 impl State {
   /// Queues `frame` for the console, after every frame queued before it.
   pub(super) fn queue(&self, frame: Frame) -> Written {
+    self.queue_encoded(frame.to_bytes())
+  }
+
+  fn queue_encoded(&self, bytes: Vec<u8>) -> Written {
     let (done, written) = mpsc::sync_channel(1);
 
     // If the writer thread has stopped, `wait` reports it.
-    let _ = self.outgoing.send(Outgoing { frame, done });
+    let _ = self.outgoing.send(Outgoing { bytes, done });
     Written(Some(written))
   }
 
@@ -134,6 +144,17 @@ impl State {
       .send(channel, message)
       .map_err(Error::protocol(what))?;
     Ok(self.queue(frame))
+  }
+
+  /// Frames `bytes` as Data for `channel` and queues it, encoding the frame
+  /// straight from the slice. Errors name what the bytes were for as `what`.
+  pub(super) fn send_data(&mut self, channel: u32, bytes: &[u8], what: &str) -> Result<Written> {
+    let mut encoded = Vec::new();
+    self
+      .mux
+      .send_data(channel, bytes, &mut encoded)
+      .map_err(Error::protocol(what))?;
+    Ok(self.queue_encoded(encoded))
   }
 
   /// Starts a new session, ending any current session and everything it ran.
@@ -254,6 +275,9 @@ fn handle(inbound: &Receiver<Event>, shared: &Arc<Shared>) {
       }
       Event::Skipped => Heard::Nothing,
     };
+    shared
+      .in_session
+      .store(state.mux.in_session(), Ordering::Relaxed);
     match heard {
       Heard::Nothing => {}
       Heard::Changed => shared.changed.notify_all(),

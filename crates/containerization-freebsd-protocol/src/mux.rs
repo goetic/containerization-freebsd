@@ -6,8 +6,8 @@
 //! each connection to a socket it listens on without asking the host first.
 
 use crate::codec::DecodeError;
-use crate::frame::{Frame, MAX_PAYLOAD};
-use crate::message::Message;
+use crate::frame::{Frame, MAX_PAYLOAD, encode_frame, encoded_len};
+use crate::message::{Message, kind};
 use std::collections::HashMap;
 use std::{fmt, mem};
 
@@ -290,6 +290,27 @@ impl Mux {
     let frame = sized(message.frame(channel))?;
     self.commit(channel, next);
     Ok(frame)
+  }
+
+  /// Like `send` with Data holding `bytes`, but encodes the frame into `out`
+  /// without first copying `bytes` into a Message.
+  pub fn send_data(&mut self, channel: u32, bytes: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    // The rules for Data don't depend on what it holds, so an empty one,
+    // which allocates nothing, stands in for `bytes`.
+    let data = Message::Data(Vec::new());
+    if channel == CONTROL {
+      return Err(not_allowed(channel, &data));
+    }
+    self.require_session()?;
+    let next = self.check(channel, self.side, &data)?;
+    if bytes.len() > MAX_PAYLOAD {
+      return Err(Error::TooLarge(bytes.len()));
+    }
+
+    out.reserve(encoded_len(bytes));
+    encode_frame(channel, kind::DATA, bytes, out);
+    self.commit(channel, next);
+    Ok(())
   }
 
   /// Decodes a frame from the other side into its channel and message, and

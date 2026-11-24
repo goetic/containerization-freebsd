@@ -296,7 +296,7 @@ impl fmt::Display for Exit {
   }
 }
 
-mod kind {
+pub(crate) mod kind {
   pub const HELLO: u8 = 0x01;
   pub const PING: u8 = 0x02;
   pub const PONG: u8 = 0x03;
@@ -375,17 +375,28 @@ impl Message {
     let Frame { kind, payload, .. } = frame;
 
     match kind {
-      kind::DATA => return Ok(Self::Data(payload)),
-      kind::STDERR => return Ok(Self::Stderr(payload)),
-      kind::ERROR => {
-        return String::from_utf8(payload)
-          .map(Self::Error)
-          .map_err(|_| DecodeError::NotUtf8);
-      }
-      _ => {}
+      kind::DATA => Ok(Self::Data(payload)),
+      kind::STDERR => Ok(Self::Stderr(payload)),
+      kind::ERROR => String::from_utf8(payload)
+        .map(Self::Error)
+        .map_err(|_| DecodeError::NotUtf8),
+      kind => Self::decode(kind, &payload),
     }
+  }
 
-    let mut reader = Reader::new(&payload);
+  /// Decodes `frame` without taking its payload, which only Data, Stderr,
+  /// and Error copy.
+  pub fn peek(frame: &Frame) -> Result<Self, DecodeError> {
+    match frame.kind {
+      kind::DATA | kind::STDERR | kind::ERROR => Self::from_frame(frame.clone()),
+      kind => Self::decode(kind, &frame.payload),
+    }
+  }
+
+  /// Decodes the fields of a message of `kind` that is not Data, Stderr, or
+  /// Error.
+  fn decode(kind: u8, payload: &[u8]) -> Result<Self, DecodeError> {
+    let mut reader = Reader::new(payload);
     let message = match kind {
       kind::HELLO => Self::Hello {
         version: reader.get()?,
@@ -696,6 +707,22 @@ mod tests {
         .payload,
       [0, 3]
     );
+  }
+
+  #[test]
+  fn peeks_at_a_frame_as_it_decodes_one() {
+    for message in [
+      Message::Received(4096),
+      Message::Hello {
+        version: 4,
+        answer: false,
+      },
+      Message::Data(b"stdout".to_vec()),
+      Message::Error("refused".into()),
+    ] {
+      let frame = message.clone().frame(3);
+      assert_eq!(Message::peek(&frame), Ok(message));
+    }
   }
 
   #[test]

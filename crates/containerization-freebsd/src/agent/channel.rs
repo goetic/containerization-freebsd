@@ -430,10 +430,15 @@ impl Stream {
     Ok(true)
   }
 
+  /// Sends `bytes` as Data in chunks, each framed straight from the slice.
   fn write(&self, bytes: &[u8]) -> Result<()> {
-    bytes
-      .chunks(CHUNK)
-      .try_for_each(|chunk| self.send(Message::Data(chunk.to_vec())))
+    bytes.chunks(CHUNK).try_for_each(|chunk| {
+      let written = self
+        .shared
+        .lock()
+        .send_data(self.channel, chunk, &self.what)?;
+      written.wait()
+    })
   }
 
   /// Returns the next message, waiting as long as it takes. An Error message
