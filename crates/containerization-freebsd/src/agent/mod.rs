@@ -23,7 +23,8 @@ pub use containerization_freebsd_protocol::{Exec, Exit, FileType, Limit, Resourc
 use crate::error::{Error, Result};
 use channel::Stream;
 use containerization_freebsd_protocol::{
-  Address, Call, Connect, Disk, FileCopy, GuestPath, Listen, Message, Mount, Return,
+  Address, Call, Connect, Disk, FileCopy, GuestPath, JailWait, Listen, Message, Mount, Return, Rules, Statistics,
+  StatisticsOf,
 };
 use session::{Route, Shared};
 use std::io::{PipeReader, PipeWriter};
@@ -122,6 +123,11 @@ impl Spawn for Agent {
 
     self.open(Message::Exec(exec), what, None).map(Process::new)
   }
+}
+
+/// What a Call that returns Done returns.
+fn done(value: Return) -> Option<()> {
+  matches!(value, Return::Done).then_some(())
 }
 
 /// `exec`'s argv, and its jail if it has one, for error messages.
@@ -299,18 +305,72 @@ impl Agent {
     })
   }
 
+  /// Replaces the jail's rctl rules with `rules`, each
+  /// `resource:action=amount`.
+  pub(crate) fn set_rules(&self, jail: &str, rules: Vec<String>) -> Result<()> {
+    self.call_for_nothing(Call::SetRules(Rules {
+      jail: jail.to_string(),
+      rules,
+    }))
+  }
+
+  /// The jail's resource usage, with the I/O of `dataset` if one is given.
+  pub(crate) fn statistics(&self, jail: &str, dataset: Option<&str>) -> Result<Statistics> {
+    let of = StatisticsOf {
+      jail: jail.to_string(),
+      dataset: dataset.map(str::to_string),
+    };
+
+    self.call(Call::Statistics(of), |value| match value {
+      Return::Statistics(statistics) => Some(statistics),
+      _ => None,
+    })
+  }
+
+  /// Sends SIGTERM to the jail's processes, and waits up to `grace` for them
+  /// to exit.
+  pub(crate) fn terminate(&self, jail: &str, grace: Duration) -> Result<()> {
+    self.call_waiting(Call::Terminate, jail, grace)
+  }
+
+  /// Drops the jail's TCP connections.
+  pub(crate) fn drop_connections(&self, jail: &str) -> Result<()> {
+    self.call_for_nothing(Call::DropConnections(jail.to_string()))
+  }
+
+  /// Waits up to `within` for the removed jail to finish dying.
+  pub(crate) fn await_removal(&self, jail: &str, within: Duration) -> Result<()> {
+    self.call_waiting(Call::AwaitRemoval, jail, within)
+  }
+
+  /// Makes the Call that `call` builds from a JailWait for `jail` and `wait`,
+  /// and gives the agent `wait` longer than usual to answer.
+  fn call_waiting(&self, call: fn(JailWait) -> Call, jail: &str, wait: Duration) -> Result<()> {
+    let call = call(JailWait {
+      jail: jail.to_string(),
+      seconds: u32::try_from(wait.as_secs()).unwrap_or(u32::MAX),
+    });
+
+    self.call_within(call, wait + AGENT_TIMEOUT, done)
+  }
+
   /// Makes `call`, which returns Done.
   fn call_for_nothing(&self, call: Call) -> Result<()> {
-    self.call(call, |value| matches!(value, Return::Done).then_some(()))
+    self.call(call, done)
   }
 
   /// Makes `call`, and returns what `take` finds in the agent's answer:
   /// `None` if the answer isn't the variant the call returns.
   fn call<T>(&self, call: Call, take: impl FnOnce(Return) -> Option<T>) -> Result<T> {
+    self.call_within(call, AGENT_TIMEOUT, take)
+  }
+
+  /// Like `call`, giving the agent `timeout` to answer.
+  fn call_within<T>(&self, call: Call, timeout: Duration, take: impl FnOnce(Return) -> Option<T>) -> Result<T> {
     let what = call.to_string();
     let stream = self.open_unanswered(Message::Call(call), what, None)?;
 
-    match stream.answer()? {
+    match stream.answer(timeout)? {
       Message::Return(value) => take(value).ok_or_else(|| stream.misreturned()),
       other => Err(stream.unexpected(&other)),
     }

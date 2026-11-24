@@ -4,12 +4,12 @@
 //! container, these share one machine; for a VM each, create a machine per
 //! container.
 
+use crate::Statistics;
 use crate::agent::{Agent, Exec, Process, QUICK, Relay, Spawn};
 use crate::copy::Parents;
 use crate::error::{Error, Result};
 use crate::jail::{self, Jail, Mount, Network};
 use crate::socket::{SocketRelay, UnixSocket};
-use crate::statistics::Statistics;
 use crate::zfs::Zfs;
 use std::mem;
 use std::path::Path;

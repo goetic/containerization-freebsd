@@ -239,6 +239,22 @@ pub enum Call {
   /// the pool of FreeBSD's VM image, gets `/<dataset>`, which its children
   /// inherit. Returns Path, the directory it is mounted at.
   MountDataset(String),
+  /// Replaces the jail's rctl(8) rules. Returns Done.
+  SetRules(Rules),
+  /// Measures the jail's resource usage. Returns Statistics.
+  Statistics(StatisticsOf),
+  /// Sends SIGTERM to every process in the jail, as `jail -r` would, and
+  /// waits up to the seconds for them to exit. Returns Done, even if some
+  /// are left.
+  Terminate(JailWait),
+  /// Drops the jail's TCP connections, which would otherwise keep it dying
+  /// through TIME_WAIT once it is removed. A VNET jail's are dropped by its
+  /// own tcpdrop(8), if it has one. Returns Done.
+  DropConnections(String),
+  /// Waits up to the seconds for the removed jail to finish dying. A dying
+  /// jail holds its root and network until everything it left closes.
+  /// Returns Done, or Error if it is still dying.
+  AwaitRemoval(JailWait),
 }
 
 /// Names what the call does, for errors: `finding the type of "/etc"`.
@@ -256,6 +272,11 @@ impl fmt::Display for Call {
       Self::CopyFile(copy) => write!(formatter, "copying {} to {}", copy.from, copy.to),
       Self::RemoveCopy(copy) => write!(formatter, "removing {} if it is a copy of {}", copy.to, copy.from),
       Self::MountDataset(dataset) => write!(formatter, "mounting dataset {dataset:?}"),
+      Self::SetRules(rules) => write!(formatter, "setting jail {:?}'s rctl rules", rules.jail),
+      Self::Statistics(of) => write!(formatter, "measuring jail {:?}", of.jail),
+      Self::Terminate(wait) => write!(formatter, "terminating jail {:?}'s processes", wait.jail),
+      Self::DropConnections(jail) => write!(formatter, "dropping jail {jail:?}'s TCP connections"),
+      Self::AwaitRemoval(wait) => write!(formatter, "waiting for jail {:?} to finish dying", wait.jail),
     }
   }
 }
@@ -268,6 +289,84 @@ pub enum Return {
   Done,
   Disks(Vec<Disk>),
   Path(String),
+  Statistics(Statistics),
+}
+
+/// A jail's rctl(8) rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rules {
+  pub jail: String,
+  /// Each is `resource:action=amount`, as rctl(8) writes a rule after its
+  /// subject, such as `pcpu:deny=200`.
+  pub rules: Vec<String>,
+}
+
+/// The jail to measure, and the ZFS dataset whose I/O to count with it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatisticsOf {
+  pub jail: String,
+  /// A dataset that ZFS has mounted, such as a container's root.
+  pub dataset: Option<String>,
+}
+
+/// A jail, and how long to wait for it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JailWait {
+  pub jail: String,
+  pub seconds: u32,
+}
+
+/// A jail's resource usage, like Containerization's `ContainerStatistics`:
+/// racct counters from rctl(8), which needs the `kern.racct.enable` tunable;
+/// a VNET jail's interface counters; and a dataset's I/O from its ZFS
+/// kstats.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Statistics {
+  pub cpu_seconds: u64,
+  /// Recent CPU usage, in percent of one core.
+  pub cpu_percent: u64,
+  /// Resident memory, in bytes.
+  pub memory: u64,
+  pub processes: u64,
+  pub threads: u64,
+  pub open_files: u64,
+  /// Recent file system reads and writes per second.
+  pub read_bytes_per_second: u64,
+  pub write_bytes_per_second: u64,
+  pub read_operations_per_second: u64,
+  pub write_operations_per_second: u64,
+  /// The interfaces, loopback included, of a VNET jail. Empty for a jail on
+  /// the guest's stack, whose counters belong to the guest.
+  pub networks: Vec<NetworkStatistics>,
+  /// A container's dataset I/O, in place of Containerization's block
+  /// devices, since FreeBSD doesn't count block I/O per jail. Empty for a
+  /// plain jail.
+  pub block_io: Vec<DatasetIo>,
+}
+
+/// Counters since the interface was created.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkStatistics {
+  pub interface: String,
+  pub received_packets: u64,
+  pub transmitted_packets: u64,
+  pub received_bytes: u64,
+  pub transmitted_bytes: u64,
+  pub received_errors: u64,
+  pub transmitted_errors: u64,
+  pub received_dropped: u64,
+  pub transmitted_dropped: u64,
+}
+
+/// A dataset's objset kstats since it was mounted, which count reads served
+/// from the ARC.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DatasetIo {
+  pub dataset: String,
+  pub read_bytes: u64,
+  pub write_bytes: u64,
+  pub read_operations: u64,
+  pub write_operations: u64,
 }
 
 /// A file system to mount, and where.
@@ -521,6 +620,41 @@ record!(Mount {
 });
 record!(FileCopy { from, to });
 record!(Disk { device, ident });
+record!(Rules { jail, rules });
+record!(StatisticsOf { jail, dataset });
+record!(JailWait { jail, seconds });
+record!(Statistics {
+  cpu_seconds,
+  cpu_percent,
+  memory,
+  processes,
+  threads,
+  open_files,
+  read_bytes_per_second,
+  write_bytes_per_second,
+  read_operations_per_second,
+  write_operations_per_second,
+  networks,
+  block_io,
+});
+record!(NetworkStatistics {
+  interface,
+  received_packets,
+  transmitted_packets,
+  received_bytes,
+  transmitted_bytes,
+  received_errors,
+  transmitted_errors,
+  received_dropped,
+  transmitted_dropped,
+});
+record!(DatasetIo {
+  dataset,
+  read_bytes,
+  write_bytes,
+  read_operations,
+  write_operations,
+});
 record!(WindowSize { rows, columns });
 tagged!(Address {
   0 => Port(port),
@@ -538,12 +672,18 @@ tagged!(Call {
   4 => CopyFile(copy),
   5 => RemoveCopy(copy),
   6 => MountDataset(dataset),
+  7 => SetRules(rules),
+  8 => Statistics(of),
+  9 => Terminate(wait),
+  10 => DropConnections(jail),
+  11 => AwaitRemoval(wait),
 });
 tagged!(Return {
   0 => FileType(found),
   1 => Done,
   2 => Disks(disks),
   3 => Path(path),
+  4 => Statistics(statistics),
 });
 
 /// A file type is a u8 tag.
@@ -735,6 +875,20 @@ mod tests {
       })),
       Message::Call(Call::RemoveCopy(FileCopy::default())),
       Message::Call(Call::MountDataset("zroot/cfbsd".into())),
+      Message::Call(Call::SetRules(Rules {
+        jail: "web".into(),
+        rules: vec!["pcpu:deny=200".into(), "memoryuse:deny=268435456".into()],
+      })),
+      Message::Call(Call::Statistics(StatisticsOf {
+        jail: "web".into(),
+        dataset: Some("zroot/cfbsd/containers/web".into()),
+      })),
+      Message::Call(Call::Terminate(JailWait {
+        jail: "web".into(),
+        seconds: 10,
+      })),
+      Message::Call(Call::DropConnections("web".into())),
+      Message::Call(Call::AwaitRemoval(JailWait::default())),
       Message::Return(Return::FileType(FileType::Missing)),
       Message::Return(Return::FileType(FileType::Directory)),
       Message::Return(Return::FileType(FileType::File)),
@@ -751,6 +905,22 @@ mod tests {
         },
       ])),
       Message::Return(Return::Path("/cfbsd".into())),
+      Message::Return(Return::Statistics(Statistics {
+        cpu_seconds: 12,
+        memory: 7_835_648,
+        networks: vec![NetworkStatistics {
+          interface: "epair0b".into(),
+          received_bytes: 14_210,
+          transmitted_dropped: 4,
+          ..NetworkStatistics::default()
+        }],
+        block_io: vec![DatasetIo {
+          dataset: "zroot/cfbsd/containers/web".into(),
+          read_bytes: 4096,
+          ..DatasetIo::default()
+        }],
+        ..Statistics::default()
+      })),
       Message::Opened,
       Message::Data(b"stdin".to_vec()),
       Message::Stderr(vec![0xFF]),

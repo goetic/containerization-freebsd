@@ -1,11 +1,12 @@
-//! Looking up jails by name, attaching to them, and finding the type of file
-//! at a path in one.
+//! Looking up jails by name, attaching to them, finding the type of file at a
+//! path in one, and ending a jail's processes.
 
-use crate::process::reap;
+use crate::process::{reap_code, reap_errno};
 use crate::{c_string, check, errno};
 use std::io;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The id of a running jail, which only `find_jail` returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,14 +66,7 @@ pub fn file_type_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<Option<F
     unsafe { libc::_exit(status) }
   }
 
-  let status = reap(pid)?;
-  if !libc::WIFEXITED(status) {
-    return Err(io::Error::other(format!(
-      "the child died of signal {}",
-      libc::WTERMSIG(status)
-    )));
-  }
-  match libc::WEXITSTATUS(status) {
+  match reap_code(pid)? {
     MISSING => Ok(None),
     DIRECTORY => Ok(Some(FileType::Directory)),
     FILE => Ok(Some(FileType::File)),
@@ -131,6 +125,131 @@ pub fn jail_id(name: Option<&str>) -> io::Result<Option<JailId>> {
   name
     .map(|name| find_jail(name).map(|(jail, _)| jail))
     .transpose()
+}
+
+/// Whether a jail named `name` exists, even a removed one that is still
+/// dying.
+#[cfg(target_os = "freebsd")]
+pub fn jail_remains(name: &str) -> io::Result<bool> {
+  // jail_get writes the name back, so it gets a buffer of its own.
+  let mut wanted = c_string(name)?.into_bytes_with_nul();
+  let mut parameters = [
+    crate::iovec(c"name".to_bytes_with_nul()),
+    libc::iovec {
+      iov_base: wanted.as_mut_ptr().cast(),
+      iov_len: wanted.len(),
+    },
+  ];
+
+  // SAFETY: jail_get reads the parameter name and writes no more than the
+  // wanted name's buffer holds.
+  match unsafe {
+    libc::jail_get(
+      parameters.as_mut_ptr(),
+      parameters.len() as libc::c_uint,
+      libc::JAIL_DYING,
+    )
+  } {
+    -1 if errno() == libc::ENOENT => Ok(false),
+    -1 => Err(io::Error::last_os_error()),
+    _ => Ok(true),
+  }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn jail_remains(name: &str) -> io::Result<bool> {
+  crate::unsupported(format_args!("looking up jail {name:?}"))
+}
+
+/// Whether `jail` has a network stack of its own: whether it is a VNET jail.
+#[cfg(target_os = "freebsd")]
+pub fn has_vnet(jail: JailId) -> io::Result<bool> {
+  /// The `vnet` parameter's value for a jail with its own stack, from
+  /// <sys/jail.h>.
+  const JAIL_SYS_NEW: libc::c_int = 1;
+  let mut jid = jail.0;
+  let mut vnet: libc::c_int = 0;
+  let int = |value: &mut libc::c_int| libc::iovec {
+    iov_base: (value as *mut libc::c_int).cast(),
+    iov_len: size_of::<libc::c_int>(),
+  };
+  let mut parameters = [
+    crate::iovec(c"jid".to_bytes_with_nul()),
+    int(&mut jid),
+    crate::iovec(c"vnet".to_bytes_with_nul()),
+    int(&mut vnet),
+  ];
+
+  // SAFETY: jail_get reads the parameter names and writes no more than the
+  // two ints hold.
+  check(unsafe { libc::jail_get(parameters.as_mut_ptr(), parameters.len() as libc::c_uint, 0) })?;
+  Ok(vnet == JAIL_SYS_NEW)
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn has_vnet(_: JailId) -> io::Result<bool> {
+  crate::unsupported("finding a jail's network stack")
+}
+
+/// A child process attached to a jail that is ending the jail's processes,
+/// which `terminate_in` returns. Wait for it from any thread.
+#[must_use]
+pub struct Terminating(libc::pid_t);
+
+impl Terminating {
+  /// Waits for the child to finish.
+  pub fn wait(self) -> io::Result<()> {
+    reap_errno(self.0)
+  }
+}
+
+/// Sends SIGTERM to every process in `jail` from a child process attached to
+/// it, which then waits up to `grace` for them to exit. The child first
+/// closes every descriptor it inherited, so that it holds no pipe or terminal
+/// open while it waits.
+#[cfg(target_os = "freebsd")]
+pub fn terminate_in(jail: JailId, grace: Duration) -> io::Result<Terminating> {
+  unsafe extern "C" {
+    fn closefrom(lowfd: libc::c_int);
+  }
+  const POLL: libc::timespec = libc::timespec {
+    tv_sec: 0,
+    tv_nsec: 100_000_000,
+  };
+  let polls = grace.as_millis() / 100;
+
+  // SAFETY: the child only closes descriptors, attaches, signals, sleeps, and
+  // exits. Those calls are async-signal-safe and allocate nothing, so they
+  // are safe after fork.
+  let pid = check(unsafe { libc::fork() })?;
+  if pid == 0 {
+    // SAFETY: as above. kill(-1) reaches every process in the jail but the
+    // child, and fails once none is left.
+    let status = unsafe {
+      closefrom(0);
+      match attach(jail) {
+        Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
+        Ok(()) => {
+          libc::kill(-1, libc::SIGTERM);
+          let mut left = polls;
+          while left > 0 && libc::kill(-1, 0) == 0 {
+            libc::nanosleep(&POLL, std::ptr::null_mut());
+            left -= 1;
+          }
+          0
+        }
+      }
+    };
+    // SAFETY: _exit ends the child at once, without running the parent's
+    // exit handlers or destructors.
+    unsafe { libc::_exit(status) }
+  }
+  Ok(Terminating(pid))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn terminate_in(_: JailId, _: Duration) -> io::Result<Terminating> {
+  crate::unsupported("terminating a jail's processes")
 }
 
 #[cfg(target_os = "freebsd")]

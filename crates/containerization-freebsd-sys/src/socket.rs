@@ -2,7 +2,7 @@
 //! loopback are the jail's, and passed back over SCM_RIGHTS.
 
 use crate::jail::{JailId, attach};
-use crate::process::reap;
+use crate::process::reap_errno;
 use crate::{c_string, check, close_on_exec, errno, retry};
 use std::ffi::CStr;
 use std::io;
@@ -251,17 +251,8 @@ pub(crate) unsafe fn in_jail(
 
   let received = receive_fd(&ours);
   drop(ours);
-  let status = reap(pid)?;
-  if !libc::WIFEXITED(status) {
-    return Err(io::Error::other(format!(
-      "the child died of signal {}",
-      libc::WTERMSIG(status)
-    )));
-  }
-  match libc::WEXITSTATUS(status) {
-    0 => received,
-    errno => Err(io::Error::from_raw_os_error(errno)),
-  }
+  reap_errno(pid)?;
+  received
 }
 
 /// The size of a control message carrying one descriptor.

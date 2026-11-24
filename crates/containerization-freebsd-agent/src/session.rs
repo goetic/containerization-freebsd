@@ -9,9 +9,10 @@ use crate::process::{self, Process};
 use crate::relay::{self, Connection};
 use crate::{call, sys};
 use containerization_freebsd_protocol::{
-  CONTROL, Call, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Side, Skipped,
+  CONTROL, Call, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Return, Side, Skipped,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -101,6 +102,9 @@ pub(crate) enum Handle {
     connection: Arc<Connection>,
   },
   Listener(Listening),
+  /// A Call that a thread is answering. The thread finishes on its own, and
+  /// what it sends once the channel has closed is dropped.
+  Call,
 }
 
 impl Handle {
@@ -113,7 +117,7 @@ impl Handle {
       Self::Relay { connection, .. } => {
         let _ = connection.shutdown(Shutdown::Both);
       }
-      Self::Listener(_) => {}
+      Self::Listener(_) | Self::Call => {}
     }
   }
 }
@@ -163,6 +167,15 @@ pub fn serve(input: impl Read + Send + 'static, output: impl Write) -> io::Resul
   let result = agent.run(&queue, &from_console);
   agent.end_channels();
   result
+}
+
+/// The answer to the Call that `what` names: Return, or an Error that says
+/// what failed.
+fn answered(what: &dyn fmt::Display, result: io::Result<Return>) -> Message {
+  match result {
+    Ok(value) => Message::Return(value),
+    Err(error) => Message::Error(format!("{what}: {error}")),
+  }
 }
 
 /// Passes what the console reads to the session loop, and wakes the loop
@@ -353,13 +366,24 @@ impl<W: Write> Agent<W> {
 
   /// Answers the Call channel `channel` with what the call returns, or with
   /// an Error. Either answer closes the channel. A call in a jail forks, and
-  /// MountDataset may spawn zfs(8), which only the session loop may do.
+  /// some spawn a process, which only the session loop may do. A call that
+  /// then only waits is answered from a thread.
   fn call(&mut self, channel: u32, call: &Call) {
-    let answer = match call::answer(call) {
-      Ok(value) => Message::Return(value),
-      Err(error) => Message::Error(format!("{call}: {error}")),
-    };
-    self.send(channel, answer);
+    match call::answer(call) {
+      call::Answer::Now(result) => self.send(channel, answered(call, result)),
+      call::Answer::Later(work) => {
+        let outbox = self.outbox(channel);
+        self.channels.insert(
+          channel,
+          Open {
+            id: outbox.id,
+            handle: Handle::Call,
+          },
+        );
+        let what = call.to_string();
+        std::thread::spawn(move || outbox.send(answered(&what, work())));
+      }
+    }
   }
 
   /// Calls `start` to start the process, relay, or listener that opening

@@ -1,17 +1,25 @@
 //! The Calls the host makes: things the agent does in the guest or a jail
 //! and reports back on.
 
-use crate::{mount, sys};
+use crate::{jail, mount, sys};
 use containerization_freebsd_protocol::{Call, Disk, FileCopy, FileType, GuestPath, Return};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-/// Does what `call` asks, and returns what to report.
-pub(crate) fn answer(call: &Call) -> io::Result<Return> {
+/// What to report for a Call: known now, or once a thread has finished work
+/// that only waits, which the session loop shouldn't wait for.
+pub(crate) enum Answer {
+  Now(io::Result<Return>),
+  Later(Box<dyn FnOnce() -> io::Result<Return> + Send>),
+}
+
+/// Does what `call` asks, and returns what to report. Forks and spawns
+/// happen here, on the session loop, and never in the work for `Later`.
+pub(crate) fn answer(call: &Call) -> Answer {
   let done = |()| Return::Done;
 
-  match call {
+  Answer::Now(match call {
     Call::FileType(path) => file_type(path).map(Return::FileType),
     Call::Mount(mounting) => mount::mount(mounting).map(done),
     Call::Unmount(path) => mount::unmount_under(path).map(done),
@@ -19,7 +27,18 @@ pub(crate) fn answer(call: &Call) -> io::Result<Return> {
     Call::CopyFile(copy) => copy_file(copy).map(done),
     Call::RemoveCopy(copy) => remove_copy(copy).map(done),
     Call::MountDataset(dataset) => mount::mount_dataset(dataset).map(Return::Path),
-  }
+    Call::SetRules(rules) => jail::set_rules(rules).map(done),
+    Call::Statistics(of) => jail::statistics(of).map(Return::Statistics),
+    Call::Terminate(wait) => match jail::terminate(wait) {
+      Ok(terminating) => return Answer::Later(Box::new(move || terminating().map(done))),
+      Err(error) => Err(error),
+    },
+    Call::DropConnections(name) => jail::drop_connections(name).map(done),
+    Call::AwaitRemoval(wait) => {
+      let wait = wait.clone();
+      return Answer::Later(Box::new(move || jail::await_removal(&wait).map(done)));
+    }
+  })
 }
 
 /// The type of file at `path`, looked up from inside its jail if it names

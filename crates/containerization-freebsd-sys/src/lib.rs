@@ -1,8 +1,8 @@
 //! Safe wrappers for the system calls the guest agent needs and std does not
 //! provide: pseudo-terminals, raw mode, signals, waiting for an exit without
 //! reaping it, the clock, jails, pre-exec process setup, sockets and files
-//! opened from inside a jail, mounts, and disks. This crate holds all of the
-//! agent's unsafe code.
+//! opened from inside a jail, mounts, disks, sysctl(3), rctl(2), and a jail's
+//! interface counters. This crate holds all of the agent's unsafe code.
 //!
 //! Descriptors from openpty(3) and SCM_RIGHTS get FD_CLOEXEC only after the
 //! call returns, so they are briefly inheritable. Spawn processes from one
@@ -13,20 +13,26 @@ mod clock;
 mod disk;
 mod exec;
 mod file;
+mod interface;
 mod jail;
 mod mount;
 mod process;
+mod rctl;
 mod socket;
+mod sysctl;
 mod terminal;
 
 pub use clock::set_time;
 pub use disk::{disk_ident, disks};
 pub use exec::{Entering, Entry, Ids, Limit, Step, enter_on_exec, rescue_on_exec};
 pub use file::{create_in, open_in, remove_in};
-pub use jail::{FileType, JailId, file_type_in, find_jail, jail_id};
+pub use interface::{Interface, interfaces_in};
+pub use jail::{FileType, JailId, Terminating, file_type_in, find_jail, has_vnet, jail_id, jail_remains, terminate_in};
 pub use mount::{Mounted, mount, mounts, unmount};
 pub use process::{kill_group, signal, wait_exited};
+pub use rctl::{add_rule, racct, remove_rules};
 pub use socket::{Ready, SocketAddress, connect_in, listen_in, remove_socket_in, wait_for_connection};
+pub use sysctl::{Mib, sysctl, text};
 pub use terminal::{WindowSize, make_raw, open_terminal, resize, take_terminal_on_exec};
 
 use std::ffi::{CString, OsStr};

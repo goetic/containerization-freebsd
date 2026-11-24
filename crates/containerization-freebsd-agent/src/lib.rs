@@ -7,6 +7,7 @@
 //! pair; the binary passes it `/dev/ttyV0.0`.
 
 mod call;
+mod jail;
 mod listener;
 mod mount;
 mod pipe;

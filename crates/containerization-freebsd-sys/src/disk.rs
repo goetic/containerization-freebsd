@@ -1,45 +1,13 @@
 //! The guest's disks, and their idents.
 
+use crate::sysctl;
 use std::io;
 
 /// The names of the guest's disks, such as `vtbd0`, from `kern.disks`.
-#[cfg(target_os = "freebsd")]
 pub fn disks() -> io::Result<Vec<String>> {
-  use std::ffi::CStr;
-  use std::ptr;
+  let disks = sysctl::text(&sysctl::sysctl("kern.disks")?);
 
-  let name = c"kern.disks";
-  loop {
-    let mut length = 0;
-    // SAFETY: with no buffer, sysctlbyname only reports the value's length.
-    crate::check(unsafe { libc::sysctlbyname(name.as_ptr(), ptr::null_mut(), &mut length, ptr::null(), 0) })?;
-    let mut value = vec![0u8; length];
-    // SAFETY: sysctlbyname writes no more than `length` bytes, which `value`
-    // holds, and sets `length` to how many it wrote.
-    let read = crate::check(unsafe {
-      libc::sysctlbyname(name.as_ptr(), value.as_mut_ptr().cast(), &mut length, ptr::null(), 0)
-    });
-    match read {
-      // A disk arrived between the calls.
-      Err(error) if error.raw_os_error() == Some(libc::ENOMEM) => continue,
-      Err(error) => return Err(error),
-      Ok(_) => {}
-    }
-    value.truncate(length);
-    let value = CStr::from_bytes_until_nul(&value).map_or(&value[..], CStr::to_bytes);
-
-    return Ok(
-      String::from_utf8_lossy(value)
-        .split_whitespace()
-        .map(str::to_string)
-        .collect(),
-    );
-  }
-}
-
-#[cfg(not(target_os = "freebsd"))]
-pub fn disks() -> io::Result<Vec<String>> {
-  crate::unsupported("listing the disks")
+  Ok(disks.split_whitespace().map(str::to_string).collect())
 }
 
 /// The ident of the disk `name`, as diskinfo(8)'s `-s` reports it. For a

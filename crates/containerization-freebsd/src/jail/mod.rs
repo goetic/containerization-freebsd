@@ -9,15 +9,16 @@ pub use network::{Interface, Network};
 use crate::agent::{Agent, Exec, FileType, Process, QUICK, Ran, Relay, Spawn};
 use crate::copy::{self, Parents};
 use crate::error::{Error, Result};
-use crate::scripts;
 use crate::socket::{SocketRelay, UnixSocket};
-use crate::statistics::{self, Statistics};
-use containerization_freebsd_protocol::{Address, Connect, GuestPath};
+use containerization_freebsd_protocol::{Address, Connect, GuestPath, Statistics};
 use std::path::Path;
 use std::time::Duration;
 
-/// How long `scripts::GONE` may wait: longer than TIME_WAIT, which is 2 × MSL
-/// (`net.inet.tcp.msl`, 30 s by default).
+/// How long a stopped jail's processes have to exit after SIGTERM, as
+/// `jail -r` gives them.
+const GRACE: Duration = Duration::from_secs(10);
+/// How long a removed jail may take to finish dying: longer than TIME_WAIT,
+/// which is 2 × MSL (`net.inet.tcp.msl`, 30 s by default).
 const DYING: Duration = Duration::from_secs(90);
 
 pub struct Jail<'a> {
@@ -119,14 +120,9 @@ impl<'a> Jail<'a> {
   /// resident. Over a limit, they're throttled or paged out. `stop` lifts the
   /// rules.
   pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Result<()> {
-    let rules = rules(&self.name, cpus, memory_in_bytes);
-    let mut args = vec![self.name.as_str()];
-    args.extend(rules.iter().map(String::as_str));
-
     self
       .agent
-      .check(&scripts::LIMIT.argv(&args), QUICK)
-      .map(|_| ())
+      .set_rules(&self.name, rules(cpus, memory_in_bytes))
   }
 
   /// Copies `source`, a host file or directory, into the jail, like
@@ -151,14 +147,9 @@ impl<'a> Jail<'a> {
   }
 
   /// Like `statistics`, with the ZFS I/O counters of `dataset` if one is
-  /// given, all from one script.
+  /// given, all from one Call.
   pub(crate) fn statistics_with(&self, dataset: Option<&str>) -> Result<Statistics> {
-    let ran = self.agent.check(
-      &scripts::STATISTICS.argv(&[&self.name, dataset.unwrap_or_default()]),
-      QUICK,
-    )?;
-
-    statistics::parse(&ran.stdout, dataset)
+    self.agent.statistics(&self.name, dataset)
   }
 
   /// Stops the jail: kills its processes, drops the TCP connections they
@@ -193,11 +184,11 @@ impl<'a> Jail<'a> {
       Vec::new()
     };
 
-    steps.take(
-      self
-        .agent
-        .check(&scripts::DROP.argv(&[&self.name, vnet]), QUICK),
-    );
+    // As `jail -r` would, give the processes time to exit. Then drop the
+    // connections they left, which would otherwise keep the removed jail
+    // dying through TIME_WAIT.
+    steps.take(self.agent.terminate(&self.name, GRACE));
+    steps.take(self.agent.drop_connections(&self.name));
     // A failed removal leaves the jail running: return early so a later
     // `find` can stop it again.
     if steps
@@ -206,7 +197,7 @@ impl<'a> Jail<'a> {
     {
       return steps.finish();
     }
-    steps.take(self.agent.check(&scripts::GONE.argv(&[&self.name]), DYING));
+    steps.take(self.agent.await_removal(&self.name, DYING));
     steps.take(clean_up(self.agent, &self.name, path));
 
     // Destroy the outside (a) end, which stays in the guest's vnet even while
@@ -256,15 +247,15 @@ impl Spawn for Jail<'_> {
 pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   let mut steps = Steps::default();
 
-  steps.take(agent.check(&scripts::LIMIT.argv(&[name]), QUICK));
+  steps.take(agent.set_rules(name, Vec::new()));
   steps.take(agent.unmount_under(path));
   steps.finish()
 }
 
-/// rctl(8) rules denying `jail` more than `cpus` CPUs (`pcpu`) and
-/// `memory_in_bytes` of resident memory (`memoryuse`).
-fn rules(jail: &str, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
-  let rule = |resource: &str, amount: Option<u64>| amount.map(|amount| format!("jail:{jail}:{resource}:deny={amount}"));
+/// rctl(8) rules, less their subject, denying more than `cpus` CPUs (`pcpu`)
+/// and `memory_in_bytes` of resident memory (`memoryuse`).
+fn rules(cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
+  let rule = |resource: &str, amount: Option<u64>| amount.map(|amount| format!("{resource}:deny={amount}"));
 
   [
     rule("pcpu", cpus.map(|cpus| u64::from(cpus) * 100)),
@@ -300,14 +291,11 @@ mod tests {
   #[test]
   fn makes_a_rule_for_each_limit_given() {
     assert_eq!(
-      rules("web", Some(2), Some(256 << 20)),
-      ["jail:web:pcpu:deny=200", "jail:web:memoryuse:deny=268435456"]
+      rules(Some(2), Some(256 << 20)),
+      ["pcpu:deny=200", "memoryuse:deny=268435456"]
     );
-    assert_eq!(
-      rules("web", None, Some(1 << 30)),
-      ["jail:web:memoryuse:deny=1073741824"]
-    );
-    assert!(rules("web", None, None).is_empty());
+    assert_eq!(rules(None, Some(1 << 30)), ["memoryuse:deny=1073741824"]);
+    assert!(rules(None, None).is_empty());
   }
 
   #[test]

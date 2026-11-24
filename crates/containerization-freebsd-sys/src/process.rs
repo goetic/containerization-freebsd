@@ -43,3 +43,26 @@ pub(crate) fn reap(pid: libc::pid_t) -> io::Result<libc::c_int> {
   retry(|| unsafe { libc::waitpid(pid, &mut status, 0) })?;
   Ok(status)
 }
+
+/// Waits for the forked child `pid` to exit, reaps it, and returns its exit
+/// code, or a failure if it died of a signal.
+pub(crate) fn reap_code(pid: libc::pid_t) -> io::Result<libc::c_int> {
+  let status = reap(pid)?;
+
+  if !libc::WIFEXITED(status) {
+    return Err(io::Error::other(format!(
+      "the child died of signal {}",
+      libc::WTERMSIG(status)
+    )));
+  }
+  Ok(libc::WEXITSTATUS(status))
+}
+
+/// Like `reap_code`, for a child whose exit code is an errno, or 0 if it
+/// succeeded.
+pub(crate) fn reap_errno(pid: libc::pid_t) -> io::Result<()> {
+  match reap_code(pid)? {
+    0 => Ok(()),
+    errno => Err(io::Error::from_raw_os_error(errno)),
+  }
+}
