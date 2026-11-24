@@ -85,22 +85,16 @@ pub fn file_type_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<Option<F
 /// its root in the guest.
 #[cfg(target_os = "freebsd")]
 pub fn find_jail(name: &str) -> io::Result<(JailId, PathBuf)> {
+  use crate::iovec;
   use std::ffi::{CStr, OsString};
   use std::os::unix::ffi::OsStringExt;
-
-  fn parameter(bytes: &[u8]) -> libc::iovec {
-    libc::iovec {
-      iov_base: bytes.as_ptr().cast_mut().cast(),
-      iov_len: bytes.len(),
-    }
-  }
 
   let wanted = crate::c_string(name)?;
   let mut path = vec![0u8; libc::PATH_MAX as usize];
   let mut parameters = [
-    parameter(c"name".to_bytes_with_nul()),
-    parameter(wanted.to_bytes_with_nul()),
-    parameter(c"path".to_bytes_with_nul()),
+    iovec(c"name".to_bytes_with_nul()),
+    iovec(wanted.to_bytes_with_nul()),
+    iovec(c"path".to_bytes_with_nul()),
     libc::iovec {
       iov_base: path.as_mut_ptr().cast(),
       iov_len: path.len(),

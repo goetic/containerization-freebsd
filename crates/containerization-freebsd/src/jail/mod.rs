@@ -14,7 +14,6 @@ use crate::socket::{SocketRelay, UnixSocket};
 use crate::statistics::{self, Statistics};
 use containerization_freebsd_protocol::{Address, Connect, GuestPath};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 /// How long `scripts::GONE` may wait: longer than TIME_WAIT, which is 2 × MSL
@@ -24,8 +23,6 @@ const DYING: Duration = Duration::from_secs(90);
 pub struct Jail<'a> {
   agent: &'a Agent,
   name: String,
-  /// The guest path of the jail's root, once it is known.
-  root: OnceLock<String>,
 }
 
 impl<'a> Jail<'a> {
@@ -56,12 +53,9 @@ impl<'a> Jail<'a> {
       }
       return Err(error);
     }
-    let jail = Self {
-      root: OnceLock::from(path.to_string()),
-      ..Self::running(agent, name)
-    };
+    let jail = Self::running(agent, name);
 
-    match jail.configure(path, network, epair.as_ref()) {
+    match jail.configure(network, epair.as_ref()) {
       Ok(()) => Ok(jail),
       Err(error) => {
         let _ = jail.stop();
@@ -75,7 +69,6 @@ impl<'a> Jail<'a> {
     Self {
       agent,
       name: name.to_string(),
-      root: OnceLock::new(),
     }
   }
 
@@ -166,23 +159,6 @@ impl<'a> Jail<'a> {
     )?;
 
     statistics::parse(&ran.stdout, dataset)
-  }
-
-  /// The guest path of the jail's root, which `jls` reports if the jail was
-  /// found rather than started.
-  fn root(&self) -> Result<&str> {
-    if let Some(root) = self.root.get() {
-      return Ok(root);
-    }
-    let ran = self
-      .agent
-      .check(&["jls", "-j", &self.name, "path"], QUICK)?;
-
-    Ok(
-      self
-        .root
-        .get_or_init(|| ran.stdout.trim_end_matches('\n').to_string()),
-    )
   }
 
   /// Stops the jail: kills its processes, drops the TCP connections they
@@ -281,7 +257,7 @@ pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
   let mut steps = Steps::default();
 
   steps.take(agent.check(&scripts::LIMIT.argv(&[name]), QUICK));
-  steps.take(agent.check(&scripts::UNMOUNT.argv(&[path]), QUICK));
+  steps.take(agent.unmount_under(path));
   steps.finish()
 }
 

@@ -142,21 +142,28 @@ macro_rules! record {
 }
 
 /// Encodes and decodes the enum `$tagged`, whose variants each hold one
-/// value, as the variant's u8 tag followed by the value.
+/// value or none, as the variant's u8 tag followed by the value. A variant
+/// that holds a value is listed with a name for it, as in `0 => Port(port)`.
 macro_rules! tagged {
-  ($tagged:ty { $($tag:literal => $variant:ident),+ $(,)? }) => {
+  ($tagged:ty { $($tag:literal => $variant:ident $(($value:ident))?),+ $(,)? }) => {
     impl $crate::codec::Encode for $tagged {
       fn encode(&self, out: &mut $crate::codec::Writer) {
         match self {
-          $(Self::$variant(value) => out.put(&($tag as u8)).put(value),)+
-        };
+          $(Self::$variant $(($value))? => {
+            out.put(&($tag as u8));
+            $(out.put($value);)?
+          })+
+        }
       }
     }
 
     impl $crate::codec::Decode for $tagged {
       fn decode(reader: &mut $crate::codec::Reader<'_>) -> Result<Self, $crate::codec::DecodeError> {
         match reader.get::<u8>()? {
-          $($tag => Ok(Self::$variant(reader.get()?)),)+
+          $($tag => Ok(Self::$variant $(({
+            let $value = reader.get()?;
+            $value
+          }))?),)+
           tag => Err($crate::codec::DecodeError::UnknownTag(tag)),
         }
       }

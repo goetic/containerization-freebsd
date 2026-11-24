@@ -6,6 +6,7 @@ use crate::agent::{Agent, QUICK, Spawn};
 use crate::error::{Error, Result};
 use crate::machine::Mac;
 use crate::scripts;
+use containerization_freebsd_protocol::{FileCopy, GuestPath};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -109,7 +110,7 @@ impl Jail<'_> {
   /// Configures a new jail's network: lo0 and the epair's b end for `Nat`,
   /// lo0 and the claimed devices for `Interfaces`, and resolv.conf for any
   /// networked jail.
-  pub(super) fn configure(&self, path: &str, network: &Network, epair: Option<&Epair>) -> Result<()> {
+  pub(super) fn configure(&self, network: &Network, epair: Option<&Epair>) -> Result<()> {
     if let Some(epair) = epair {
       let (inside, address) = (format!("{}b", epair.name), format!("{}/{PREFIX}", epair.address));
       self.set_address(&inside, &address, &GATEWAY.to_string())?;
@@ -127,11 +128,31 @@ impl Jail<'_> {
       }
     }
     if *network != Network::None {
-      self
-        .agent
-        .check(&scripts::COPY_RESOLV_CONF.argv(&[path]), QUICK)?;
+      self.agent.copy_file(self.resolv_conf())?;
     }
     Ok(())
+  }
+
+  /// Removes the jail's resolv.conf if it is the copy of the guest's that
+  /// `start` made, and nothing has changed it since.
+  pub(crate) fn remove_resolv_conf(&self) -> Result<()> {
+    self.agent.remove_copy(self.resolv_conf())
+  }
+
+  /// The guest's resolv.conf, and where the jail's is.
+  fn resolv_conf(&self) -> FileCopy {
+    let path = "/etc/resolv.conf".to_string();
+
+    FileCopy {
+      from: GuestPath {
+        path: path.clone(),
+        jail: None,
+      },
+      to: GuestPath {
+        path,
+        jail: Some(self.name.clone()),
+      },
+    }
   }
 
   /// Runs `scripts::ADDRESS`, which brings up the VNET jail's lo0, gives a

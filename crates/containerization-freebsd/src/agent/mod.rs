@@ -22,7 +22,9 @@ pub use containerization_freebsd_protocol::{Exec, Exit, FileType, Limit, Resourc
 
 use crate::error::{Error, Result};
 use channel::Stream;
-use containerization_freebsd_protocol::{Address, Call, Connect, GuestPath, Listen, Message, Return};
+use containerization_freebsd_protocol::{
+  Address, Call, Connect, Disk, FileCopy, GuestPath, Listen, Message, Mount, Return,
+};
 use session::{Route, Shared};
 use std::io::{PipeReader, PipeWriter};
 use std::path::PathBuf;
@@ -253,17 +255,63 @@ impl Agent {
   /// The type of file at `path`, which the agent looks up from inside the
   /// jail if `path` names one.
   pub(crate) fn file_type_at(&self, path: GuestPath) -> Result<FileType> {
-    let Return::FileType(found) = self.call(Call::FileType(path))?;
-    Ok(found)
+    self.call(Call::FileType(path), |value| match value {
+      Return::FileType(found) => Some(found),
+      _ => None,
+    })
   }
 
-  /// Makes `call` and returns the agent's answer.
-  fn call(&self, call: Call) -> Result<Return> {
+  /// Mounts what `mount` describes.
+  pub(crate) fn mount(&self, mount: Mount) -> Result<()> {
+    self.call_for_nothing(Call::Mount(mount))
+  }
+
+  /// Unmounts every file system mounted under the guest path `path`, except
+  /// ZFS datasets.
+  pub(crate) fn unmount_under(&self, path: &str) -> Result<()> {
+    self.call_for_nothing(Call::Unmount(path.to_string()))
+  }
+
+  pub(crate) fn disks(&self) -> Result<Vec<Disk>> {
+    self.call(Call::Disks, |value| match value {
+      Return::Disks(disks) => Some(disks),
+      _ => None,
+    })
+  }
+
+  /// Copies a regular file and its permissions, unless the original is
+  /// missing or something is already at the destination.
+  pub(crate) fn copy_file(&self, copy: FileCopy) -> Result<()> {
+    self.call_for_nothing(Call::CopyFile(copy))
+  }
+
+  /// Removes the copy `copy_file` made, unless something has changed it.
+  pub(crate) fn remove_copy(&self, copy: FileCopy) -> Result<()> {
+    self.call_for_nothing(Call::RemoveCopy(copy))
+  }
+
+  /// Creates the ZFS dataset `dataset` if it doesn't exist, makes sure ZFS
+  /// mounts it, and returns the directory it is mounted at.
+  pub(crate) fn mount_dataset(&self, dataset: &str) -> Result<String> {
+    self.call(Call::MountDataset(dataset.to_string()), |value| match value {
+      Return::Path(path) => Some(path),
+      _ => None,
+    })
+  }
+
+  /// Makes `call`, which returns Done.
+  fn call_for_nothing(&self, call: Call) -> Result<()> {
+    self.call(call, |value| matches!(value, Return::Done).then_some(()))
+  }
+
+  /// Makes `call`, and returns what `take` finds in the agent's answer:
+  /// `None` if the answer isn't the variant the call returns.
+  fn call<T>(&self, call: Call, take: impl FnOnce(Return) -> Option<T>) -> Result<T> {
     let what = call.to_string();
     let stream = self.open_unanswered(Message::Call(call), what, None)?;
 
     match stream.answer()? {
-      Message::Return(value) => Ok(value),
+      Message::Return(value) => take(value).ok_or_else(|| stream.misreturned()),
       other => Err(stream.unexpected(&other)),
     }
   }

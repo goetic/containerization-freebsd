@@ -143,6 +143,7 @@ dependencies = [
  "containerization-freebsd-protocol",
  "containerization-freebsd-sys",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

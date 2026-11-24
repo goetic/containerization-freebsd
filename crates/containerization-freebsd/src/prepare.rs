@@ -2,11 +2,10 @@
 //! later machines clone or restore.
 
 use crate::Machine;
-use crate::agent::Spawn;
+use crate::agent::FileType;
 use crate::error::{Error, Result};
 use crate::fat::Volume;
 use crate::machine::Layout;
-use crate::scripts;
 use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -23,9 +22,11 @@ const SEED_LABEL: [u8; 11] = *b"CIDATA     ";
 const USER_DATA: &str = include_str!("scripts/user-data.sh");
 /// The guest bundle's file name on the seed, where `USER_DATA` expects it.
 const BUNDLE: &str = "bundle.tar.xz";
-/// The most boots to wait through. A first boot that upgrades reboots once,
-/// and the agent then starts again.
+/// The most boots to wait through for a power-off. A first boot that
+/// upgrades reboots once, and the agent then starts again.
 const BOOTS: usize = 3;
+/// The longest the first boot may take, through an upgrade's reboot.
+const FIRST_BOOT: Duration = Duration::from_secs(1800);
 /// The longest a power-off may take, or, if the guest reboots instead, its
 /// boot up to the agent's session.
 const POWER_OFF: Duration = Duration::from_secs(600);
@@ -76,23 +77,37 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
 /// boot, after the seed's script has started the agent; a machine powered off
 /// sooner repeats the first boot. If an upgrade requested a reboot
 /// (/firstboot-reboot), rc deletes /firstboot and then reboots, so the wait
-/// can succeed just before that reboot (see `power_off`), or end in
-/// `SessionEnded` and succeed on the next boot.
+/// can succeed just before that reboot (see `power_off`). Or the reboot
+/// takes the agent down before it answers, and the wait succeeds on the next
+/// boot.
 fn wait_first_boot(machine: &Machine) -> Result<()> {
-  let wait = scripts::FIRST_BOOT_DONE.argv(&[]);
+  let deadline = Instant::now() + FIRST_BOOT;
 
-  for _ in 0..BOOTS {
-    machine.wait_ready(Duration::from_secs(600))?;
-    match machine.agent.check(&wait, Duration::from_secs(900)) {
-      Ok(_) => return Ok(()),
-      // The upgrade's reboot.
-      Err(Error::SessionEnded(_)) => {}
+  loop {
+    machine.wait_ready(deadline.saturating_duration_since(Instant::now()))?;
+    match machine.agent.file_type("/firstboot") {
+      Ok(FileType::Missing) => return Ok(()),
+      Ok(_) => {}
+      // The upgrade's reboot ended the session, or the agent went down
+      // before the next boot's agent could end it.
+      Err(
+        Error::SessionEnded(_)
+        | Error::Timeout(_)
+        | Error::Protocol {
+          error: containerization_freebsd_protocol::Error::NoSession,
+          ..
+        },
+      ) => {}
       Err(error) => return Err(error),
     }
+    if Instant::now() >= deadline {
+      return Err(Error::Timeout(format!(
+        "the first boot did not finish within {}s",
+        FIRST_BOOT.as_secs()
+      )));
+    }
+    std::thread::sleep(Duration::from_secs(1));
   }
-  Err(Error::Guest(format!(
-    "the first boot did not finish within {BOOTS} boots"
-  )))
 }
 
 /// Powers the guest off, and again if it boots instead. `wait_first_boot` can

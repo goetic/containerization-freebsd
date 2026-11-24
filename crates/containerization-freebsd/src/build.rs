@@ -3,11 +3,10 @@
 //! hashed from that snapshot's name and the step, so a built step never runs
 //! again.
 
-use crate::agent::{Agent, Exec, Exit, Output, QUICK, Spawn};
+use crate::agent::{Agent, Exec, Exit, Output, Spawn};
 use crate::digest::sha256;
 use crate::error::{Error, Result};
 use crate::jail::{Jail, Network};
-use crate::scripts;
 use crate::zfs::{Cache, SnapshotChain, Zfs};
 
 /// The snapshot taken of each step's dataset once the step succeeds.
@@ -89,12 +88,14 @@ impl<'a> Builder<'a> {
     let jail = Jail::start(self.agent, &name, root, &step.network, &["mount.devfs"])?;
 
     let exit = run_script(&jail, &step.script, output);
+    // Remove resolv.conf from inside the jail, so that a symlink the script
+    // left on the path can't lead outside.
+    let removed = match step.network {
+      Network::None => Ok(()),
+      _ => jail.remove_resolv_conf(),
+    };
     jail.stop()?;
-    if step.network != Network::None {
-      self
-        .agent
-        .check(&scripts::REMOVE_RESOLV_CONF.argv(&[root]), QUICK)?;
-    }
+    removed?;
 
     match exit? {
       exit if exit.success() => Ok(()),

@@ -214,7 +214,7 @@ fn unlink_socket(path: &CStr) -> Result<(), libc::c_int> {
 ///
 /// The child is a fork of a multithreaded process, so `act` must make only
 /// async-signal-safe calls and allocate nothing.
-unsafe fn in_jail(
+pub(crate) unsafe fn in_jail(
   jail: JailId,
   act: impl FnOnce() -> Result<Option<libc::c_int>, libc::c_int>,
 ) -> io::Result<Option<OwnedFd>> {

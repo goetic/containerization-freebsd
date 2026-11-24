@@ -3,7 +3,6 @@
 
 use crate::agent::{Agent, QUICK, Spawn};
 use crate::error::{Error, Result};
-use crate::scripts;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -63,11 +62,7 @@ impl<'a> Zfs<'a> {
   /// `legacy`, as under the pool of FreeBSD's VM image, gets `/<dataset>`,
   /// which its children inherit.
   pub fn create_mounted(&self, dataset: &str) -> Result<String> {
-    let ran = self
-      .agent
-      .check(&scripts::CREATE_MOUNTED.argv(&[dataset]), QUICK)?;
-
-    Ok(ran.stdout.trim().to_string())
+    self.agent.mount_dataset(dataset)
   }
 
   /// `snapshot` is `<dataset>@<name>`.

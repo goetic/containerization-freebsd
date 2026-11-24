@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 #[cfg(feature = "kernel-messages")]
 use crate::kernel_messages::Memory;
 use crate::scripts;
+use containerization_freebsd_protocol::{GuestPath, Mount};
 use dispatch2::{DispatchQueue, DispatchRetained};
 use std::fmt;
 use std::fs::File;
@@ -478,25 +479,35 @@ impl Machine {
   /// `/dev/vtbd1`. It scans `kern.disks` because the image disables the
   /// `/dev/diskid` labels that would otherwise name it.
   pub fn disk_device(&self, identifier: &str) -> Result<String> {
-    let ran = self
+    let mut devices: Vec<String> = self
       .agent
-      .check(&scripts::DISK_DEVICE.argv(&[identifier]), QUICK)?;
+      .disks()?
+      .into_iter()
+      .filter(|disk| disk.ident.as_deref() == Some(identifier))
+      .map(|disk| disk.device)
+      .collect();
 
-    match ran.lines().as_slice() {
-      [device] => Ok(device.to_string()),
-      [] => Err(Error::Guest(format!("no disk has the identifier {identifier:?}"))),
-      devices => Err(Error::Guest(format!(
+    match devices.len() {
+      1 => Ok(devices.remove(0)),
+      0 => Err(Error::Guest(format!("no disk has the identifier {identifier:?}"))),
+      _ => Err(Error::Guest(format!(
         "disks {devices:?} all have the identifier {identifier:?}"
       ))),
     }
   }
 
-  /// Mounts the share tagged `tag` at `path` in the guest.
+  /// Mounts the share tagged `tag` at `path` in the guest, creating the
+  /// directory if needed.
   pub fn mount_share(&self, tag: &str, path: &str) -> Result<()> {
-    self
-      .agent
-      .check(&scripts::MOUNT_SHARE.argv(&[tag, path]), QUICK)
-      .map(|_| ())
+    self.agent.mount(Mount {
+      kind: "virtiofs".to_string(),
+      source: tag.to_string(),
+      destination: GuestPath {
+        path: path.to_string(),
+        jail: None,
+      },
+      options: Vec::new(),
+    })
   }
 
   /// Restores a state written by `save` into this machine, which must have the

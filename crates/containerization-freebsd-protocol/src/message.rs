@@ -214,11 +214,31 @@ pub struct Listen {
   pub mode: Option<u16>,
 }
 
-/// What a Call asks the agent to do.
+/// What a Call asks the agent to do. Each variant says which Return answers
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
-  /// Finds the type of file at the path, following symlinks.
+  /// Finds the type of file at the path, following symlinks. Returns
+  /// FileType.
   FileType(GuestPath),
+  /// Mounts a file system. Returns Done.
+  Mount(Mount),
+  /// Unmounts every file system mounted under the guest path, except ZFS
+  /// datasets, the most recently mounted first. Returns Done.
+  Unmount(String),
+  /// Lists the guest's disks. Returns Disks.
+  Disks,
+  /// Copies a regular file and its permissions, unless the original is
+  /// missing or something is already at the destination. Returns Done.
+  CopyFile(FileCopy),
+  /// Removes the destination if it holds the same bytes as the original, as
+  /// a copy that nothing has changed does. Returns Done.
+  RemoveCopy(FileCopy),
+  /// Creates the ZFS dataset and any missing parents, and makes sure ZFS
+  /// mounts it. A dataset whose mountpoint is `none` or `legacy`, as under
+  /// the pool of FreeBSD's VM image, gets `/<dataset>`, which its children
+  /// inherit. Returns Path, the directory it is mounted at.
+  MountDataset(String),
 }
 
 /// Names what the call does, for errors: `finding the type of "/etc"`.
@@ -226,14 +246,61 @@ impl fmt::Display for Call {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::FileType(path) => write!(formatter, "finding the type of {path}"),
+      Self::Mount(mount) => write!(
+        formatter,
+        "mounting {} {:?} at {}",
+        mount.kind, mount.source, mount.destination
+      ),
+      Self::Unmount(path) => write!(formatter, "unmounting what is mounted under {path:?}"),
+      Self::Disks => write!(formatter, "listing the disks"),
+      Self::CopyFile(copy) => write!(formatter, "copying {} to {}", copy.from, copy.to),
+      Self::RemoveCopy(copy) => write!(formatter, "removing {} if it is a copy of {}", copy.to, copy.from),
+      Self::MountDataset(dataset) => write!(formatter, "mounting dataset {dataset:?}"),
     }
   }
 }
 
-/// What the agent reports for a Call, in the variant of the same name.
+/// What the agent reports for a Call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Return {
   FileType(FileType),
+  /// The call succeeded and has nothing to report.
+  Done,
+  Disks(Vec<Disk>),
+  Path(String),
+}
+
+/// A file system to mount, and where.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Mount {
+  /// The file system's type, such as `nullfs`, `tmpfs`, or `virtiofs`.
+  pub kind: String,
+  /// What to mount, such as a guest directory for nullfs or a share's tag
+  /// for virtio-fs.
+  pub source: String,
+  /// Where to mount it. Missing directories are created. In a jail, the path
+  /// resolves within the jail's root, as under chroot(2): absolute symlinks
+  /// start at the root, and `..` stops there.
+  pub destination: GuestPath,
+  /// Options such as `ro`, or tmpfs's `size=64m`.
+  pub options: Vec<String>,
+}
+
+/// A file and where to copy it. Either path may be in a jail.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileCopy {
+  pub from: GuestPath,
+  pub to: GuestPath,
+}
+
+/// One of the guest's disks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Disk {
+  /// Such as `/dev/vtbd1`.
+  pub device: String,
+  /// The disk's ident, which for a virtio-blk disk is its serial. `None` if
+  /// the disk has none or it can't be read.
+  pub ident: Option<String>,
 }
 
 /// A path in the guest, or in a jail if one is named. The agent works from
@@ -446,11 +513,38 @@ record!(Limit { resource, soft, hard });
 record!(Connect { to, jail });
 record!(Listen { path, jail, mode });
 record!(GuestPath { path, jail });
+record!(Mount {
+  kind,
+  source,
+  destination,
+  options,
+});
+record!(FileCopy { from, to });
+record!(Disk { device, ident });
 record!(WindowSize { rows, columns });
-tagged!(Address { 0 => Port, 1 => Unix });
-tagged!(Exit { 0 => Code, 1 => Signal });
-tagged!(Call { 0 => FileType });
-tagged!(Return { 0 => FileType });
+tagged!(Address {
+  0 => Port(port),
+  1 => Unix(path),
+});
+tagged!(Exit {
+  0 => Code(code),
+  1 => Signal(signal),
+});
+tagged!(Call {
+  0 => FileType(path),
+  1 => Mount(mount),
+  2 => Unmount(path),
+  3 => Disks,
+  4 => CopyFile(copy),
+  5 => RemoveCopy(copy),
+  6 => MountDataset(dataset),
+});
+tagged!(Return {
+  0 => FileType(found),
+  1 => Done,
+  2 => Disks(disks),
+  3 => Path(path),
+});
 
 /// A file type is a u8 tag.
 impl Encode for FileType {
@@ -618,10 +712,45 @@ mod tests {
         jail: Some("web".into()),
       })),
       Message::Call(Call::FileType(GuestPath::default())),
+      Message::Call(Call::Mount(Mount {
+        kind: "tmpfs".into(),
+        source: "tmpfs".into(),
+        destination: GuestPath {
+          path: "/tmp".into(),
+          jail: Some("web".into()),
+        },
+        options: vec!["ro".into(), "size=64m".into()],
+      })),
+      Message::Call(Call::Unmount("/jails/web".into())),
+      Message::Call(Call::Disks),
+      Message::Call(Call::CopyFile(FileCopy {
+        from: GuestPath {
+          path: "/etc/resolv.conf".into(),
+          jail: None,
+        },
+        to: GuestPath {
+          path: "/etc/resolv.conf".into(),
+          jail: Some("web".into()),
+        },
+      })),
+      Message::Call(Call::RemoveCopy(FileCopy::default())),
+      Message::Call(Call::MountDataset("zroot/cfbsd".into())),
       Message::Return(Return::FileType(FileType::Missing)),
       Message::Return(Return::FileType(FileType::Directory)),
       Message::Return(Return::FileType(FileType::File)),
       Message::Return(Return::FileType(FileType::Other)),
+      Message::Return(Return::Done),
+      Message::Return(Return::Disks(vec![
+        Disk {
+          device: "/dev/vtbd0".into(),
+          ident: None,
+        },
+        Disk {
+          device: "/dev/vtbd1".into(),
+          ident: Some("images".into()),
+        },
+      ])),
+      Message::Return(Return::Path("/cfbsd".into())),
       Message::Opened,
       Message::Data(b"stdin".to_vec()),
       Message::Stderr(vec![0xFF]),
@@ -707,6 +836,7 @@ mod tests {
         .payload,
       [0, 3]
     );
+    assert_eq!(Message::Call(Call::Disks).frame(0).payload, [3]);
   }
 
   #[test]

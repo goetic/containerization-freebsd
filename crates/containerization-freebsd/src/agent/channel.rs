@@ -410,6 +410,11 @@ impl Stream {
     Error::Guest(format!("{}: the agent sent {}", self.what, message.name()))
   }
 
+  /// The error for a Return that doesn't answer the channel's Call.
+  pub(super) fn misreturned(&self) -> Error {
+    Error::Guest(format!("{}: the agent returned the wrong kind of answer", self.what))
+  }
+
   fn send(&self, message: Message) -> Result<()> {
     let written = self.shared.lock().send(self.channel, message, &self.what)?;
     written.wait()

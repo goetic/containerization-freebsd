@@ -2,8 +2,8 @@
 //! that stands in for the console.
 
 use containerization_freebsd_protocol::{
-  Address, CONTROL, Call, Connect, Decoder, Exec, Exit, FileType, Frame, GuestPath, Limit, Listen, Message, Mux,
-  Resource, Return, Side, User, VERSION, WindowSize,
+  Address, CONTROL, Call, Connect, Decoder, Exec, Exit, FileCopy, FileType, Frame, GuestPath, Limit, Listen, Message,
+  Mux, Resource, Return, Side, User, VERSION, WindowSize,
 };
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
@@ -631,6 +631,56 @@ fn says_what_type_of_file_is_at_a_path() {
     "{:?}",
     answers[5]
   );
+}
+
+#[test]
+fn copies_a_file_and_removes_the_copy_unless_it_changed() {
+  let mut host = Host::start();
+  let directory = tempfile::tempdir().unwrap();
+  let file = |name: &str| directory.path().join(name);
+  let copy = |from: &str, to: &str| FileCopy {
+    from: GuestPath {
+      path: file(from).to_str().unwrap().into(),
+      jail: None,
+    },
+    to: GuestPath {
+      path: file(to).to_str().unwrap().into(),
+      jail: None,
+    },
+  };
+  let original = "nameserver 192.0.2.1\n";
+  std::fs::write(file("original"), original).unwrap();
+  std::fs::set_permissions(file("original"), std::fs::Permissions::from_mode(0o640)).unwrap();
+  std::fs::write(file("taken"), "mine\n").unwrap();
+  std::fs::write(file("longer"), format!("{original}options edns0\n")).unwrap();
+  let mut call = |call: Call| {
+    let channel = host.open(Message::Call(call));
+    let (answered, answer) = host.next();
+    assert_eq!(answered, channel);
+    answer
+  };
+  let done = Message::Return(Return::Done);
+
+  assert_eq!(call(Call::CopyFile(copy("original", "copy"))), done);
+  assert_eq!(call(Call::CopyFile(copy("original", "taken"))), done);
+  assert_eq!(call(Call::CopyFile(copy("missing", "nothing"))), done);
+  assert_eq!(std::fs::read_to_string(file("copy")).unwrap(), original);
+  assert_eq!(
+    std::fs::metadata(file("copy"))
+      .unwrap()
+      .permissions()
+      .mode()
+      & 0o777,
+    0o640
+  );
+  assert_eq!(std::fs::read_to_string(file("taken")).unwrap(), "mine\n");
+  assert!(!file("nothing").exists());
+
+  for changed in ["taken", "longer", "copy"] {
+    assert_eq!(call(Call::RemoveCopy(copy("original", changed))), done);
+  }
+  assert!(file("taken").exists() && file("longer").exists());
+  assert!(!file("copy").exists());
 }
 
 /// The agent's end of the console, counting the agent's writes to it.

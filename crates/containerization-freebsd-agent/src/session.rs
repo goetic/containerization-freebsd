@@ -352,8 +352,8 @@ impl<W: Write> Agent<W> {
   }
 
   /// Answers the Call channel `channel` with what the call returns, or with
-  /// an Error. Either answer closes the channel. A call in a jail forks,
-  /// which only the session loop may do.
+  /// an Error. Either answer closes the channel. A call in a jail forks, and
+  /// MountDataset may spawn zfs(8), which only the session loop may do.
   fn call(&mut self, channel: u32, call: &Call) {
     let answer = match call::answer(call) {
       Ok(value) => Message::Return(value),
