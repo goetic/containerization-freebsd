@@ -23,7 +23,7 @@ cache="$HOME/.cache/containerization-freebsd-tests"
 work="${AGENT_WORK:-tmp/agent-work}"
 
 pinned() {
-  sed -n "s/^pub const $1: &str = \"\(.*\)\";/\1/p" crates/containerization-freebsd/src/image.rs
+  sed -n "s/^pub const $1: &str = \"\(.*\)\";/\1/p" crates/containerization-freebsd/src/release.rs
 }
 
 if [ -z "${CROSS_BINDIR:-}" ]; then

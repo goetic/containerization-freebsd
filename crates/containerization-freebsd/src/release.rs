@@ -14,9 +14,9 @@ pub const IMAGE: &str = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.
 pub const BASE_DISK: &str = "base.raw";
 /// The guest bundle for `RELEASE`, holding the agent and the virtiofs
 /// modules, as this repository's CI publishes it.
-pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r4.tar.xz";
-const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r4/freebsd-15.1-arm64-guest-r4.tar.xz";
-const BUNDLE_SHA256: &str = "eddf74f52ad2d18dfcea136dfa98d41809f7324085682b27d1568003f47947ca";
+pub const BUNDLE: &str = "freebsd-15.1-arm64-guest-r5.tar.xz";
+const BUNDLE_URL: &str = "https://github.com/goetic/containerization-freebsd/releases/download/guest-15.1-r5/freebsd-15.1-arm64-guest-r5.tar.xz";
+const BUNDLE_SHA256: &str = "381cef5f031c869c7b92f109a109a4b80c216368000efd1dbbbe2a3445efec0a";
 /// `RELEASE`'s base system, the jails' userland, as named in the `userland`
 /// cache.
 pub const USERLAND: &str = "FreeBSD-15.1-RELEASE-arm64-base.txz";
