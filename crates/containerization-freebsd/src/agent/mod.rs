@@ -7,26 +7,17 @@
 //! meant to start, and end that session.
 //!
 //! The guest's tty drops input it has no room for, so the host keeps at most
-//! `WINDOW` bytes in flight and writes frames in slices that fit. One
+//! `mux::WINDOW` bytes in flight and writes frames in slices that fit. One
 //! thread reads the console and counts the agent's Received reports. Another
 //! thread handles everything else, so a writer blocked on a full window can't
 //! deadlock the reader whose Received counts reopen it.
 
-mod channel;
+pub mod channel;
 mod console;
 mod session;
 
-pub(crate) use channel::Listener;
-pub use channel::{Output, Process, Relay};
-pub use containerization_freebsd_protocol::{Exec, Exit, FileType, Limit, Resource, User, WindowSize};
-
-use crate::error::{Error, Result};
-use channel::Stream;
-use containerization_freebsd_protocol::{
-  Address, Addressing, Bridge, Call, Claim, Connect, Disk, FileCopy, GuestPath, JailWait, Lease, Listen, Message,
-  Mount, Return, Rules, Statistics, StatisticsOf,
-};
-use session::{Route, Shared};
+use crate::error;
+use containerization_freebsd_protocol::message;
 use std::io::{PipeReader, PipeWriter};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -43,13 +34,13 @@ pub(crate) const QUICK: Duration = Duration::from_secs(60);
 const LEASING: Duration = Duration::from_secs(30);
 
 pub struct Agent {
-  shared: Arc<Shared>,
+  shared: Arc<session::Shared>,
 }
 
 /// The output and exit status of a finished command.
 #[derive(Debug)]
 pub struct Ran {
-  pub exit: Exit,
+  pub exit: message::Exit,
   pub stdout: String,
   pub stderr: String,
   pub seconds: f64,
@@ -68,16 +59,16 @@ pub trait Spawn {
   /// environment plus `exec.env`. With `pty`, it runs on a terminal of that
   /// size. With a user, `HOME` is set to the user's home directory unless
   /// `exec.env` sets it.
-  fn spawn(&self, exec: Exec) -> Result<Process>;
+  fn spawn(&self, exec: message::Exec) -> error::Result<channel::Process>;
 
   /// Runs `argv` with no input and collects its output. If the command is
   /// still running after `timeout`, it is killed.
-  fn run(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.run_exec(Exec::new(argv), timeout)
+  fn run(&self, argv: &[&str], timeout: Duration) -> error::Result<Ran> {
+    self.run_exec(message::Exec::new(argv), timeout)
   }
 
   /// Like `run`, for the process `exec` describes.
-  fn run_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
+  fn run_exec(&self, exec: message::Exec, timeout: Duration) -> error::Result<Ran> {
     let started = Instant::now();
     let what = described(&exec);
     let process = self.spawn(exec)?;
@@ -86,7 +77,7 @@ pub trait Spawn {
     // Dropping the process on a timeout kills it.
     let exit = process
       .wait_timeout(timeout, &mut stdout, &mut stderr)?
-      .ok_or_else(|| Error::Timeout(format!("{what} did not finish within {}s", timeout.as_secs())))?;
+      .ok_or_else(|| error::Error::Timeout(format!("{what} did not finish within {}s", timeout.as_secs())))?;
 
     Ok(Ran {
       exit,
@@ -97,12 +88,12 @@ pub trait Spawn {
   }
 
   /// Like `run`, but fails unless the command exits with status 0.
-  fn check(&self, argv: &[&str], timeout: Duration) -> Result<Ran> {
-    self.check_exec(Exec::new(argv), timeout)
+  fn check(&self, argv: &[&str], timeout: Duration) -> error::Result<Ran> {
+    self.check_exec(message::Exec::new(argv), timeout)
   }
 
   /// Like `check`, for the process `exec` describes.
-  fn check_exec(&self, exec: Exec, timeout: Duration) -> Result<Ran> {
+  fn check_exec(&self, exec: message::Exec, timeout: Duration) -> error::Result<Ran> {
     let what = described(&exec);
     let ran = self.run_exec(exec, timeout)?;
 
@@ -112,7 +103,7 @@ pub trait Spawn {
     let lines: Vec<&str> = ran.stderr.lines().collect();
     let tail = lines[lines.len().saturating_sub(20)..].join("\n");
 
-    Err(Error::Guest(format!(
+    Err(error::Error::Guest(format!(
       "{what} exited with {} after {:.1}s: {tail}",
       ran.exit, ran.seconds
     )))
@@ -120,28 +111,30 @@ pub trait Spawn {
 }
 
 impl Spawn for Agent {
-  fn spawn(&self, exec: Exec) -> Result<Process> {
+  fn spawn(&self, exec: message::Exec) -> error::Result<channel::Process> {
     let what = described(&exec);
 
-    self.open(Message::Exec(exec), what, None).map(Process::new)
+    self
+      .open(message::Message::Exec(exec), what, None)
+      .map(channel::Process::new)
   }
 }
 
 /// What a Call that returns Done returns.
-fn done(value: Return) -> Option<()> {
-  matches!(value, Return::Done).then_some(())
+fn done(value: message::Return) -> Option<()> {
+  matches!(value, message::Return::Done).then_some(())
 }
 
 /// What a Call that returns Name returns.
-fn name(value: Return) -> Option<String> {
+fn name(value: message::Return) -> Option<String> {
   match value {
-    Return::Name(name) => Some(name),
+    message::Return::Name(name) => Some(name),
     _ => None,
   }
 }
 
 /// `exec`'s argv, and its jail if it has one, for error messages.
-fn described(exec: &Exec) -> String {
+fn described(exec: &message::Exec) -> String {
   match &exec.jail {
     Some(jail) => format!("{:?} in jail {jail}", exec.argv),
     None => format!("{:?}", exec.argv),
@@ -151,7 +144,7 @@ fn described(exec: &Exec) -> String {
 impl Agent {
   pub(crate) fn new(output: PipeReader, input: PipeWriter) -> Self {
     Self {
-      shared: Shared::start(output, input),
+      shared: session::Shared::start(output, input),
     }
   }
 
@@ -164,7 +157,7 @@ impl Agent {
 
   /// Starts a session with an agent that is already running and so will not
   /// announce itself, as after a restore.
-  pub(crate) fn rejoin(&self) -> Result<()> {
+  pub(crate) fn rejoin(&self) -> error::Result<()> {
     let written = self.shared.lock().hello();
     written.wait()
   }
@@ -177,7 +170,7 @@ impl Agent {
 
   /// Waits for a session with the agent, which starts when the agent
   /// announces itself or answers `rejoin`.
-  pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
+  pub fn wait_ready(&self, timeout: Duration) -> error::Result<()> {
     let (state, _) = self
       .shared
       .changed
@@ -187,73 +180,73 @@ impl Agent {
       .unwrap_or_else(PoisonError::into_inner);
 
     if let Some(mismatch) = state.mismatch {
-      return Err(Error::Guest(format!("the guest agent: {mismatch}")));
+      return Err(error::Error::Guest(format!("the guest agent: {mismatch}")));
     }
     if state.mux.in_session() {
       return Ok(());
     }
     if state.closed {
-      return Err(Error::Guest("the console closed".to_string()));
+      return Err(error::Error::Guest("the console closed".to_string()));
     }
-    Err(Error::Timeout(format!(
+    Err(error::Error::Timeout(format!(
       "the guest agent did not start within {}s",
       timeout.as_secs()
     )))
   }
 
   /// Connects to `port` on the guest's loopback.
-  pub fn connect(&self, port: u16) -> Result<Relay> {
-    self.relay(Connect {
-      to: Address::Port(port),
+  pub fn connect(&self, port: u16) -> error::Result<channel::Relay> {
+    self.relay(message::Connect {
+      to: message::Address::Port(port),
       jail: None,
     })
   }
 
   /// Connects to the Unix socket at `path` in the guest.
-  pub fn connect_unix(&self, path: &str) -> Result<Relay> {
-    self.relay(Connect {
-      to: Address::Unix(path.to_string()),
+  pub fn connect_unix(&self, path: &str) -> error::Result<channel::Relay> {
+    self.relay(message::Connect {
+      to: message::Address::Unix(path.to_string()),
       jail: None,
     })
   }
 
-  pub(crate) fn relay(&self, connect: Connect) -> Result<Relay> {
+  pub(crate) fn relay(&self, connect: message::Connect) -> error::Result<channel::Relay> {
     let what = connect.to_string();
 
     self
-      .open(Message::Connect(connect), what, None)
-      .map(Relay::new)
+      .open(message::Message::Connect(connect), what, None)
+      .map(channel::Relay::new)
   }
 
   /// Makes the agent listen on the Unix socket `listen` describes, and relays
   /// each connection to the host's socket at `host`.
-  pub(crate) fn listen(&self, listen: Listen, host: PathBuf) -> Result<Listener> {
+  pub(crate) fn listen(&self, listen: message::Listen, host: PathBuf) -> error::Result<channel::Listener> {
     let what = listen.to_string();
 
     self
-      .open(Message::Listen(listen), what, Some(host))
-      .map(Listener::new)
+      .open(message::Message::Listen(listen), what, Some(host))
+      .map(channel::Listener::new)
   }
 
   /// Sets the guest's clock to the host's, if there is a session. The clock
   /// is synced at the start of each session, and a machine also syncs it
   /// every 30 seconds while it runs.
-  pub fn sync_clock(&self) -> Result<()> {
+  pub fn sync_clock(&self) -> error::Result<()> {
     let written = self.shared.lock().sync_clock()?;
     written.wait()
   }
 
   /// Starts `argv` in the guest without waiting for Opened, for commands
   /// that may never report back, such as one that powers off the guest.
-  pub fn launch(&self, argv: &[&str]) -> Result<()> {
+  pub fn launch(&self, argv: &[&str]) -> error::Result<()> {
     let what = format!("{argv:?}");
     let (opened, ended) = {
       let mut state = self.shared.lock();
       let (channel, frame) = state
         .mux
-        .open(Message::Exec(Exec::new(argv)))
-        .map_err(Error::protocol(&what))?;
-      (state.queue(frame), state.send(channel, Message::Eof, &what)?)
+        .open(message::Message::Exec(message::Exec::new(argv)))
+        .map_err(error::Error::protocol(&what))?;
+      (state.queue(frame), state.send(channel, message::Message::Eof, &what)?)
     };
 
     opened.wait()?;
@@ -261,8 +254,8 @@ impl Agent {
   }
 
   /// The type of file at `path` in the guest, following symlinks.
-  pub fn file_type(&self, path: &str) -> Result<FileType> {
-    self.file_type_at(GuestPath {
+  pub fn file_type(&self, path: &str) -> error::Result<message::FileType> {
+    self.file_type_at(message::GuestPath {
       path: path.to_string(),
       jail: None,
     })
@@ -270,128 +263,128 @@ impl Agent {
 
   /// The type of file at `path`, which the agent looks up from inside the
   /// jail if `path` names one.
-  pub(crate) fn file_type_at(&self, path: GuestPath) -> Result<FileType> {
-    self.call(Call::FileType(path), |value| match value {
-      Return::FileType(found) => Some(found),
+  pub(crate) fn file_type_at(&self, path: message::GuestPath) -> error::Result<message::FileType> {
+    self.call(message::Call::FileType(path), |value| match value {
+      message::Return::FileType(found) => Some(found),
       _ => None,
     })
   }
 
   /// Mounts what `mount` describes.
-  pub(crate) fn mount(&self, mount: Mount) -> Result<()> {
-    self.call_for_nothing(Call::Mount(mount))
+  pub(crate) fn mount(&self, mount: message::Mount) -> error::Result<()> {
+    self.call_for_nothing(message::Call::Mount(mount))
   }
 
   /// Unmounts every file system mounted under the guest path `path`, except
   /// ZFS datasets.
-  pub(crate) fn unmount_under(&self, path: &str) -> Result<()> {
-    self.call_for_nothing(Call::Unmount(path.to_string()))
+  pub(crate) fn unmount_under(&self, path: &str) -> error::Result<()> {
+    self.call_for_nothing(message::Call::Unmount(path.to_string()))
   }
 
-  pub(crate) fn disks(&self) -> Result<Vec<Disk>> {
-    self.call(Call::Disks, |value| match value {
-      Return::Disks(disks) => Some(disks),
+  pub(crate) fn disks(&self) -> error::Result<Vec<message::Disk>> {
+    self.call(message::Call::Disks, |value| match value {
+      message::Return::Disks(disks) => Some(disks),
       _ => None,
     })
   }
 
   /// Copies a regular file and its permissions, unless the original is
   /// missing or something is already at the destination.
-  pub(crate) fn copy_file(&self, copy: FileCopy) -> Result<()> {
-    self.call_for_nothing(Call::CopyFile(copy))
+  pub(crate) fn copy_file(&self, copy: message::FileCopy) -> error::Result<()> {
+    self.call_for_nothing(message::Call::CopyFile(copy))
   }
 
   /// Removes the copy `copy_file` made, unless something has changed it.
-  pub(crate) fn remove_copy(&self, copy: FileCopy) -> Result<()> {
-    self.call_for_nothing(Call::RemoveCopy(copy))
+  pub(crate) fn remove_copy(&self, copy: message::FileCopy) -> error::Result<()> {
+    self.call_for_nothing(message::Call::RemoveCopy(copy))
   }
 
   /// Creates the ZFS dataset `dataset` if it doesn't exist, makes sure ZFS
   /// mounts it, and returns the directory it is mounted at.
-  pub(crate) fn mount_dataset(&self, dataset: &str) -> Result<String> {
-    self.call(Call::MountDataset(dataset.to_string()), |value| match value {
-      Return::Path(path) => Some(path),
+  pub(crate) fn mount_dataset(&self, dataset: &str) -> error::Result<String> {
+    self.call(message::Call::MountDataset(dataset.to_string()), |value| match value {
+      message::Return::Path(path) => Some(path),
       _ => None,
     })
   }
 
   /// Replaces the jail's rctl rules with `rules`, each
   /// `resource:action=amount`.
-  pub(crate) fn set_rules(&self, jail: &str, rules: Vec<String>) -> Result<()> {
-    self.call_for_nothing(Call::SetRules(Rules {
+  pub(crate) fn set_rules(&self, jail: &str, rules: Vec<String>) -> error::Result<()> {
+    self.call_for_nothing(message::Call::SetRules(message::Rules {
       jail: jail.to_string(),
       rules,
     }))
   }
 
   /// The jail's resource usage, with the I/O of `dataset` if one is given.
-  pub(crate) fn statistics(&self, jail: &str, dataset: Option<&str>) -> Result<Statistics> {
-    let of = StatisticsOf {
+  pub(crate) fn statistics(&self, jail: &str, dataset: Option<&str>) -> error::Result<message::Statistics> {
+    let of = message::StatisticsOf {
       jail: jail.to_string(),
       dataset: dataset.map(str::to_string),
     };
 
-    self.call(Call::Statistics(of), |value| match value {
-      Return::Statistics(statistics) => Some(statistics),
+    self.call(message::Call::Statistics(of), |value| match value {
+      message::Return::Statistics(statistics) => Some(statistics),
       _ => None,
     })
   }
 
   /// Sends SIGTERM to the jail's processes, and waits up to `grace` for them
   /// to exit.
-  pub(crate) fn terminate(&self, jail: &str, grace: Duration) -> Result<()> {
-    self.call_waiting(Call::Terminate, jail, grace)
+  pub(crate) fn terminate(&self, jail: &str, grace: Duration) -> error::Result<()> {
+    self.call_waiting(message::Call::Terminate, jail, grace)
   }
 
   /// Drops the jail's TCP connections.
-  pub(crate) fn drop_connections(&self, jail: &str) -> Result<()> {
-    self.call_for_nothing(Call::DropConnections(jail.to_string()))
+  pub(crate) fn drop_connections(&self, jail: &str) -> error::Result<()> {
+    self.call_for_nothing(message::Call::DropConnections(jail.to_string()))
   }
 
   /// Waits up to `within` for the removed jail to finish dying.
-  pub(crate) fn await_removal(&self, jail: &str, within: Duration) -> Result<()> {
-    self.call_waiting(Call::AwaitRemoval, jail, within)
+  pub(crate) fn await_removal(&self, jail: &str, within: Duration) -> error::Result<()> {
+    self.call_waiting(message::Call::AwaitRemoval, jail, within)
   }
 
   /// Moves the guest's network device with MAC address `mac` into the VNET
   /// jail, and returns the device's name.
-  pub(crate) fn claim(&self, jail: &str, mac: &str) -> Result<String> {
-    let claim = Claim {
+  pub(crate) fn claim(&self, jail: &str, mac: &str) -> error::Result<String> {
+    let claim = message::Claim {
       jail: jail.to_string(),
       mac: mac.to_string(),
     };
 
-    self.call(Call::Claim(claim), name)
+    self.call(message::Call::Claim(claim), name)
   }
 
   /// Brings up the VNET jail's lo0, and sets up the device address and
   /// default route that `addressing` asks for.
-  pub(crate) fn set_address(&self, addressing: Addressing) -> Result<()> {
-    self.call_for_nothing(Call::SetAddress(addressing))
+  pub(crate) fn set_address(&self, addressing: message::Addressing) -> error::Result<()> {
+    self.call_for_nothing(message::Call::SetAddress(addressing))
   }
 
   /// Waits up to `within` for the guest's default route, and for its
   /// interface's link to go active.
-  pub(crate) fn await_route(&self, within: Duration) -> Result<()> {
+  pub(crate) fn await_route(&self, within: Duration) -> error::Result<()> {
     let seconds = u32::try_from(within.as_secs()).unwrap_or(u32::MAX);
 
-    self.call_within(Call::AwaitRoute(seconds), within + AGENT_TIMEOUT, done)
+    self.call_within(message::Call::AwaitRoute(seconds), within + AGENT_TIMEOUT, done)
   }
 
   /// Creates an epair on `bridge`, setting up NAT first if this boot has no
   /// bridge yet, and returns its `a` end's name.
-  pub(crate) fn create_epair(&self, bridge: Bridge) -> Result<String> {
-    self.call(Call::CreateEpair(bridge), name)
+  pub(crate) fn create_epair(&self, bridge: message::Bridge) -> error::Result<String> {
+    self.call(message::Call::CreateEpair(bridge), name)
   }
 
   /// Leases an address from the NAT's DHCP server for the guest's network
   /// device with MAC address `mac`, which may take the agent `LEASING`.
-  pub(crate) fn lease(&self, mac: &str) -> Result<Lease> {
+  pub(crate) fn lease(&self, mac: &str) -> error::Result<message::Lease> {
     self.call_within(
-      Call::Lease(mac.to_string()),
+      message::Call::Lease(mac.to_string()),
       LEASING + AGENT_TIMEOUT,
       |value| match value {
-        Return::Lease(lease) => Some(lease),
+        message::Return::Lease(lease) => Some(lease),
         _ => None,
       },
     )
@@ -399,8 +392,13 @@ impl Agent {
 
   /// Makes the Call that `call` builds from a JailWait for `jail` and `wait`,
   /// and gives the agent `wait` longer than usual to answer.
-  fn call_waiting(&self, call: fn(JailWait) -> Call, jail: &str, wait: Duration) -> Result<()> {
-    let call = call(JailWait {
+  fn call_waiting(
+    &self,
+    call: fn(message::JailWait) -> message::Call,
+    jail: &str,
+    wait: Duration,
+  ) -> error::Result<()> {
+    let call = call(message::JailWait {
       jail: jail.to_string(),
       seconds: u32::try_from(wait.as_secs()).unwrap_or(u32::MAX),
     });
@@ -409,60 +407,73 @@ impl Agent {
   }
 
   /// Makes `call`, which returns Done.
-  fn call_for_nothing(&self, call: Call) -> Result<()> {
+  fn call_for_nothing(&self, call: message::Call) -> error::Result<()> {
     self.call(call, done)
   }
 
   /// Makes `call`, and returns what `take` finds in the agent's answer:
   /// `None` if the answer isn't the variant the call returns.
-  fn call<T>(&self, call: Call, take: impl FnOnce(Return) -> Option<T>) -> Result<T> {
+  fn call<T>(&self, call: message::Call, take: impl FnOnce(message::Return) -> Option<T>) -> error::Result<T> {
     self.call_within(call, AGENT_TIMEOUT, take)
   }
 
   /// Like `call`, giving the agent `timeout` to answer.
-  fn call_within<T>(&self, call: Call, timeout: Duration, take: impl FnOnce(Return) -> Option<T>) -> Result<T> {
+  fn call_within<T>(
+    &self,
+    call: message::Call,
+    timeout: Duration,
+    take: impl FnOnce(message::Return) -> Option<T>,
+  ) -> error::Result<T> {
     let what = call.to_string();
-    let stream = self.open_unanswered(Message::Call(call), what, None)?;
+    let stream = self.open_unanswered(message::Message::Call(call), what, None)?;
 
     match stream.answer(timeout)? {
-      Message::Return(value) => take(value).ok_or_else(|| stream.misreturned()),
+      message::Message::Return(value) => take(value).ok_or_else(|| stream.misreturned()),
       other => Err(stream.unexpected(&other)),
     }
   }
 
   /// Opens a channel with `message` and waits for the agent to send Opened.
   /// For a Listen channel, connections are relayed to `host`.
-  fn open(&self, message: Message, what: String, host: Option<PathBuf>) -> Result<Stream> {
+  fn open(&self, message: message::Message, what: String, host: Option<PathBuf>) -> error::Result<channel::Stream> {
     self.open_unanswered(message, what, host)?.opened()
   }
 
   /// Opens a channel with `message`, without waiting for the agent.
-  fn open_unanswered(&self, message: Message, what: String, host: Option<PathBuf>) -> Result<Stream> {
+  fn open_unanswered(
+    &self,
+    message: message::Message,
+    what: String,
+    host: Option<PathBuf>,
+  ) -> error::Result<channel::Stream> {
     let (sender, receiver) = mpsc::channel();
     let (channel, written) = {
       let mut state = self.shared.lock();
-      let (channel, frame) = state.mux.open(message).map_err(Error::protocol(&what))?;
+      let (channel, frame) = state
+        .mux
+        .open(message)
+        .map_err(error::Error::protocol(&what))?;
       state
         .channels
-        .insert(channel, Route { sender, relay_to: host });
+        .insert(channel, session::Route { sender, relay_to: host });
       (channel, state.queue(frame))
     };
 
     written.wait()?;
-    Ok(Stream::new(channel, self.shared.clone(), receiver, what))
+    Ok(channel::Stream::new(channel, self.shared.clone(), receiver, what))
   }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
   use super::*;
-  use containerization_freebsd_protocol::{Decoder, Mux, Side, VERSION, WINDOW};
+  use containerization_freebsd_protocol::{frame, mux};
   use std::io::{Read, Write};
   use std::net::TcpListener;
 
   /// Far longer than any of these tests' commands take.
   const TIMEOUT: Duration = Duration::from_secs(10);
-  const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
+  const TERMINAL: message::WindowSize = message::WindowSize { rows: 24, columns: 80 };
   /// FreeBSD and macOS use the same number for SIGTERM.
   const SIGTERM: i32 = 15;
 
@@ -471,7 +482,7 @@ pub(crate) mod tests {
   fn serve() -> (PipeReader, PipeWriter) {
     let (output, agent_output) = std::io::pipe().unwrap();
     let (agent_input, input) = std::io::pipe().unwrap();
-    std::thread::spawn(move || containerization_freebsd_agent::serve(agent_input, agent_output));
+    std::thread::spawn(move || containerization_freebsd_agent::session::serve(agent_input, agent_output));
     (output, input)
   }
 
@@ -483,12 +494,12 @@ pub(crate) mod tests {
   }
 
   /// Reads the process's stdout until it contains `text`.
-  fn read_until(process: &Process, text: &str) -> String {
+  fn read_until(process: &channel::Process, text: &str) -> String {
     let mut output = String::new();
 
     while !output.contains(text) {
       match process.recv_timeout(TIMEOUT).unwrap() {
-        Some(Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
+        Some(channel::Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
         other => panic!("{other:?} before {text:?}, after {output:?}"),
       }
     }
@@ -497,13 +508,13 @@ pub(crate) mod tests {
 
   /// Reads the process's stdout until it exits, and returns the output and
   /// exit status.
-  fn finish(process: &Process) -> (String, Exit) {
+  fn finish(process: &channel::Process) -> (String, message::Exit) {
     let mut output = String::new();
 
     loop {
       match process.recv_timeout(TIMEOUT).unwrap() {
-        Some(Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
-        Some(Output::Exited(exit)) => return (output, exit),
+        Some(channel::Output::Stdout(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
+        Some(channel::Output::Exited(exit)) => return (output, exit),
         other => panic!("{other:?} after {output:?}"),
       }
     }
@@ -527,8 +538,8 @@ pub(crate) mod tests {
   fn rejoins_an_agent_that_does_not_announce_itself() {
     let (mut output, input) = serve();
     // Simulates a restore: the agent announced itself to an earlier host.
-    let announcement = Message::Hello {
-      version: VERSION,
+    let announcement = message::Message::Hello {
+      version: mux::VERSION,
       answer: false,
     }
     .frame(0)
@@ -564,8 +575,8 @@ pub(crate) mod tests {
     assert!(
       matches!(
         &error,
-        Error::Protocol {
-          error: containerization_freebsd_protocol::Error::NoSession,
+        error::Error::Protocol {
+          error: mux::Error::NoSession,
           ..
         }
       ),
@@ -582,7 +593,7 @@ pub(crate) mod tests {
       .run(&["sh", "-c", "echo out; echo err >&2; exit 2"], TIMEOUT)
       .unwrap();
 
-    assert_eq!(ran.exit, Exit::Code(2));
+    assert_eq!(ran.exit, message::Exit::Code(2));
     assert_eq!(ran.lines(), ["out"]);
     assert_eq!(ran.stderr, "err\n");
   }
@@ -605,7 +616,7 @@ pub(crate) mod tests {
     let error = agent
       .run(&["sleep", "30"], Duration::from_millis(200))
       .unwrap_err();
-    assert!(matches!(error, Error::Timeout(_)), "{error}");
+    assert!(matches!(error, error::Error::Timeout(_)), "{error}");
 
     let ran = agent.check(&["echo", "next"], TIMEOUT).unwrap();
     assert_eq!(ran.lines(), ["next"]);
@@ -616,7 +627,7 @@ pub(crate) mod tests {
     let agent = started();
 
     let error = agent
-      .spawn(Exec::new(["/nonexistent/command"]))
+      .spawn(message::Exec::new(["/nonexistent/command"]))
       .err()
       .unwrap();
 
@@ -630,14 +641,17 @@ pub(crate) mod tests {
     let root = directory.path().to_str().unwrap();
     std::fs::write(directory.path().join("file"), "").unwrap();
 
-    assert_eq!(agent.file_type(root).unwrap(), FileType::Directory);
-    assert_eq!(agent.file_type(&format!("{root}/file")).unwrap(), FileType::File);
+    assert_eq!(agent.file_type(root).unwrap(), message::FileType::Directory);
+    assert_eq!(
+      agent.file_type(&format!("{root}/file")).unwrap(),
+      message::FileType::File
+    );
     assert_eq!(
       agent.file_type(&format!("{root}/file/under")).unwrap(),
-      FileType::Missing
+      message::FileType::Missing
     );
     let error = agent
-      .file_type_at(GuestPath {
+      .file_type_at(message::GuestPath {
         path: root.to_string(),
         jail: Some("cfbsd-no-such-jail".into()),
       })
@@ -649,19 +663,19 @@ pub(crate) mod tests {
   fn feeds_a_process_its_input() {
     let agent = started();
 
-    let process = agent.spawn(Exec::new(["cat"])).unwrap();
+    let process = agent.spawn(message::Exec::new(["cat"])).unwrap();
     process.write(b"fed\n").unwrap();
     process.close_input().unwrap();
 
-    assert_eq!(finish(&process), ("fed\n".to_string(), Exit::Code(0)));
+    assert_eq!(finish(&process), ("fed\n".to_string(), message::Exit::Code(0)));
   }
 
   #[test]
   fn closing_the_input_of_a_process_that_exited_does_nothing() {
     let agent = started();
 
-    let process = agent.spawn(Exec::new(["true"])).unwrap();
-    assert_eq!(finish(&process), (String::new(), Exit::Code(0)));
+    let process = agent.spawn(message::Exec::new(["true"])).unwrap();
+    assert_eq!(finish(&process), (String::new(), message::Exit::Code(0)));
 
     process.close_input().unwrap();
   }
@@ -669,21 +683,24 @@ pub(crate) mod tests {
   #[test]
   fn feeds_input_many_windows_long() {
     let agent = started();
-    let input = vec![b'x'; 300 * WINDOW + 1];
+    let input = vec![b'x'; 300 * mux::WINDOW + 1];
 
-    let process = agent.spawn(Exec::new(["wc", "-c"])).unwrap();
+    let process = agent.spawn(message::Exec::new(["wc", "-c"])).unwrap();
     process.write(&input).unwrap();
     process.close_input().unwrap();
 
     let (output, exit) = finish(&process);
-    assert_eq!((output.trim(), exit), (input.len().to_string().as_str(), Exit::Code(0)));
+    assert_eq!(
+      (output.trim(), exit),
+      (input.len().to_string().as_str(), message::Exit::Code(0))
+    );
   }
 
   /// A guest that speaks the protocol by hand and never reports what it read
   /// from the console, so the host's window stays shut once it fills.
   struct SilentGuest {
-    mux: Mux,
-    decoder: Decoder,
+    mux: mux::Mux,
+    decoder: frame::Decoder,
     input: PipeReader,
     output: PipeWriter,
   }
@@ -695,8 +712,8 @@ pub(crate) mod tests {
       let (guest_input, input) = std::io::pipe().unwrap();
       let agent = Agent::new(output, input);
       let mut guest = Self {
-        mux: Mux::new(Side::Guest),
-        decoder: Decoder::new(),
+        mux: mux::Mux::new(mux::Side::Guest),
+        decoder: frame::Decoder::new(),
         input: guest_input,
         output: guest_output,
       };
@@ -714,13 +731,13 @@ pub(crate) mod tests {
       self.output.write_all(&hello.to_bytes()).unwrap();
     }
 
-    fn send(&mut self, channel: u32, message: Message) {
+    fn send(&mut self, channel: u32, message: message::Message) {
       let frame = self.mux.send(channel, message).unwrap();
       self.output.write_all(&frame.to_bytes()).unwrap();
     }
 
     /// Returns the host's next message.
-    fn receive(&mut self) -> (u32, Message) {
+    fn receive(&mut self) -> (u32, message::Message) {
       loop {
         if let Some(decoded) = self.decoder.decode() {
           return self.mux.receive(decoded.unwrap()).unwrap();
@@ -741,27 +758,27 @@ pub(crate) mod tests {
   fn routes_what_the_agent_sends_while_a_write_waits_for_room() {
     let (agent, mut guest) = SilentGuest::start();
     let (cat, channel) = std::thread::scope(|scope| {
-      let spawning = scope.spawn(|| agent.spawn(Exec::new(["cat"])).unwrap());
+      let spawning = scope.spawn(|| agent.spawn(message::Exec::new(["cat"])).unwrap());
       // The host sets the guest's clock first.
       let channel = loop {
-        if let (channel, Message::Exec(_)) = guest.receive() {
+        if let (channel, message::Message::Exec(_)) = guest.receive() {
           break channel;
         }
       };
-      guest.send(channel, Message::Opened);
+      guest.send(channel, message::Message::Opened);
       (spawning.join().unwrap(), channel)
     });
 
     // The Exec frame is longer than the window, so writing it stops partway.
-    let argument = "y".repeat(2 * WINDOW);
+    let argument = "y".repeat(2 * mux::WINDOW);
     std::thread::scope(|scope| {
-      let blocked = scope.spawn(|| agent.spawn(Exec::new(["echo", argument.as_str()])));
+      let blocked = scope.spawn(|| agent.spawn(message::Exec::new(["echo", argument.as_str()])));
       guest.read();
 
-      guest.send(channel, Message::Data(b"routed".to_vec()));
+      guest.send(channel, message::Message::Data(b"routed".to_vec()));
       assert!(matches!(
         cat.recv_timeout(TIMEOUT).unwrap(),
-        Some(Output::Stdout(bytes)) if bytes == b"routed"
+        Some(channel::Output::Stdout(bytes)) if bytes == b"routed"
       ));
       assert!(!blocked.is_finished());
       // Closing the console fails the write instead of leaving it to time out.
@@ -773,7 +790,7 @@ pub(crate) mod tests {
   #[test]
   fn sends_a_frame_longer_than_the_window() {
     let agent = started();
-    let argument = "y".repeat(4 * WINDOW);
+    let argument = "y".repeat(4 * mux::WINDOW);
 
     let ran = agent.check(&["printf", "%s", &argument], TIMEOUT).unwrap();
 
@@ -784,10 +801,10 @@ pub(crate) mod tests {
   fn signals_a_process() {
     let agent = started();
 
-    let process = agent.spawn(Exec::new(["sleep", "30"])).unwrap();
+    let process = agent.spawn(message::Exec::new(["sleep", "30"])).unwrap();
     process.signal(SIGTERM).unwrap();
 
-    assert_eq!(finish(&process).1, Exit::Signal(SIGTERM));
+    assert_eq!(finish(&process).1, message::Exit::Signal(SIGTERM));
   }
 
   #[test]
@@ -795,27 +812,27 @@ pub(crate) mod tests {
     let agent = started();
 
     let process = agent
-      .spawn(Exec {
+      .spawn(message::Exec {
         pty: Some(TERMINAL),
-        ..Exec::new(["sh", "-c", "stty size; read line; stty size"])
+        ..message::Exec::new(["sh", "-c", "stty size; read line; stty size"])
       })
       .unwrap();
     read_until(&process, "24 80");
     process
-      .resize(WindowSize { rows: 40, columns: 100 })
+      .resize(message::WindowSize { rows: 40, columns: 100 })
       .unwrap();
     process.write(b"\n").unwrap();
 
     let (output, exit) = finish(&process);
     assert!(output.contains("40 100"), "{output:?}");
-    assert_eq!(exit, Exit::Code(0));
+    assert_eq!(exit, message::Exit::Code(0));
   }
 
   #[test]
   fn dropping_a_process_kills_it() {
     let agent = started();
     let process = agent
-      .spawn(Exec::new(["sh", "-c", "echo $$; exec sleep 30"]))
+      .spawn(message::Exec::new(["sh", "-c", "echo $$; exec sleep 30"]))
       .unwrap();
     let pid = read_until(&process, "\n").trim().to_string();
 

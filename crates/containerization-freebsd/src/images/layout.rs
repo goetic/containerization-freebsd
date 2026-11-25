@@ -1,25 +1,23 @@
 //! Loading images from, and saving them to, OCI image layouts.
 
-use super::{Image, ImageStore, LAYOUT};
-use crate::error::{Error, Result};
-use crate::oci::{BLOBS, Descriptor, Digest, Document, Index, Platform, REF_NAME, blob_path, parse};
+use crate::{digest, error, oci};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-impl ImageStore {
+impl super::ImageStore {
   /// Loads the images in the OCI image layout at `directory`, like
   /// Containerization's `load(from:)`. An archived layout, such as FreeBSD's
   /// container images on download.freebsd.org, must be extracted first. Each
-  /// image is named by its `REF_NAME` annotation, normalized like any
+  /// image is named by its `oci::REF_NAME` annotation, normalized like any
   /// reference, so `freebsd-static:15.1-RELEASE-aarch64` becomes
   /// `docker.io/library/freebsd-static:15.1-RELEASE-aarch64`. Blobs already
   /// in the store are not copied.
-  pub fn load(&self, directory: &Path) -> Result<Vec<Image>> {
+  pub fn load(&self, directory: &Path) -> error::Result<Vec<super::Image>> {
     let path = directory.join("index.json");
-    let bytes = std::fs::read(&path).map_err(Error::io(format!("reading {}", path.display())))?;
-    let index: Index = parse(&bytes, &path.display().to_string())?;
+    let bytes = std::fs::read(&path).map_err(error::Error::io(format!("reading {}", path.display())))?;
+    let index: oci::Index = oci::parse(&bytes, &path.display().to_string())?;
     let _blobs = self.using_blobs()?;
 
     index
@@ -28,13 +26,13 @@ impl ImageStore {
       .map(|descriptor| {
         let name = descriptor
           .annotations
-          .get(REF_NAME)
+          .get(oci::REF_NAME)
           .cloned()
-          .ok_or_else(|| Error::Invalid(format!("{} has an image with no {REF_NAME}", path.display())))?;
+          .ok_or_else(|| error::Error::Invalid(format!("{} has an image with no {}", path.display(), oci::REF_NAME)))?;
         self.import(directory, &descriptor)?;
         let needed = self.reachable(std::slice::from_ref(&descriptor))?;
         if let Some(missing) = self.missing(&needed) {
-          return Err(Error::Invalid(format!(
+          return Err(error::Error::Invalid(format!(
             "{} lacks blob {missing} of {name}",
             directory.display()
           )));
@@ -49,37 +47,39 @@ impl ImageStore {
   /// `save(references:out:platform:)`. With `platform`, an index is saved as
   /// a new index of only that platform's manifests. `out` is created if
   /// needed, and any `index.json` there is replaced.
-  pub fn save(&self, references: &[&str], out: &Path, platform: Option<&Platform>) -> Result<()> {
+  pub fn save(&self, references: &[&str], out: &Path, platform: Option<&oci::Platform>) -> error::Result<()> {
     let _blobs = self.using_blobs()?;
     let manifests = references
       .iter()
       .map(|reference| self.for_platform(&self.get(reference)?, platform))
-      .collect::<Result<Vec<_>>>()?;
+      .collect::<error::Result<Vec<_>>>()?;
     let needed = self.reachable(&manifests)?;
     if let Some(missing) = self.missing(&needed) {
-      return Err(Error::Invalid(format!(
+      return Err(error::Error::Invalid(format!(
         "the store lacks blob {missing} of {references:?}"
       )));
     }
 
-    let blobs = out.join(BLOBS);
-    std::fs::create_dir_all(&blobs).map_err(Error::io(format!("making {}", blobs.display())))?;
+    let blobs = out.join(oci::content::BLOBS);
+    std::fs::create_dir_all(&blobs).map_err(error::Error::io(format!("making {}", blobs.display())))?;
     for digest in &needed {
-      let saved = blob_path(out, digest)?;
+      let saved = oci::content::blob_path(out, digest)?;
       if !saved.exists() {
-        std::fs::copy(self.content.path(digest)?, &saved).map_err(Error::io(format!("writing {}", saved.display())))?;
+        std::fs::copy(self.content.path(digest)?, &saved)
+          .map_err(error::Error::io(format!("writing {}", saved.display())))?;
       }
     }
-    let index = Index {
+    let index = oci::Index {
       manifests,
-      ..Index::default()
+      ..oci::Index::default()
     };
-    let index = serde_json::to_vec(&index).map_err(|error| Error::Invalid(format!("an index to save: {error}")))?;
-    for (name, bytes) in [("oci-layout", LAYOUT.as_bytes()), ("index.json", &index)] {
+    let index =
+      serde_json::to_vec(&index).map_err(|error| error::Error::Invalid(format!("an index to save: {error}")))?;
+    for (name, bytes) in [("oci-layout", super::LAYOUT.as_bytes()), ("index.json", &index)] {
       let partial = out.join(format!("{name}.partial"));
       std::fs::write(&partial, bytes)
         .and_then(|()| std::fs::rename(&partial, out.join(name)))
-        .map_err(Error::io(format!("writing {}", out.join(name).display())))?;
+        .map_err(error::Error::io(format!("writing {}", out.join(name).display())))?;
     }
     Ok(())
   }
@@ -88,17 +88,17 @@ impl ImageStore {
   /// `directory`, skipping blobs the store has. Absent blobs are skipped
   /// too, since an index's manifests may be absent, as after a pull;
   /// `missing` reports any others afterwards.
-  fn import(&self, directory: &Path, descriptor: &Descriptor) -> Result<()> {
+  fn import(&self, directory: &Path, descriptor: &oci::Descriptor) -> error::Result<()> {
     if !self.copy_in(directory, &descriptor.digest)? {
       return Ok(());
     }
 
     match self.content.document(descriptor)? {
-      Document::Index(index) => index
+      oci::Document::Index(index) => index
         .manifests
         .iter()
         .try_for_each(|child| self.import(directory, child)),
-      Document::Manifest(manifest) => manifest
+      oci::Document::Manifest(manifest) => manifest
         .blobs()
         .try_for_each(|blob| self.copy_in(directory, &blob.digest).map(drop)),
     }
@@ -106,23 +106,23 @@ impl ImageStore {
 
   /// Copies the blob `digest` from the layout at `directory` unless the
   /// store has it. Returns whether the store has it afterwards.
-  fn copy_in(&self, directory: &Path, digest: &Digest) -> Result<bool> {
+  fn copy_in(&self, directory: &Path, digest: &digest::Digest) -> error::Result<bool> {
     if self.content.has(digest) {
       return Ok(true);
     }
-    let path = blob_path(directory, digest)?;
+    let path = oci::content::blob_path(directory, digest)?;
 
     match File::open(&path) {
       Ok(mut file) => self.content.ingest_from(&mut file, digest).map(|()| true),
       Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-      Err(error) => Err(Error::io(format!("reading {}", path.display()))(error)),
+      Err(error) => Err(error::Error::io(format!("reading {}", path.display()))(error)),
     }
   }
 
   /// A blob in `needed`, as `reachable` returns it, that the store lacks.
   /// Missing manifests aren't reported, since `reachable` skips them: a pull
   /// fetches only one platform's manifest.
-  fn missing<'a>(&self, needed: &'a BTreeSet<Digest>) -> Option<&'a Digest> {
+  fn missing<'a>(&self, needed: &'a BTreeSet<digest::Digest>) -> Option<&'a digest::Digest> {
     needed.iter().find(|digest| !self.content.has(digest))
   }
 }
@@ -130,8 +130,8 @@ impl ImageStore {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::images::tests::{descriptor, documents, json, registry};
-  use crate::oci::{RegistryClient, media_type};
+  use crate::images;
+  use crate::oci::media_type;
   use std::path::PathBuf;
 
   #[test]
@@ -141,10 +141,14 @@ mod tests {
       tempfile::tempdir().unwrap(),
       tempfile::tempdir().unwrap(),
     );
-    let store = ImageStore::new(pulled.path()).unwrap();
-    let reference = format!("{}/test/image:1", registry());
+    let store = images::ImageStore::new(pulled.path()).unwrap();
+    let reference = format!("{}/test/image:1", images::tests::registry());
     store
-      .pull(&reference, &Platform::default(), &RegistryClient::default())
+      .pull(
+        &reference,
+        &oci::Platform::default(),
+        &oci::registry::RegistryClient::default(),
+      )
       .unwrap();
     store.tag(&reference, "ghcr.io/test/other:2").unwrap();
     let layout = work.path().join("layout");
@@ -152,8 +156,11 @@ mod tests {
     store
       .save(&[&reference, "ghcr.io/test/other:2"], &layout, None)
       .unwrap();
-    assert_eq!(std::fs::read_to_string(layout.join("oci-layout")).unwrap(), LAYOUT);
-    let other = ImageStore::new(loaded.path()).unwrap();
+    assert_eq!(
+      std::fs::read_to_string(layout.join("oci-layout")).unwrap(),
+      images::LAYOUT
+    );
+    let other = images::ImageStore::new(loaded.path()).unwrap();
     let images = other.load(&layout).unwrap();
 
     let names: Vec<&str> = images
@@ -168,7 +175,7 @@ mod tests {
     let config = other
       .get(&reference)
       .unwrap()
-      .config(&Platform::default())
+      .config(&oci::Platform::default())
       .unwrap();
     assert_eq!(config.config.unwrap().cmd, Some(vec!["/bin/sh".to_string()]));
     let mut digests = store.content().digests().unwrap();
@@ -181,10 +188,10 @@ mod tests {
     // manifest.
     let arm64 = work.path().join("arm64");
     store
-      .save(&[&reference], &arm64, Some(&Platform::default()))
+      .save(&[&reference], &arm64, Some(&oci::Platform::default()))
       .unwrap();
     let third = tempfile::tempdir().unwrap();
-    let saved = ImageStore::new(third.path()).unwrap();
+    let saved = images::ImageStore::new(third.path()).unwrap();
     let image = saved.load(&arm64).unwrap().remove(0);
     assert_ne!(
       image.descriptor.digest,
@@ -192,27 +199,27 @@ mod tests {
     );
     assert_eq!(
       saved
-        .platforms(&reference, &RegistryClient::default())
+        .platforms(&reference, &oci::registry::RegistryClient::default())
         .unwrap(),
-      [Platform::default()]
+      [oci::Platform::default()]
     );
   }
 
   /// Writes an OCI image layout at `root` holding the blobs `files`, with an
   /// index that names `manifest`'s image `name`.
   fn layout(root: &Path, name: &str, manifest: &[u8], files: &[&[u8]]) -> PathBuf {
-    let mut entry = descriptor(media_type::MANIFEST, manifest, None);
+    let mut entry = images::tests::descriptor(media_type::MANIFEST, manifest, None);
     entry
       .annotations
-      .insert(REF_NAME.to_string(), name.to_string());
-    let index = json(&Index {
+      .insert(oci::REF_NAME.to_string(), name.to_string());
+    let index = images::tests::json(&oci::Index {
       manifests: vec![entry],
-      ..Index::default()
+      ..oci::Index::default()
     });
-    std::fs::create_dir_all(root.join(BLOBS)).unwrap();
+    std::fs::create_dir_all(root.join(oci::content::BLOBS)).unwrap();
     std::fs::write(root.join("index.json"), index).unwrap();
     for file in files {
-      std::fs::write(blob_path(root, &Digest::of(file)).unwrap(), file).unwrap();
+      std::fs::write(oci::content::blob_path(root, &digest::Digest::of(file)).unwrap(), file).unwrap();
     }
     root.to_path_buf()
   }
@@ -220,8 +227,8 @@ mod tests {
   #[test]
   fn loads_a_layout_naming_its_image_as_freebsd_does() {
     let (root, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let store = ImageStore::new(root.path()).unwrap();
-    let (layer, config, manifest) = documents();
+    let store = images::ImageStore::new(root.path()).unwrap();
+    let (layer, config, manifest) = images::tests::documents();
     let directory = layout(
       work.path(),
       "freebsd-static:15.1-RELEASE-aarch64",
@@ -235,29 +242,46 @@ mod tests {
       images[0].reference,
       "docker.io/library/freebsd-static:15.1-RELEASE-aarch64"
     );
-    assert!(store.content().has(&Digest::of(&layer)));
+    assert!(store.content().has(&digest::Digest::of(&layer)));
   }
 
   #[test]
   fn refuses_a_layout_with_a_blob_missing_or_not_its_digest() {
     let (root, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let store = ImageStore::new(root.path()).unwrap();
-    let (layer, config, manifest) = documents();
+    let store = images::ImageStore::new(root.path()).unwrap();
+    let (layer, config, manifest) = images::tests::documents();
     let name = "ghcr.io/test/image:1";
 
     let empty = layout(&work.path().join("empty"), name, &manifest, &[]);
     let error = store.load(&empty).unwrap_err();
-    assert!(error.to_string().contains(Digest::of(&manifest).as_str()), "{error}");
+    assert!(
+      error
+        .to_string()
+        .contains(digest::Digest::of(&manifest).as_str()),
+      "{error}"
+    );
 
     let lacking = layout(&work.path().join("lacking"), name, &manifest, &[&manifest, &config]);
     let error = store.load(&lacking).unwrap_err();
-    assert!(error.to_string().contains(Digest::of(&layer).as_str()), "{error}");
+    assert!(
+      error
+        .to_string()
+        .contains(digest::Digest::of(&layer).as_str()),
+      "{error}"
+    );
 
     // The previous load left the manifest and config in the store, but not
     // the layer.
     let forged = layout(&work.path().join("forged"), name, &manifest, &[]);
-    std::fs::write(blob_path(&forged, &Digest::of(&layer)).unwrap(), "something else").unwrap();
-    assert!(matches!(store.load(&forged).unwrap_err(), Error::Checksum { .. }));
+    std::fs::write(
+      oci::content::blob_path(&forged, &digest::Digest::of(&layer)).unwrap(),
+      "something else",
+    )
+    .unwrap();
+    assert!(matches!(
+      store.load(&forged).unwrap_err(),
+      error::Error::Checksum { .. }
+    ));
     assert!(store.list().unwrap().is_empty());
   }
 }

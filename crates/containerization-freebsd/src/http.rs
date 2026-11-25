@@ -3,8 +3,7 @@
 //! or 504 response, as curl's `--retry` does. A download hashes its body as it
 //! writes it, and resumes with a Range request if the body breaks off.
 
-use crate::digest::Hashing;
-use crate::error::{Error, Result};
+use crate::{digest, error};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -120,7 +119,7 @@ impl Response {
 
   /// The response, if it carries the content `request` asks for: a 200, or a
   /// 206 to a request that resumes. Otherwise, the error for it.
-  pub(crate) fn content(self, request: &Request) -> Result<Self> {
+  pub(crate) fn content(self, request: &Request) -> error::Result<Self> {
     match (self.status(), request.from) {
       (200, _) | (206, 1..) => Ok(self),
       _ => Err(self.unexpected(request)),
@@ -128,7 +127,7 @@ impl Response {
   }
 
   /// Reads the whole body, failing if it is over `limit` bytes.
-  pub(crate) fn body(self, request: &Request, limit: u64) -> Result<Vec<u8>> {
+  pub(crate) fn body(self, request: &Request, limit: u64) -> error::Result<Vec<u8>> {
     self
       .0
       .into_body()
@@ -140,7 +139,7 @@ impl Response {
 
   /// The error for a response to `request` with a status it didn't expect,
   /// quoting the start of the body.
-  pub(crate) fn unexpected(self, request: &Request) -> Error {
+  pub(crate) fn unexpected(self, request: &Request) -> error::Error {
     let status = self.status();
     let mut start = Vec::new();
     let _ = self
@@ -150,7 +149,7 @@ impl Response {
       .take(SNIPPET)
       .read_to_end(&mut start);
 
-    Error::Command {
+    error::Error::Command {
       command: request.to_string(),
       failure: format!("HTTP {status}: {}", String::from_utf8_lossy(&start).trim()),
     }
@@ -171,7 +170,7 @@ impl Response {
 /// Sends `request` with `authorization` as its Authorization header,
 /// retrying failures to resolve or connect and transient statuses. Once the
 /// retries run out, a transient status is returned like any other.
-pub(crate) fn send(agent: &Agent, request: &Request, authorization: Option<&str>) -> Result<Response> {
+pub(crate) fn send(agent: &Agent, request: &Request, authorization: Option<&str>) -> error::Result<Response> {
   let mut retries = 0;
 
   loop {
@@ -180,7 +179,7 @@ pub(crate) fn send(agent: &Agent, request: &Request, authorization: Option<&str>
       .upload
       .map(File::open)
       .transpose()
-      .map_err(|error| Error::Io {
+      .map_err(|error| error::Error::Io {
         action: format!("reading the body of {request}"),
         error,
       })?;
@@ -253,8 +252,8 @@ fn backoff(retries: u32) -> Duration {
   BACKOFF * 2u32.pow(retries)
 }
 
-fn failed(request: &Request, error: &dyn fmt::Display) -> Error {
-  Error::Command {
+fn failed(request: &Request, error: &dyn fmt::Display) -> error::Error {
+  error::Error::Command {
     command: request.to_string(),
     failure: error.to_string(),
   }
@@ -276,13 +275,13 @@ pub(crate) fn download(
   path: &Path,
   limit: Option<u64>,
   what: &str,
-  mut get: impl FnMut(u64) -> Result<Response>,
-) -> Result<Downloaded> {
+  mut get: impl FnMut(u64) -> error::Result<Response>,
+) -> error::Result<Downloaded> {
   let writing = || format!("writing {}", path.display());
   let create = || {
     File::create(path)
-      .map(Hashing::new)
-      .map_err(Error::io(writing()))
+      .map(digest::Hashing::new)
+      .map_err(error::Error::io(writing()))
   };
   let mut file = create()?;
   let mut size = 0;
@@ -306,16 +305,16 @@ pub(crate) fn download(
       Err(Append::Read(error)) => {
         stalls = if size > before { 0 } else { stalls + 1 };
         if stalls > RETRIES {
-          return Err(Error::Command {
+          return Err(error::Error::Command {
             command: what.to_string(),
             failure: error.to_string(),
           });
         }
         std::thread::sleep(backoff(stalls));
       }
-      Err(Append::Write(error)) => return Err(Error::io(writing())(error)),
+      Err(Append::Write(error)) => return Err(error::Error::io(writing())(error)),
       Err(Append::OverLimit(limit)) => {
-        return Err(Error::Guest(format!(
+        return Err(error::Error::Guest(format!(
           "{what}: the response body is over the {limit}-byte limit"
         )));
       }
@@ -333,7 +332,7 @@ enum Append {
 /// Appends `response`'s body to `file`, counting what it appends in `size`.
 fn append(
   response: Response,
-  file: &mut Hashing<File>,
+  file: &mut digest::Hashing<File>,
   size: &mut u64,
   limit: Option<u64>,
 ) -> std::result::Result<(), Append> {
@@ -362,15 +361,14 @@ fn append(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::digest::Digest;
-  use crate::testing::{self, serve_in_order};
+  use crate::testing;
 
   fn get(url: &str) -> Request<'static> {
     Request::new(Method::Get, Url::parse(url).unwrap())
   }
 
   /// Downloads `url` into `path` as a registry or release download does.
-  fn download_from(url: &str, path: &Path, limit: Option<u64>) -> Result<Downloaded> {
+  fn download_from(url: &str, path: &Path, limit: Option<u64>) -> error::Result<Downloaded> {
     let agent = agent();
     let mut request = get(url);
 
@@ -386,7 +384,7 @@ mod tests {
 
   #[test]
   fn retries_a_transient_status_until_it_clears() {
-    let (url, requests) = serve_in_order(vec![
+    let (url, requests) = testing::serve_in_order(vec![
       testing::Response::status("503 Service Unavailable").header("Retry-After", "0".into()),
       testing::Response::status("502 Bad Gateway"),
       testing::Response::ok(b"done".to_vec()),
@@ -403,7 +401,7 @@ mod tests {
   #[test]
   fn returns_a_transient_status_once_its_retries_run_out() {
     let unavailable = || testing::Response::status("503 Service Unavailable");
-    let (url, requests) = serve_in_order((0..=RETRIES).map(|_| unavailable()).collect());
+    let (url, requests) = testing::serve_in_order((0..=RETRIES).map(|_| unavailable()).collect());
 
     let response = send(&agent(), &get(&url), None).unwrap();
 
@@ -415,7 +413,7 @@ mod tests {
   fn resumes_a_download_that_breaks_off() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("download");
-    let (url, requests) = serve_in_order(vec![
+    let (url, requests) = testing::serve_in_order(vec![
       testing::Response::ok(b"hello, world".to_vec()).cut(5),
       testing::Response::status("206 Partial Content").body(b", world".to_vec()),
     ]);
@@ -423,7 +421,10 @@ mod tests {
     let downloaded = download_from(&url, &path, None).unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), b"hello, world");
-    assert_eq!(Digest::from_sha256(&downloaded.sha256), Digest::of(b"hello, world"));
+    assert_eq!(
+      digest::Digest::from_sha256(&downloaded.sha256),
+      digest::Digest::of(b"hello, world")
+    );
     assert_eq!(downloaded.size, 12);
     let requests = requests.lock().unwrap();
     assert_eq!(range(&requests[0]), None);
@@ -434,7 +435,7 @@ mod tests {
   fn starts_over_when_the_server_sends_the_whole_body_again() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("download");
-    let (url, _) = serve_in_order(vec![
+    let (url, _) = testing::serve_in_order(vec![
       testing::Response::ok(b"hello, world".to_vec()).cut(5),
       testing::Response::ok(b"hello, world".to_vec()),
     ]);
@@ -448,14 +449,14 @@ mod tests {
   #[test]
   fn refuses_a_body_over_its_limit() {
     let directory = tempfile::tempdir().unwrap();
-    let (url, _) = serve_in_order(vec![testing::Response::ok(b"too long".to_vec())]);
+    let (url, _) = testing::serve_in_order(vec![testing::Response::ok(b"too long".to_vec())]);
 
     let error = download_from(&url, &directory.path().join("download"), Some(4))
       .err()
       .unwrap();
 
     assert!(
-      matches!(&error, Error::Guest(message) if message.ends_with("over the 4-byte limit")),
+      matches!(&error, error::Error::Guest(message) if message.ends_with("over the 4-byte limit")),
       "{error}"
     );
   }
@@ -463,7 +464,7 @@ mod tests {
   #[test]
   fn fails_on_a_status_that_carries_no_content() {
     let directory = tempfile::tempdir().unwrap();
-    let (url, _) = serve_in_order(vec![
+    let (url, _) = testing::serve_in_order(vec![
       testing::Response::status("404 Not Found").header("Content-Type", "text/plain".into()),
     ]);
 
@@ -472,7 +473,7 @@ mod tests {
       .unwrap();
 
     assert!(
-      matches!(&error, Error::Command { failure, .. } if failure.starts_with("HTTP 404")),
+      matches!(&error, error::Error::Command { failure, .. } if failure.starts_with("HTTP 404")),
       "{error}"
     );
   }

@@ -1,8 +1,7 @@
 //! Looking up jails by name, attaching to them, finding the type of file at a
 //! path in one, and ending a jail's processes.
 
-use crate::process::{reap_code, reap_errno};
-use crate::{c_string, check, errno};
+use crate::process;
 use std::io;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
@@ -33,11 +32,11 @@ pub fn file_type_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<Option<F
   const DIRECTORY: libc::c_int = 129;
   const FILE: libc::c_int = 130;
   const OTHER: libc::c_int = 131;
-  let path = c_string(path.as_ref())?;
+  let path = crate::c_string(path.as_ref())?;
 
   // SAFETY: the child only attaches, calls stat(2), and exits. Those calls
   // are async-signal-safe and allocate nothing, so they are safe after fork.
-  let pid = check(unsafe { libc::fork() })?;
+  let pid = crate::check(unsafe { libc::fork() })?;
   if pid == 0 {
     let status = match attach(jail) {
       Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
@@ -47,7 +46,7 @@ pub fn file_type_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<Option<F
         // only after that.
         unsafe {
           if libc::stat(path.as_ptr(), stat.as_mut_ptr()) == -1 {
-            match errno() {
+            match crate::errno() {
               libc::ENOENT | libc::ENOTDIR => MISSING,
               error => error,
             }
@@ -66,7 +65,7 @@ pub fn file_type_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<Option<F
     unsafe { libc::_exit(status) }
   }
 
-  match reap_code(pid)? {
+  match process::reap_code(pid)? {
     MISSING => Ok(None),
     DIRECTORY => Ok(Some(FileType::Directory)),
     FILE => Ok(Some(FileType::File)),
@@ -79,16 +78,15 @@ pub fn file_type_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<Option<F
 /// its root in the guest.
 #[cfg(target_os = "freebsd")]
 pub fn find_jail(name: &str) -> io::Result<(JailId, PathBuf)> {
-  use crate::iovec;
   use std::ffi::{CStr, OsString};
   use std::os::unix::ffi::OsStringExt;
 
   let wanted = crate::c_string(name)?;
   let mut path = vec![0u8; libc::PATH_MAX as usize];
   let mut parameters = [
-    iovec(c"name".to_bytes_with_nul()),
-    iovec(wanted.to_bytes_with_nul()),
-    iovec(c"path".to_bytes_with_nul()),
+    crate::iovec(c"name".to_bytes_with_nul()),
+    crate::iovec(wanted.to_bytes_with_nul()),
+    crate::iovec(c"path".to_bytes_with_nul()),
     libc::iovec {
       iov_base: path.as_mut_ptr().cast(),
       iov_len: path.len(),
@@ -132,7 +130,7 @@ pub fn jail_id(name: Option<&str>) -> io::Result<Option<JailId>> {
 #[cfg(target_os = "freebsd")]
 pub fn jail_remains(name: &str) -> io::Result<bool> {
   // jail_get writes the name back, so it gets a buffer of its own.
-  let mut wanted = c_string(name)?.into_bytes_with_nul();
+  let mut wanted = crate::c_string(name)?.into_bytes_with_nul();
   let mut parameters = [
     crate::iovec(c"name".to_bytes_with_nul()),
     libc::iovec {
@@ -150,7 +148,7 @@ pub fn jail_remains(name: &str) -> io::Result<bool> {
       libc::JAIL_DYING,
     )
   } {
-    -1 if errno() == libc::ENOENT => Ok(false),
+    -1 if crate::errno() == libc::ENOENT => Ok(false),
     -1 => Err(io::Error::last_os_error()),
     _ => Ok(true),
   }
@@ -182,7 +180,7 @@ pub fn has_vnet(jail: JailId) -> io::Result<bool> {
 
   // SAFETY: jail_get reads the parameter names and writes no more than the
   // two ints hold.
-  check(unsafe { libc::jail_get(parameters.as_mut_ptr(), parameters.len() as libc::c_uint, 0) })?;
+  crate::check(unsafe { libc::jail_get(parameters.as_mut_ptr(), parameters.len() as libc::c_uint, 0) })?;
   Ok(vnet == JAIL_SYS_NEW)
 }
 
@@ -199,7 +197,7 @@ pub struct Terminating(libc::pid_t);
 impl Terminating {
   /// Waits for the child to finish.
   pub fn wait(self) -> io::Result<()> {
-    reap_errno(self.0)
+    process::reap_errno(self.0)
   }
 }
 
@@ -221,7 +219,7 @@ pub fn terminate_in(jail: JailId, grace: Duration) -> io::Result<Terminating> {
   // SAFETY: the child only closes descriptors, attaches, signals, sleeps, and
   // exits. Those calls are async-signal-safe and allocate nothing, so they
   // are safe after fork.
-  let pid = check(unsafe { libc::fork() })?;
+  let pid = crate::check(unsafe { libc::fork() })?;
   if pid == 0 {
     // SAFETY: as above. kill(-1) reaches every process in the jail but the
     // child, and fails once none is left.

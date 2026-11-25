@@ -1,8 +1,8 @@
 //! ZFS pools, datasets, snapshots and clones in the guest, via the agent.
 //! Names are passed as argv, never through a shell.
 
-use crate::agent::{Agent, QUICK, Spawn};
-use crate::error::{Error, Result};
+use crate::agent::{self, Spawn};
+use crate::error;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -10,17 +10,17 @@ use std::time::Duration;
 const EXTRACTING: Duration = Duration::from_secs(600);
 
 pub struct Zfs<'a> {
-  agent: &'a Agent,
+  agent: &'a agent::Agent,
 }
 
 impl<'a> Zfs<'a> {
-  pub fn new(agent: &'a Agent) -> Self {
+  pub fn new(agent: &'a agent::Agent) -> Self {
     Self { agent }
   }
 
   /// Creates a pool on `device`, mounted at `/<pool>`, with `compression=lz4`
   /// and `atime=off`.
-  pub fn create_pool(&self, pool: &str, device: &str) -> Result<()> {
+  pub fn create_pool(&self, pool: &str, device: &str) -> error::Result<()> {
     self.check(
       &[
         "zpool",
@@ -32,58 +32,58 @@ impl<'a> Zfs<'a> {
         pool,
         device,
       ],
-      QUICK,
+      agent::QUICK,
     )
   }
 
   /// Force-imports a pool, which may have been last imported by another
   /// machine, such as one on a disk the caller keeps across machines.
-  pub fn import_pool(&self, pool: &str) -> Result<()> {
-    self.check(&["zpool", "import", "-f", pool], QUICK)
+  pub fn import_pool(&self, pool: &str) -> error::Result<()> {
+    self.check(&["zpool", "import", "-f", pool], agent::QUICK)
   }
 
   /// Whether `pool` is imported.
-  pub fn has_pool(&self, pool: &str) -> Result<bool> {
+  pub fn has_pool(&self, pool: &str) -> error::Result<bool> {
     self.succeeds(&["zpool", "list", "-H", pool])
   }
 
   /// Whether a dataset or snapshot exists.
-  pub fn exists(&self, name: &str) -> Result<bool> {
+  pub fn exists(&self, name: &str) -> error::Result<bool> {
     self.succeeds(&["zfs", "list", "-H", "-t", "all", name])
   }
 
   /// Creates `dataset` and any missing parents.
-  pub fn create(&self, dataset: &str) -> Result<()> {
-    self.check(&["zfs", "create", "-p", dataset], QUICK)
+  pub fn create(&self, dataset: &str) -> error::Result<()> {
+    self.check(&["zfs", "create", "-p", dataset], agent::QUICK)
   }
 
   /// Creates `dataset` if needed, ensures ZFS mounts it, and returns the
   /// directory it is mounted at. A dataset whose mountpoint is `none` or
   /// `legacy`, as under the pool of FreeBSD's VM image, gets `/<dataset>`,
   /// which its children inherit.
-  pub fn create_mounted(&self, dataset: &str) -> Result<String> {
+  pub fn create_mounted(&self, dataset: &str) -> error::Result<String> {
     self.agent.mount_dataset(dataset)
   }
 
   /// `snapshot` is `<dataset>@<name>`.
-  pub fn snapshot(&self, snapshot: &str) -> Result<()> {
-    self.check(&["zfs", "snapshot", snapshot], QUICK)
+  pub fn snapshot(&self, snapshot: &str) -> error::Result<()> {
+    self.check(&["zfs", "snapshot", snapshot], agent::QUICK)
   }
 
   /// Clones `snapshot` to `dataset`, creating missing parents.
-  pub fn clone(&self, snapshot: &str, dataset: &str) -> Result<()> {
-    self.check(&["zfs", "clone", "-p", snapshot, dataset], QUICK)
+  pub fn clone(&self, snapshot: &str, dataset: &str) -> error::Result<()> {
+    self.check(&["zfs", "clone", "-p", snapshot, dataset], agent::QUICK)
   }
 
   /// Destroys a dataset and its descendants, or a snapshot. Fails if a clone
   /// depends on it, since `-r` doesn't destroy dependents.
-  pub fn destroy(&self, name: &str) -> Result<()> {
-    self.check(&["zfs", "destroy", "-r", name], QUICK)
+  pub fn destroy(&self, name: &str) -> error::Result<()> {
+    self.check(&["zfs", "destroy", "-r", name], agent::QUICK)
   }
 
   /// The full names of `dataset`, its snapshots, and the filesystems and
   /// snapshots under it.
-  fn names_under(&self, dataset: &str) -> Result<Vec<String>> {
+  fn names_under(&self, dataset: &str) -> error::Result<Vec<String>> {
     let ran = self.agent.check(
       &[
         "zfs",
@@ -96,14 +96,14 @@ impl<'a> Zfs<'a> {
         "-r",
         dataset,
       ],
-      QUICK,
+      agent::QUICK,
     )?;
 
     Ok(ran.lines().into_iter().map(str::to_string).collect())
   }
 
   /// The full names of the filesystems directly under `dataset`.
-  pub fn children(&self, dataset: &str) -> Result<Vec<String>> {
+  pub fn children(&self, dataset: &str) -> error::Result<Vec<String>> {
     let ran = self.agent.check(
       &[
         "zfs",
@@ -118,7 +118,7 @@ impl<'a> Zfs<'a> {
         "1",
         dataset,
       ],
-      QUICK,
+      agent::QUICK,
     )?;
 
     Ok(
@@ -134,32 +134,33 @@ impl<'a> Zfs<'a> {
   /// The directory that `dataset`'s `mountpoint` property names. Fails if
   /// the property is `none` or `legacy`, since ZFS then doesn't mount the
   /// dataset.
-  pub fn mountpoint(&self, dataset: &str) -> Result<String> {
+  pub fn mountpoint(&self, dataset: &str) -> error::Result<String> {
     mounted_at(dataset, &self.mountpoint_property(dataset)?)
   }
 
-  fn mountpoint_property(&self, dataset: &str) -> Result<String> {
-    let ran = self
-      .agent
-      .check(&["zfs", "get", "-H", "-o", "value", "mountpoint", dataset], QUICK)?;
+  fn mountpoint_property(&self, dataset: &str) -> error::Result<String> {
+    let ran = self.agent.check(
+      &["zfs", "get", "-H", "-o", "value", "mountpoint", dataset],
+      agent::QUICK,
+    )?;
 
     Ok(ran.stdout.trim().to_string())
   }
 
   /// Extracts `archive`, a guest path such as the userland on a share, into
   /// `dataset`'s mountpoint.
-  pub fn extract(&self, archive: &str, dataset: &str) -> Result<()> {
+  pub fn extract(&self, archive: &str, dataset: &str) -> error::Result<()> {
     let mountpoint = self.mountpoint(dataset)?;
 
     self.check(&["tar", "-xf", archive, "-C", &mountpoint], EXTRACTING)
   }
 
-  fn check(&self, argv: &[&str], timeout: Duration) -> Result<()> {
+  fn check(&self, argv: &[&str], timeout: Duration) -> error::Result<()> {
     self.agent.check(argv, timeout).map(|_| ())
   }
 
-  fn succeeds(&self, argv: &[&str]) -> Result<bool> {
-    Ok(self.agent.run(argv, QUICK)?.exit.success())
+  fn succeeds(&self, argv: &[&str]) -> error::Result<bool> {
+    Ok(self.agent.run(argv, agent::QUICK)?.exit.success())
   }
 }
 
@@ -189,7 +190,7 @@ pub(crate) enum Cache {
 impl<'a> SnapshotChain<'a> {
   /// Creates and mounts `store` if needed, and notes the datasets and
   /// snapshots already in it, so that no link needs to ask the guest.
-  pub(crate) fn open(zfs: &'a Zfs<'a>, store: &'a str, tag: &'static str) -> Result<Self> {
+  pub(crate) fn open(zfs: &'a Zfs<'a>, store: &'a str, tag: &'static str) -> error::Result<Self> {
     let mountpoint = zfs.create_mounted(store)?;
     let existing = zfs.names_under(store)?.into_iter().collect();
 
@@ -215,8 +216,8 @@ impl<'a> SnapshotChain<'a> {
     &self,
     below: Option<&str>,
     name: &str,
-    fill: impl FnOnce(&str, &str) -> Result<()>,
-  ) -> Result<(String, Cache)> {
+    fill: impl FnOnce(&str, &str) -> error::Result<()>,
+  ) -> error::Result<(String, Cache)> {
     let dataset = format!("{}/{name}", self.store);
     let snapshot = format!("{dataset}@{}", self.tag);
     if self.existing.contains(&snapshot) {
@@ -243,9 +244,9 @@ impl<'a> SnapshotChain<'a> {
 
 /// The directory `dataset` is mounted at, given its `mountpoint` property
 /// `value`.
-fn mounted_at(dataset: &str, value: &str) -> Result<String> {
+fn mounted_at(dataset: &str, value: &str) -> error::Result<String> {
   if unmounted(value) {
-    return Err(Error::Invalid(format!(
+    return Err(error::Error::Invalid(format!(
       "{dataset} has mountpoint={value}, so ZFS doesn't mount it: give it, or a dataset it is under, a mountpoint"
     )));
   }
@@ -267,7 +268,7 @@ mod tests {
       let result = mounted_at("zroot/cfbsd", value);
 
       assert!(
-        matches!(&result, Err(Error::Invalid(message)) if message.starts_with(&format!("zroot/cfbsd has mountpoint={value},"))),
+        matches!(&result, Err(error::Error::Invalid(message)) if message.starts_with(&format!("zroot/cfbsd has mountpoint={value},"))),
         "{result:?}"
       );
     }

@@ -1,3 +1,4 @@
+use containerization_freebsd_protocol::mux;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -37,7 +38,7 @@ pub enum Error {
   /// as with `NoSession` when there is no session with the guest agent.
   Protocol {
     what: String,
-    error: containerization_freebsd_protocol::Error,
+    error: mux::Error,
   },
   /// The guest agent's session ended, as on a guest reboot, while the named
   /// operation waited on it.
@@ -79,7 +80,7 @@ impl Error {
   }
 
   /// Like `io`, for the protocol's errors.
-  pub(crate) fn protocol(what: impl Into<String>) -> impl FnOnce(containerization_freebsd_protocol::Error) -> Self {
+  pub(crate) fn protocol(what: impl Into<String>) -> impl FnOnce(mux::Error) -> Self {
     move |error| Self::Protocol {
       what: what.into(),
       error,

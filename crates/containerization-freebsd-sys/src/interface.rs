@@ -1,7 +1,7 @@
 //! The network interfaces of the guest's network stack, or of a jail's, read
 //! from inside the jail, since a VNET jail's interfaces are in its own stack.
 
-use crate::jail::JailId;
+use crate::jail;
 use std::io;
 
 /// A network interface, and its counters since it was created.
@@ -41,10 +41,7 @@ pub fn interfaces() -> io::Result<Vec<Interface>> {
 /// to a child process attached to the jail. The child writes the list into
 /// a buffer allocated before the fork, and passes it back over a socket.
 #[cfg(target_os = "freebsd")]
-pub fn interfaces_in(jail: JailId) -> io::Result<Vec<Interface>> {
-  use crate::jail::attach;
-  use crate::process::reap_errno;
-  use crate::{check, errno};
+pub fn interfaces_in(jail: jail::JailId) -> io::Result<Vec<Interface>> {
   use std::io::Read;
   use std::os::fd::AsRawFd;
   use std::os::unix::net::UnixStream;
@@ -55,8 +52,8 @@ pub fn interfaces_in(jail: JailId) -> io::Result<Vec<Interface>> {
     while !bytes.is_empty() {
       // SAFETY: write reads no more than `bytes` holds.
       match unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) } {
-        -1 if errno() == libc::EINTR => {}
-        -1 => return Err(errno()),
+        -1 if crate::errno() == libc::EINTR => {}
+        -1 => return Err(crate::errno()),
         written => bytes = &bytes[written as usize..],
       }
     }
@@ -71,9 +68,9 @@ pub fn interfaces_in(jail: JailId) -> io::Result<Vec<Interface>> {
   // SAFETY: the child only attaches, reads the sysctl into the buffer, writes
   // it to the socket, and exits. Those calls are async-signal-safe and
   // allocate nothing, so they are safe after fork.
-  let pid = check(unsafe { libc::fork() })?;
+  let pid = crate::check(unsafe { libc::fork() })?;
   if pid == 0 {
-    let done = attach(jail)
+    let done = jail::attach(jail)
       .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
       .and_then(|()| {
         let mut length = buffer.len();
@@ -90,7 +87,7 @@ pub fn interfaces_in(jail: JailId) -> io::Result<Vec<Interface>> {
           )
         };
         if read == -1 {
-          return Err(errno());
+          return Err(crate::errno());
         }
         write_all(theirs.as_raw_fd(), &buffer[..length])
       });
@@ -102,13 +99,13 @@ pub fn interfaces_in(jail: JailId) -> io::Result<Vec<Interface>> {
 
   let mut messages = Vec::new();
   let read = (&ours).read_to_end(&mut messages);
-  reap_errno(pid)?;
+  crate::process::reap_errno(pid)?;
   read?;
   Ok(parse(&messages))
 }
 
 #[cfg(not(target_os = "freebsd"))]
-pub fn interfaces_in(_: JailId) -> io::Result<Vec<Interface>> {
+pub fn interfaces_in(_: jail::JailId) -> io::Result<Vec<Interface>> {
   crate::unsupported("listing a jail's interfaces")
 }
 

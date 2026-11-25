@@ -3,14 +3,8 @@
 //! console reader passes it the host's bytes on a queue of their own, which
 //! the loop empties before it takes each event.
 
-use crate::listener::{self, Listening};
-use crate::pipe::{READ, Stopped, read_chunks};
-use crate::process::{self, Process};
-use crate::relay::{self, Connection};
-use crate::{call, sys};
-use containerization_freebsd_protocol::{
-  CONTROL, Call, Connect, Decoder, Error, Exec, Frame, Listen, Message, Mux, Return, Side, Skipped,
-};
+use crate::{call, listener, pipe, process, relay, sys};
+use containerization_freebsd_protocol::{frame, message, mux};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -24,7 +18,7 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 const QUEUE: usize = 64;
 /// The most bytes of frames the loop gathers before writing them. A full
 /// read's Data frame reaches it alone, so it goes out at once.
-const BATCH: usize = READ;
+const BATCH: usize = pipe::READ;
 
 /// What the console reader passes the session loop. Its queue is unbounded,
 /// but the host sends no more than the window allows before the loop reports
@@ -42,7 +36,11 @@ enum Event {
   /// Wakes the session loop for what the console reader has queued.
   Console,
   /// A message a channel's thread has for the host.
-  Channel { id: u64, channel: u32, message: Message },
+  Channel {
+    id: u64,
+    channel: u32,
+    message: message::Message,
+  },
   /// A new connection to the socket of the Listen channel `listener`.
   Accepted { id: u64, listener: u32, stream: UnixStream },
 }
@@ -59,7 +57,7 @@ pub(crate) struct Outbox {
 
 impl Outbox {
   /// Returns false once the session loop has stopped.
-  pub(crate) fn send(&self, message: Message) -> bool {
+  pub(crate) fn send(&self, message: message::Message) -> bool {
     self
       .events
       .send(Event::Channel {
@@ -95,13 +93,13 @@ pub(crate) enum Input {
 pub(crate) enum Handle {
   Process {
     input: Sender<Input>,
-    process: Arc<Process>,
+    process: Arc<process::Process>,
   },
   Relay {
     input: Sender<Input>,
-    connection: Arc<Connection>,
+    connection: Arc<relay::Connection>,
   },
-  Listener(Listening),
+  Listener(listener::Listening),
   /// A Call that a thread is answering. The thread finishes on its own, and
   /// what it sends once the channel has closed is dropped.
   Call,
@@ -128,8 +126,8 @@ struct Open {
 }
 
 struct Agent<W> {
-  mux: Mux,
-  decoder: Decoder,
+  mux: mux::Mux,
+  decoder: frame::Decoder,
   output: W,
   events: SyncSender<Event>,
   channels: HashMap<u32, Open>,
@@ -155,8 +153,8 @@ pub fn serve(input: impl Read + Send + 'static, output: impl Write) -> io::Resul
   std::thread::spawn(move || read(input, &console, &wake));
 
   let mut agent = Agent {
-    mux: Mux::new(Side::Guest),
-    decoder: Decoder::new(),
+    mux: mux::Mux::new(mux::Side::Guest),
+    decoder: frame::Decoder::new(),
     output,
     events,
     channels: HashMap::new(),
@@ -171,10 +169,10 @@ pub fn serve(input: impl Read + Send + 'static, output: impl Write) -> io::Resul
 
 /// The answer to the Call that `what` names: Return, or an Error that says
 /// what failed.
-fn answered(what: &dyn fmt::Display, result: io::Result<Return>) -> Message {
+fn answered(what: &dyn fmt::Display, result: io::Result<message::Return>) -> message::Message {
   match result {
-    Ok(value) => Message::Return(value),
-    Err(error) => Message::Error(format!("{what}: {error}")),
+    Ok(value) => message::Message::Return(value),
+    Err(error) => message::Message::Error(format!("{what}: {error}")),
   }
 }
 
@@ -188,11 +186,11 @@ fn read(input: impl Read, console: &Sender<FromConsole>, wake: &SyncSender<Event
     passed
   };
 
-  let closed = match read_chunks(input, |bytes| pass(FromConsole::Read(bytes))) {
-    Stopped::Eof => Ok(()),
+  let closed = match pipe::read_chunks(input, |bytes| pass(FromConsole::Read(bytes))) {
+    pipe::Stopped::Eof => Ok(()),
     // The session loop has stopped.
-    Stopped::Refused => return,
-    Stopped::Failed(error) => Err(error),
+    pipe::Stopped::Refused => return,
+    pipe::Stopped::Failed(error) => Err(error),
   };
   pass(FromConsole::Closed(closed));
 }
@@ -255,7 +253,7 @@ impl<W: Write> Agent<W> {
     // These bytes have left the tty's input queue, so the host may send that
     // many more.
     let read = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-    self.send(CONTROL, Message::Received(read));
+    self.send(mux::CONTROL, message::Message::Received(read));
     self.decoder.push(bytes);
 
     while let Some(decoded) = self.decoder.decode() {
@@ -263,7 +261,7 @@ impl<W: Write> Agent<W> {
         Ok(frame) => self.receive(frame),
         // Frames were lost. The announcement makes the host start a new
         // session.
-        Err(Skipped(count)) => {
+        Err(frame::Skipped(count)) => {
           eprintln!("agent: dropped {count} bytes between frames");
           self.announce();
         }
@@ -271,60 +269,60 @@ impl<W: Write> Agent<W> {
     }
   }
 
-  fn receive(&mut self, frame: Frame) {
+  fn receive(&mut self, frame: frame::Frame) {
     let channel = frame.channel;
 
     match self.mux.receive(frame) {
       // The host's Hello starts a session. The agent answers even when the
       // versions differ, so the host learns the agent's version.
-      Ok((_, Message::Hello { .. })) | Err(Error::Version(_)) => {
+      Ok((_, message::Message::Hello { .. })) | Err(mux::Error::Version(_)) => {
         self.end_channels();
         self.announced = false;
         let answer = self.mux.hello();
         self.write(&answer);
       }
-      Ok((_, Message::Ping(number))) => self.send(CONTROL, Message::Pong(number)),
-      Ok((_, Message::SetTime { seconds, nanoseconds })) => {
-        if let Err(error) = sys::set_time(seconds, nanoseconds) {
+      Ok((_, message::Message::Ping(number))) => self.send(mux::CONTROL, message::Message::Pong(number)),
+      Ok((_, message::Message::SetTime { seconds, nanoseconds })) => {
+        if let Err(error) = sys::clock::set_time(seconds, nanoseconds) {
           eprintln!("agent: setting the clock: {error}");
         }
       }
-      Ok((_, Message::Exec(exec))) => self.exec(channel, &exec),
-      Ok((_, Message::Connect(connect))) => self.connect(channel, &connect),
-      Ok((_, Message::Listen(listen))) => self.listen(channel, &listen),
-      Ok((_, Message::Call(call))) => self.call(channel, &call),
+      Ok((_, message::Message::Exec(exec))) => self.exec(channel, &exec),
+      Ok((_, message::Message::Connect(connect))) => self.connect(channel, &connect),
+      Ok((_, message::Message::Listen(listen))) => self.listen(channel, &listen),
+      Ok((_, message::Message::Call(call))) => self.call(channel, &call),
       Ok((_, message)) => self.deliver(channel, message),
       // The host has a session that the agent does not. The agent announces
       // itself once so the host starts a new one; frames still arriving
       // from the old session are then dropped.
-      Err(Error::NoSession) if !self.announced => self.announce(),
+      Err(mux::Error::NoSession) if !self.announced => self.announce(),
       // A frame from the old session after the announcement, or one that
       // crossed its channel's close in flight.
-      Err(Error::NoSession | Error::UnknownChannel(_)) => {}
+      Err(mux::Error::NoSession | mux::Error::UnknownChannel(_)) => {}
       Err(error) => eprintln!("agent: refused a frame on channel {channel}: {error}"),
     }
   }
 
   /// Passes the host's message to an open channel.
-  fn deliver(&mut self, channel: u32, message: Message) {
+  fn deliver(&mut self, channel: u32, message: message::Message) {
     let Some(open) = self.channels.get_mut(&channel) else {
       return;
     };
-    let ends = matches!(message, Message::Error(_));
+    let ends = matches!(message, message::Message::Error(_));
 
     let result = match (message, &mut open.handle) {
-      (Message::Data(bytes), Handle::Process { input, .. } | Handle::Relay { input, .. }) => {
+      (message::Message::Data(bytes), Handle::Process { input, .. } | Handle::Relay { input, .. }) => {
         let _ = input.send(Input::Data(bytes));
         Ok(())
       }
-      (Message::Eof, Handle::Process { input, .. } | Handle::Relay { input, .. }) => {
+      (message::Message::Eof, Handle::Process { input, .. } | Handle::Relay { input, .. }) => {
         let _ = input.send(Input::Eof);
         Ok(())
       }
-      (Message::Eof, Handle::Listener(listening)) => listening.remove(),
-      (Message::Resize(size), Handle::Process { process, .. }) => process.resize(size),
-      (Message::Signal(signal), Handle::Process { process, .. }) => process.signal(signal),
-      (Message::Error(reason), _) => {
+      (message::Message::Eof, Handle::Listener(listening)) => listening.remove(),
+      (message::Message::Resize(size), Handle::Process { process, .. }) => process.resize(size),
+      (message::Message::Signal(signal), Handle::Process { process, .. }) => process.signal(signal),
+      (message::Message::Error(reason), _) => {
         eprintln!("agent: the host closed channel {channel}: {reason}");
         Ok(())
       }
@@ -345,20 +343,20 @@ impl<W: Write> Agent<W> {
     }
   }
 
-  fn exec(&mut self, channel: u32, exec: &Exec) {
+  fn exec(&mut self, channel: u32, exec: &message::Exec) {
     // spawn's errors already say which step failed, so they need no prefix.
     self.start(channel, |outbox| {
       process::spawn(exec, outbox).map_err(|error| error.to_string())
     });
   }
 
-  fn connect(&mut self, channel: u32, connect: &Connect) {
+  fn connect(&mut self, channel: u32, connect: &message::Connect) {
     self.start(channel, |outbox| {
       relay::connect(connect, outbox).map_err(|error| format!("connecting to {connect}: {error}"))
     });
   }
 
-  fn listen(&mut self, channel: u32, listen: &Listen) {
+  fn listen(&mut self, channel: u32, listen: &message::Listen) {
     self.start(channel, |outbox| {
       listener::listen(listen, outbox).map_err(|error| format!("listening on {listen}: {error}"))
     });
@@ -368,7 +366,7 @@ impl<W: Write> Agent<W> {
   /// an Error. Either answer closes the channel. A call in a jail forks, and
   /// some spawn a process, which only the session loop may do. A call that
   /// then only waits is answered from a thread.
-  fn call(&mut self, channel: u32, call: &Call) {
+  fn call(&mut self, channel: u32, call: &message::Call) {
     match call::answer(call) {
       call::Answer::Now(result) => self.send(channel, answered(call, result)),
       call::Answer::Later(work) => {
@@ -396,16 +394,16 @@ impl<W: Write> Agent<W> {
     match start(outbox) {
       Ok(handle) => {
         self.channels.insert(channel, Open { id, handle });
-        self.send(channel, Message::Opened)
+        self.send(channel, message::Message::Opened)
       }
-      Err(reason) => self.send(channel, Message::Error(reason)),
+      Err(reason) => self.send(channel, message::Message::Error(reason)),
     }
   }
 
   /// Opens an Accepted channel for a connection to the socket of the Listen
   /// channel `listener`, and relays the connection on it.
   fn accepted(&mut self, listener: u32, stream: UnixStream) {
-    let (channel, frame) = match self.mux.open(Message::Accepted { listener }) {
+    let (channel, frame) = match self.mux.open(message::Message::Accepted { listener }) {
       Ok(opened) => opened,
       Err(error) => {
         eprintln!("agent: could not relay a connection to listener {listener}: {error}");
@@ -416,7 +414,7 @@ impl<W: Write> Agent<W> {
     let outbox = self.outbox(channel);
     let id = outbox.id;
 
-    let handle = relay::start(Connection::Unix(stream), outbox);
+    let handle = relay::start(relay::Connection::Unix(stream), outbox);
     self.channels.insert(channel, Open { id, handle });
   }
 
@@ -431,12 +429,12 @@ impl<W: Write> Agent<W> {
 
   /// Queues a message for the host. If it closes the channel (Exited, Error,
   /// or the second Eof on a relay or listener), the channel is forgotten.
-  fn send(&mut self, channel: u32, message: Message) {
+  fn send(&mut self, channel: u32, message: message::Message) {
     match self.mux.send(channel, message) {
       Ok(frame) => self.write(&frame),
       Err(error) => eprintln!("agent: could not send on channel {channel}: {error}"),
     }
-    if channel != CONTROL && !self.mux.is_open(channel) {
+    if channel != mux::CONTROL && !self.mux.is_open(channel) {
       self.channels.remove(&channel);
     }
   }
@@ -457,7 +455,7 @@ impl<W: Write> Agent<W> {
   }
 
   /// Adds `frame` to those waiting to be written.
-  fn write(&mut self, frame: &Frame) {
+  fn write(&mut self, frame: &frame::Frame) {
     frame.encode(&mut self.pending);
   }
 

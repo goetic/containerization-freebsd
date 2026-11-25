@@ -4,13 +4,11 @@
 //! images pulled, unpacked into ZFS and run; and a build-sized workload on a
 //! share. Run them through `bin/dev/test-integration`, which signs them.
 
-use containerization_freebsd::oci::{ContentStore, Descriptor, Digest, Platform, RegistryClient, media_type};
-use containerization_freebsd::{
-  Builder, Configuration, Container, Containers, Direction, Disk, Dns, Exec, Exit, Host, Image, ImageStore, Interface,
-  Jail, Layout, Limit, Mac, Machine, Mount, Network, Output, Parents, Process, Resource, Share, Spawn, Step,
-  UnixSocket, Unpacker, Upgrade, User, WindowSize, Zfs, release,
-};
-use containerization_freebsd_test::{base_disk, bundle, cache, userland};
+use containerization_freebsd::agent::{self, Spawn};
+use containerization_freebsd::jail::{self, mount, network};
+use containerization_freebsd::oci::{self, media_type};
+use containerization_freebsd::{build, container, copy, digest, images, machine, release, socket, unpack, zfs};
+use containerization_freebsd_protocol::message;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
@@ -34,13 +32,20 @@ fn work(name: &str) -> PathBuf {
 
 /// Prepares a base disk in `work`. `Upgrade::Latest` would download the
 /// release's patches, which takes minutes.
-fn prepare(work: &Path) -> Layout {
-  containerization_freebsd::prepare(&base_disk(), work, DISK_SIZE, Upgrade::None, &bundle()).expect("prepare the base")
+fn prepare(work: &Path) -> machine::Layout {
+  containerization_freebsd::prepare::prepare(
+    &containerization_freebsd_test::base_disk(),
+    work,
+    DISK_SIZE,
+    containerization_freebsd::prepare::Upgrade::None,
+    &containerization_freebsd_test::bundle(),
+  )
+  .expect("prepare the base")
 }
 
 /// Makes the machine `name` from `layout`, starts it, and waits for its
 /// agent.
-fn boot(layout: &Layout, name: &str) -> Machine {
+fn boot(layout: &machine::Layout, name: &str) -> machine::Machine {
   let machine = layout.machine(name).expect("make the machine");
   machine.start().expect("start");
   machine
@@ -51,10 +56,13 @@ fn boot(layout: &Layout, name: &str) -> Machine {
 
 /// A read-only share of the cache that holds the userland, which tests mount
 /// at `/mnt/userland`.
-fn userland_share() -> Share {
-  Share {
+fn userland_share() -> machine::Share {
+  machine::Share {
     tag: "userland".into(),
-    path: userland().parent().expect("the cache").to_path_buf(),
+    path: containerization_freebsd_test::userland()
+      .parent()
+      .expect("the cache")
+      .to_path_buf(),
     read_only: true,
   }
 }
@@ -65,14 +73,14 @@ fn sh(script: &str) -> [&str; 3] {
 
 /// Waits for a process to exit and returns its stdout and exit status. Any
 /// output on stderr fails the test.
-fn finish(process: &Process) -> (String, Exit) {
+fn finish(process: &agent::channel::Process) -> (String, message::Exit) {
   let mut stdout = Vec::new();
 
   loop {
     match process.recv().expect("its output") {
-      Output::Stdout(bytes) => stdout.extend(bytes),
-      Output::Stderr(bytes) => panic!("{}", String::from_utf8_lossy(&bytes)),
-      Output::Exited(exit) => return (String::from_utf8_lossy(&stdout).into_owned(), exit),
+      agent::channel::Output::Stdout(bytes) => stdout.extend(bytes),
+      agent::channel::Output::Stderr(bytes) => panic!("{}", String::from_utf8_lossy(&bytes)),
+      agent::channel::Output::Exited(exit) => return (String::from_utf8_lossy(&stdout).into_owned(), exit),
     }
   }
 }
@@ -142,7 +150,7 @@ fn prepares_boots_and_restores() {
   std::fs::write(shared.join("from-host"), "written on the host\n").expect("write a shared file");
 
   let mut layout = prepare(&work);
-  layout.shares.push(Share {
+  layout.shares.push(machine::Share {
     tag: "shared".into(),
     path: shared.clone(),
     read_only: false,
@@ -182,25 +190,25 @@ fn prepares_boots_and_restores() {
 
 /// Streams input spanning many flow-control windows through sha256(1). The
 /// virtio console would drop bytes if the host outpaced the agent.
-fn streams_input_across_windows(cold: &Machine, work: &Path) {
+fn streams_input_across_windows(cold: &machine::Machine, work: &Path) {
   let input: Vec<u8> = (0..16usize << 20)
     .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
     .collect();
   std::fs::write(work.join("input"), &input).expect("write the input");
   let checksum = cold
     .agent
-    .spawn(Exec::new(["sha256", "-q"]))
+    .spawn(message::Exec::new(["sha256", "-q"]))
     .expect("start a checksum");
   checksum.write(&input).expect("stream the input");
   checksum.close_input().expect("end the input");
   let (sum, exit) = finish(&checksum);
-  assert_eq!(exit, Exit::Code(0));
+  assert_eq!(exit, message::Exit::Code(0));
   assert_eq!(sum.trim(), host_sha256(&work.join("input")));
 }
 
 /// Checks that rc loaded the bundle's patched modules, including its fusefs
 /// rather than the stock one.
-fn loads_the_bundles_modules(cold: &Machine) {
+fn loads_the_bundles_modules(cold: &machine::Machine) {
   let ran = cold
     .agent
     .check(&sh("kldstat -v | grep -E 'virtiofs|vtfs|fusefs'"), TIMEOUT)
@@ -211,7 +219,7 @@ fn loads_the_bundles_modules(cold: &Machine) {
 }
 
 /// Mounts the virtio-fs share of `shared` and reads and writes through it.
-fn shares_files_with_the_host(cold: &Machine, shared: &Path) {
+fn shares_files_with_the_host(cold: &machine::Machine, shared: &Path) {
   cold
     .mount_share("shared", "/mnt/shared")
     .expect("mount the share");
@@ -231,7 +239,7 @@ fn shares_files_with_the_host(cold: &Machine, shared: &Path) {
 
 /// Saves the guest's state to `state`. Saving first unmounts every virtiofs
 /// file system, so it fails while the share is busy.
-fn saves_with_the_share_unused(cold: &Machine, state: &Path) {
+fn saves_with_the_share_unused(cold: &machine::Machine, state: &Path) {
   cold
     .agent
     .check(
@@ -258,7 +266,7 @@ fn saves_with_the_share_unused(cold: &Machine, state: &Path) {
 /// Checks that the restored guest resumes where the cold boot left off: on
 /// its NAT network, with its clock corrected, and with the share mounted
 /// again.
-fn resumes_where_it_left_off(restored: &Machine) {
+fn resumes_where_it_left_off(restored: &machine::Machine) {
   // Once its link is back, the guest keeps its saved NAT configuration: the
   // Mac answers through the default route.
   restored
@@ -301,18 +309,18 @@ fn resumes_where_it_left_off(restored: &Machine) {
 
 /// Runs a command on a pty, reading its output before it exits: FreeBSD
 /// discards a pty's unread output a second after its last close.
-fn runs_a_command_in_a_terminal(restored: &Machine) {
+fn runs_a_command_in_a_terminal(restored: &machine::Machine) {
   let terminal = restored
     .agent
-    .spawn(Exec {
-      pty: Some(WindowSize { rows: 24, columns: 80 }),
-      ..Exec::new(sh("tty; read line"))
+    .spawn(message::Exec {
+      pty: Some(message::WindowSize { rows: 24, columns: 80 }),
+      ..message::Exec::new(sh("tty; read line"))
     })
     .expect("run a command in a terminal");
   let mut output = Vec::new();
   while !output.contains(&b'\n') {
     match terminal.recv().expect("its output") {
-      Output::Stdout(bytes) => output.extend(bytes),
+      agent::channel::Output::Stdout(bytes) => output.extend(bytes),
       other => panic!("{other:?} after {:?}", String::from_utf8_lossy(&output)),
     }
   }
@@ -324,17 +332,17 @@ fn runs_a_command_in_a_terminal(restored: &Machine) {
   terminal.write(b"\n").expect("answer it");
   let exit = loop {
     match terminal.recv().expect("its last output") {
-      Output::Stdout(_) => {}
-      Output::Exited(exit) => break exit,
-      Output::Stderr(_) => unreachable!("a terminal merges stderr into stdout"),
+      agent::channel::Output::Stdout(_) => {}
+      agent::channel::Output::Exited(exit) => break exit,
+      agent::channel::Output::Stderr(_) => unreachable!("a terminal merges stderr into stdout"),
     }
   };
-  assert_eq!(exit, Exit::Code(0));
+  assert_eq!(exit, message::Exit::Code(0));
 }
 
 /// The MAC address of the guest's spare NAT device, which a container claims
 /// as its own interface.
-const SPARE: Mac = Mac([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]);
+const SPARE: machine::Mac = machine::Mac([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]);
 
 /// A script that succeeds if the spare device has no IPv4 address.
 fn unconfigured() -> String {
@@ -364,7 +372,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
     .trim()
     .to_string();
 
-  let zfs = Zfs::new(&machine.agent);
+  let zfs = zfs::Zfs::new(&machine.agent);
   zfs
     .clone("images/userland@base", "images/jails/first")
     .expect("clone the userland");
@@ -379,7 +387,7 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
   assert!(!zfs.exists("images/jails/first").expect("list datasets"));
 
   caches_build_steps(&machine);
-  let containers = Containers::new(&machine.agent, "images/containers");
+  let containers = container::Containers::new(&machine.agent, "images/containers");
   runs_a_container(&machine, &containers);
   limits_a_container(&machine, &containers);
   gives_a_container_an_interface(&machine, &containers, &gateway);
@@ -392,9 +400,9 @@ fn runs_a_jail_on_a_clone_of_the_userland() {
 
 /// Boots a guest for jails: with NAT, a spare NAT device, an empty images
 /// disk, and the userland's share mounted at `/mnt/userland`.
-fn boot_for_jails(work: &Path) -> Machine {
+fn boot_for_jails(work: &Path) -> machine::Machine {
   let mut layout = prepare(work);
-  let images = Disk::create(work.join("images.raw"), "images", 8 << 30).expect("make the images disk");
+  let images = machine::Disk::create(work.join("images.raw"), "images", 8 << 30).expect("make the images disk");
   layout.disks.push(images);
   layout.nat = true;
   layout.interfaces.push(SPARE);
@@ -436,9 +444,9 @@ fn boot_for_jails(work: &Path) -> Machine {
 
 /// Makes a pool on the images disk and extracts the userland into it, as
 /// `images/userland@base`.
-fn pool_the_userland(machine: &Machine) {
+fn pool_the_userland(machine: &machine::Machine) {
   let device = machine.disk_device("images").expect("find the images disk");
-  let zfs = Zfs::new(&machine.agent);
+  let zfs = zfs::Zfs::new(&machine.agent);
   zfs
     .create_pool("images", &device)
     .expect("make a pool on the disk");
@@ -453,8 +461,9 @@ fn pool_the_userland(machine: &Machine) {
     .expect("snapshot the userland");
 }
 
-fn runs_commands_in_a_jail(machine: &Machine, root: &str) {
-  let jail = Jail::start(&machine.agent, "first", root, &Network::None, &["mount.devfs"]).expect("start a jail");
+fn runs_commands_in_a_jail(machine: &machine::Machine, root: &str) {
+  let jail =
+    jail::Jail::start(&machine.agent, "first", root, &network::Network::None, &["mount.devfs"]).expect("start a jail");
   let ran = jail
     .check(&["freebsd-version", "-u"], TIMEOUT)
     .expect("run a command in the jail");
@@ -469,14 +478,20 @@ fn runs_commands_in_a_jail(machine: &Machine, root: &str) {
 
   // Files the jail writes stay in its clone.
   let process = jail
-    .spawn(Exec {
+    .spawn(message::Exec {
       cwd: Some("/root".into()),
-      ..Exec::new(sh("pwd; echo jailed > mark"))
+      ..message::Exec::new(sh("pwd; echo jailed > mark"))
     })
     .expect("spawn in the jail");
   process.close_input().expect("close its input");
-  assert_eq!(process.recv().expect("its output"), Output::Stdout(b"/root\n".to_vec()));
-  assert_eq!(process.recv().expect("its exit"), Output::Exited(Exit::Code(0)));
+  assert_eq!(
+    process.recv().expect("its output"),
+    agent::channel::Output::Stdout(b"/root\n".to_vec())
+  );
+  assert_eq!(
+    process.recv().expect("its exit"),
+    agent::channel::Output::Exited(message::Exit::Code(0))
+  );
   machine
     .agent
     .check(&["test", "-e", &format!("{root}/root/mark")], TIMEOUT)
@@ -493,7 +508,7 @@ fn runs_commands_in_a_jail(machine: &Machine, root: &str) {
 /// guest's `gateway` and by connecting to the internet. A NAT jail gets
 /// answers only through pf's NAT, because the gateway has no route to
 /// 10.66/16.
-fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str) {
+fn reaches_the_network_in_each_mode(machine: &machine::Machine, root: &str, gateway: &str) {
   // Setting up a NAT jail's network must not depend on the jail's own
   // ifconfig or route.
   machine
@@ -504,8 +519,12 @@ fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str
     )
     .expect("remove the clone's ifconfig and route");
 
-  for (network, reaches) in [(Network::None, false), (Network::Inherit, true), (Network::Nat, true)] {
-    let jail = Jail::start(
+  for (network, reaches) in [
+    (network::Network::None, false),
+    (network::Network::Inherit, true),
+    (network::Network::Nat, true),
+  ] {
+    let jail = jail::Jail::start(
       &machine.agent,
       "first",
       root,
@@ -541,14 +560,14 @@ fn reaches_the_network_in_each_mode(machine: &Machine, root: &str, gateway: &str
 
 /// Builds in cached steps: each step becomes a snapshot, and a step built
 /// before is skipped.
-fn caches_build_steps(machine: &Machine) {
-  let zfs = Zfs::new(&machine.agent);
-  let builder = Builder::new(&machine.agent, "images/builds");
+fn caches_build_steps(machine: &machine::Machine) {
+  let zfs = zfs::Zfs::new(&machine.agent);
+  let builder = build::Builder::new(&machine.agent, "images/builds");
   let steps = [
-    Step::new("echo one > /one; echo building"),
-    Step {
-      network: Network::None,
-      ..Step::new("cat /one > /two")
+    build::Step::new("echo one > /one; echo building"),
+    build::Step {
+      network: network::Network::None,
+      ..build::Step::new("cat /one > /two")
     },
   ];
   let mut printed = Vec::new();
@@ -581,7 +600,7 @@ fn caches_build_steps(machine: &Machine) {
   let changed = builder
     .build(
       "images/userland@base",
-      &[steps[0].clone(), Step::new("echo changed > /two")],
+      &[steps[0].clone(), build::Step::new("echo changed > /two")],
       &mut |_| {},
     )
     .expect("build a changed step");
@@ -589,7 +608,7 @@ fn caches_build_steps(machine: &Machine) {
   let failed = builder
     .build(
       "images/userland@base",
-      &[steps[0].clone(), Step::new("exit 3")],
+      &[steps[0].clone(), build::Step::new("exit 3")],
       &mut |_| {},
     )
     .expect_err("build a failing step");
@@ -607,7 +626,7 @@ fn caches_build_steps(machine: &Machine) {
 /// with its own hostname, resolver, hosts, mounts and sockets. The sockets
 /// live in the temp directory because the work directory's paths overflow
 /// `sun_path`.
-fn runs_a_container(machine: &Machine, containers: &Containers) {
+fn runs_a_container(machine: &machine::Machine, containers: &container::Containers) {
   machine
     .agent
     .check(
@@ -629,7 +648,10 @@ fn runs_a_container(machine: &Machine, containers: &Containers) {
   assert_eq!(containers.list().expect("list containers"), ["web"]);
   web.start().expect("start its main process");
   let main = web.main_process().expect("its main process");
-  assert_eq!(main.recv().expect("its output"), Output::Stdout(b"started\n".to_vec()));
+  assert_eq!(
+    main.recv().expect("its output"),
+    agent::channel::Output::Stdout(b"started\n".to_vec())
+  );
 
   sets_its_hostname_resolver_and_hosts(&web);
   uses_its_mounts(&web);
@@ -654,12 +676,12 @@ fn runs_a_container(machine: &Machine, containers: &Containers) {
   let mut stdout = Vec::new();
   let exit = loop {
     match main.recv().expect("its last output") {
-      Output::Stdout(bytes) => stdout.extend(bytes),
-      Output::Stderr(_) => {}
-      Output::Exited(exit) => break exit,
+      agent::channel::Output::Stdout(bytes) => stdout.extend(bytes),
+      agent::channel::Output::Stderr(_) => {}
+      agent::channel::Output::Exited(exit) => break exit,
     }
   };
-  assert_eq!((stdout.as_slice(), exit), (&b"stopping\n"[..], Exit::Code(3)));
+  assert_eq!((stdout.as_slice(), exit), (&b"stopping\n"[..], message::Exit::Code(3)));
   // Delete only after the agent has closed the host's socket inside the
   // container.
   web.delete().expect("delete the container");
@@ -668,50 +690,50 @@ fn runs_a_container(machine: &Machine, containers: &Containers) {
 
 /// The web container's configuration, with the host's socket at
 /// `host_socket` inside it and its own socket at `web_socket` on the host.
-fn web_configuration(host_socket: &Path, web_socket: &Path) -> Configuration {
-  Configuration {
-    process: Exec::new(sh(
+fn web_configuration(host_socket: &Path, web_socket: &Path) -> container::Configuration {
+  container::Configuration {
+    process: message::Exec::new(sh(
       "trap 'echo stopping; exit 3' TERM; echo started; while :; do sleep 0.1; done",
     )),
     hostname: Some("web.test".into()),
-    network: Network::Nat,
+    network: network::Network::Nat,
     // The container's own loopback, where nothing answers. getent looks up
     // IPv6 first, which /etc/hosts lacks for db, so it asks DNS; a
     // nameserver outside the guest would stall it until the Mac's network
     // dropped the query.
-    dns: Some(Dns {
+    dns: Some(container::Dns {
       nameservers: vec!["127.0.0.1".into()],
       search: vec!["test".into()],
-      ..Dns::default()
+      ..container::Dns::default()
     }),
-    hosts: vec![Host {
+    hosts: vec![container::Host {
       address: "192.0.2.1".into(),
       names: vec!["db.test".into(), "db".into()],
     }],
     mounts: vec![
-      Mount::directory("/mnt/userland", "/mnt/userland"),
-      Mount::directory("/var/cfbsd-data", "/var/data").read_only(),
-      Mount::tmpfs("/scratch"),
+      mount::Mount::directory("/mnt/userland", "/mnt/userland"),
+      mount::Mount::directory("/var/cfbsd-data", "/var/data").read_only(),
+      mount::Mount::tmpfs("/scratch"),
     ],
     sockets: vec![
-      UnixSocket {
+      socket::UnixSocket {
         host: host_socket.to_path_buf(),
         guest: "/var/run/host.sock".into(),
-        direction: Direction::Into,
+        direction: socket::Direction::Into,
         mode: Some(0o666),
       },
-      UnixSocket {
+      socket::UnixSocket {
         host: web_socket.to_path_buf(),
         guest: "/var/run/web.sock".into(),
-        direction: Direction::OutOf,
+        direction: socket::Direction::OutOf,
         mode: Some(0o600),
       },
     ],
-    ..Configuration::default()
+    ..container::Configuration::default()
   }
 }
 
-fn sets_its_hostname_resolver_and_hosts(web: &Container) {
+fn sets_its_hostname_resolver_and_hosts(web: &container::Container) {
   let ran = web
     .check(&sh("hostname; cat /etc/resolv.conf; getent hosts db"), TIMEOUT)
     .expect("run a command in the container");
@@ -729,7 +751,7 @@ fn sets_its_hostname_resolver_and_hosts(web: &Container) {
 
 /// Uses the container's mounts: nullfs mounts of a virtio-fs share and of a
 /// read-only guest directory, and a tmpfs.
-fn uses_its_mounts(web: &Container) {
+fn uses_its_mounts(web: &container::Container) {
   let script = format!(
     "set -e; test -f /mnt/userland/{}; cat /var/data/greeting; \
      touch /var/data/x 2>/dev/null || echo read-only; echo kept > /scratch/x; cat /scratch/x",
@@ -742,28 +764,28 @@ fn uses_its_mounts(web: &Container) {
 /// Runs processes as a user in the container's passwd, with supplementary
 /// groups, a umask, rlimits and a working directory; and as a uid missing from
 /// its passwd.
-fn runs_processes_as_its_users(web: &Container) {
+fn runs_processes_as_its_users(web: &container::Container) {
   let script = "id -u; id -g; id -G; umask; ulimit -n; echo \"$HOME\"; pwd";
   let (stdout, exit) = finish(
     &web
-      .exec(Exec {
+      .exec(message::Exec {
         cwd: Some("/var/empty".into()),
-        user: Some(User {
+        user: Some(message::User {
           name: "nobody".into(),
           group: None,
           groups: vec!["operator".into(), "4242".into()],
         }),
         umask: Some(0o077),
-        limits: vec![Limit {
-          resource: Resource::OPEN_FILES,
+        limits: vec![message::Limit {
+          resource: message::Resource::OPEN_FILES,
           soft: 100,
           hard: 100,
         }],
-        ..Exec::new(sh(script))
+        ..message::Exec::new(sh(script))
       })
       .expect("run a process as nobody"),
   );
-  assert_eq!(exit, Exit::Code(0), "{stdout}");
+  assert_eq!(exit, message::Exit::Code(0), "{stdout}");
   let lines: Vec<&str> = stdout.lines().collect();
   assert_eq!(lines[..2], ["65534", "65534"], "{stdout}");
   // On FreeBSD 15, `id -G` lists only supplementary groups.
@@ -773,36 +795,36 @@ fn runs_processes_as_its_users(web: &Container) {
   assert_eq!(lines[3..], ["0077", "100", "/nonexistent", "/var/empty"], "{stdout}");
   let (stdout, exit) = finish(
     &web
-      .exec(Exec {
-        user: Some(User {
+      .exec(message::Exec {
+        user: Some(message::User {
           name: "4242".into(),
-          ..User::default()
+          ..message::User::default()
         }),
-        ..Exec::new(sh("id -u; id -g; echo \"$HOME\""))
+        ..message::Exec::new(sh("id -u; id -g; echo \"$HOME\""))
       })
       .expect("run a process as an unlisted uid"),
   );
-  assert_eq!((stdout.as_str(), exit), ("4242\n0\n/\n", Exit::Code(0)));
+  assert_eq!((stdout.as_str(), exit), ("4242\n0\n/\n", message::Exit::Code(0)));
 }
 
 /// Uses the container's sockets: the host's socket inside the container, open
 /// to its users; the container's socket at `web_socket` on the host; and a
 /// port on the container's loopback.
-fn relays_its_sockets(web: &Container, web_socket: &Path) {
+fn relays_its_sockets(web: &container::Container, web_socket: &Path) {
   let (stdout, exit) = finish(
     &web
-      .exec(Exec {
-        user: Some(User {
+      .exec(message::Exec {
+        user: Some(message::User {
           name: "nobody".into(),
-          ..User::default()
+          ..message::User::default()
         }),
-        ..Exec::new(sh(
+        ..message::Exec::new(sh(
           "stat -f %Lp /var/run/host.sock; echo hello | nc -N -U /var/run/host.sock",
         ))
       })
       .expect("use the host's socket"),
   );
-  assert_eq!((stdout.as_str(), exit), ("666\nHELLO\n", Exit::Code(0)));
+  assert_eq!((stdout.as_str(), exit), ("666\nHELLO\n", message::Exit::Code(0)));
   let mode = std::fs::metadata(web_socket)
     .expect("the container's socket on the host")
     .permissions()
@@ -810,13 +832,13 @@ fn relays_its_sockets(web: &Container, web_socket: &Path) {
   assert_eq!(mode & 0o777, 0o600);
   let serve = |script: &str| {
     web
-      .exec(Exec::new(sh(script)))
+      .exec(message::Exec::new(sh(script)))
       .expect("serve in the container")
   };
   let server = serve("echo pong | nc -N -lU /var/run/web.sock");
   let answer = eventually(|| Some(ask(web_socket, "ping\n")).filter(|answer| !answer.is_empty()));
   assert_eq!(answer, "pong\n");
-  assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
+  assert_eq!(finish(&server), ("ping\n".to_string(), message::Exit::Code(0)));
   let server = serve("echo pong | nc -N -l 127.0.0.1 7000");
   let relay = eventually(|| web.connect(7000).ok());
   relay.write(b"ping\n").expect("write to its port");
@@ -826,13 +848,13 @@ fn relays_its_sockets(web: &Container, web_socket: &Path) {
     answer.extend(bytes);
   }
   assert_eq!(answer, b"pong\n");
-  assert_eq!(finish(&server), ("ping\n".to_string(), Exit::Code(0)));
+  assert_eq!(finish(&server), ("ping\n".to_string(), message::Exit::Code(0)));
 }
 
 /// Checks the container's statistics: its network counters, where its
 /// loopback carried the relayed traffic, and its dataset's I/O from the files
 /// it wrote.
-fn counts_its_statistics(web: &Container) {
+fn counts_its_statistics(web: &container::Container) {
   let statistics = web.statistics().expect("its statistics");
   let loopback = statistics
     .networks
@@ -859,15 +881,15 @@ fn counts_its_statistics(web: &Container) {
 
 /// Checks a container's rctl rules and statistics. racct samples memoryuse
 /// once a second, so the test waits for a nonzero value.
-fn limits_a_container(machine: &Machine, containers: &Containers) {
+fn limits_a_container(machine: &machine::Machine, containers: &container::Containers) {
   let limited = containers
     .create(
       "limited",
       "images/userland@base",
-      Configuration {
+      container::Configuration {
         cpus: Some(1),
         memory_in_bytes: Some(64 << 20),
-        ..Configuration::default()
+        ..container::Configuration::default()
       },
     )
     .expect("create a container with limits");
@@ -882,7 +904,7 @@ fn limits_a_container(machine: &Machine, containers: &Containers) {
     ["jail:limited:memoryuse:deny=67108864", "jail:limited:pcpu:deny=100"]
   );
   let sleeper = limited
-    .exec(Exec::new(["sleep", "30"]))
+    .exec(message::Exec::new(["sleep", "30"]))
     .expect("start a process in it");
   let statistics =
     eventually(|| Some(limited.statistics().expect("its statistics")).filter(|statistics| statistics.memory > 0));
@@ -900,8 +922,8 @@ fn limits_a_container(machine: &Machine, containers: &Containers) {
 /// Gives a container its own interface on the NAT network, at an address the
 /// NAT's DHCP server leased. The host can reach it and it can reach the
 /// internet. Deleting the container returns the device to the guest.
-fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, gateway: &str) {
-  let interface = Interface::leased(&machine.agent, SPARE).expect("lease an address");
+fn gives_a_container_an_interface(machine: &machine::Machine, containers: &container::Containers, gateway: &str) {
+  let interface = network::Interface::leased(&machine.agent, SPARE).expect("lease an address");
   assert_eq!(interface.gateway.as_deref(), Some(gateway), "{interface:?}");
   machine
     .agent
@@ -917,14 +939,14 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
     .create(
       "reachable",
       "images/userland@base",
-      Configuration {
-        network: Network::Interfaces(vec![interface]),
-        ..Configuration::default()
+      container::Configuration {
+        network: network::Network::Interfaces(vec![interface]),
+        ..container::Configuration::default()
       },
     )
     .expect("create a container with an interface");
   let server = reachable
-    .exec(Exec::new(sh("echo reached | nc -N -l 8080")))
+    .exec(message::Exec::new(sh("echo reached | nc -N -l 8080")))
     .expect("serve in the container");
   let address: std::net::SocketAddr = format!("{address}:8080").parse().expect("its address");
   let mut stream = eventually(|| std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok());
@@ -936,7 +958,7 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
   assert_eq!(answer, "reached\n");
   // nc keeps reading until the host closes the connection.
   drop(stream);
-  assert_eq!(finish(&server), (String::new(), Exit::Code(0)));
+  assert_eq!(finish(&server), (String::new(), message::Exit::Code(0)));
   reachable
     .check(&INTERNET, TIMEOUT)
     .expect("connect out from its interface");
@@ -949,16 +971,16 @@ fn gives_a_container_an_interface(machine: &Machine, containers: &Containers, ga
     .expect("its device is back in the guest");
 }
 
-fn deletes_containers_left_behind(machine: &Machine, containers: &Containers) {
+fn deletes_containers_left_behind(machine: &machine::Machine, containers: &container::Containers) {
   // A container whose handle was dropped can be deleted by id, mounts and all.
   drop(
     containers
       .create(
         "left",
         "images/userland@base",
-        Configuration {
-          mounts: vec![Mount::tmpfs("/scratch")],
-          ..Configuration::default()
+        container::Configuration {
+          mounts: vec![mount::Mount::tmpfs("/scratch")],
+          ..container::Configuration::default()
         },
       )
       .expect("create another container"),
@@ -974,10 +996,10 @@ fn deletes_containers_left_behind(machine: &Machine, containers: &Containers) {
       .create(
         "removed",
         "images/userland@base",
-        Configuration {
+        container::Configuration {
           memory_in_bytes: Some(64 << 20),
-          mounts: vec![Mount::tmpfs("/scratch")],
-          ..Configuration::default()
+          mounts: vec![mount::Mount::tmpfs("/scratch")],
+          ..container::Configuration::default()
         },
       )
       .expect("create a container to remove"),
@@ -996,7 +1018,7 @@ fn deletes_containers_left_behind(machine: &Machine, containers: &Containers) {
   assert_eq!(ran.stdout, "", "its rules outlived it");
   assert!(containers.list().expect("list containers").is_empty());
   assert!(
-    Jail::find(&machine.agent, "left")
+    jail::Jail::find(&machine.agent, "left")
       .expect("look for its jail")
       .is_none()
   );
@@ -1060,7 +1082,7 @@ fn runs_a_build_sized_workload_on_a_share() {
   write_project(&shared.join("project"));
 
   let mut layout = prepare(&work);
-  layout.shares.push(Share {
+  layout.shares.push(machine::Share {
     tag: "shared".into(),
     path: shared.clone(),
     read_only: false,
@@ -1172,8 +1194,8 @@ fn gzip(bytes: &[u8], work: &Path) -> Vec<u8> {
 }
 
 /// Stores `bytes` as a blob of `media_type` and returns its descriptor.
-fn blob(content: &ContentStore, media_type: &str, bytes: &[u8]) -> Descriptor {
-  Descriptor::new(
+fn blob(content: &oci::content::ContentStore, media_type: &str, bytes: &[u8]) -> oci::Descriptor {
+  oci::Descriptor::new(
     media_type,
     content.ingest(bytes).expect("store a blob"),
     bytes.len() as u64,
@@ -1183,13 +1205,14 @@ fn blob(content: &ContentStore, media_type: &str, bytes: &[u8]) -> Descriptor {
 #[test]
 fn pulls_unpacks_and_runs_oci_images() {
   let work = work("pulls_unpacks_and_runs_oci_images");
-  let platform = Platform::default();
-  let store = ImageStore::new(&cache().join("images")).expect("open the image store");
+  let platform = oci::Platform::default();
+  let store =
+    images::ImageStore::new(&containerization_freebsd_test::cache().join("images")).expect("open the image store");
   let runtime = store
     .pull(
       "ghcr.io/freebsd/freebsd-runtime:15.1",
       &platform,
-      &RegistryClient::default(),
+      &oci::registry::RegistryClient::default(),
     )
     .expect("pull FreeBSD's runtime image");
   let whiteouts = layers_an_image_on_the_runtime(&work, &store, &runtime, &platform);
@@ -1197,15 +1220,15 @@ fn pulls_unpacks_and_runs_oci_images() {
   let machine = boot(&prepare(&work), "images");
 
   let (base, layered) = unpacks_each_layer_once(&machine, &runtime, &whiteouts, &platform);
-  let containers = Containers::new(&machine.agent, "zroot/cfbsd/containers");
+  let containers = container::Containers::new(&machine.agent, "zroot/cfbsd/containers");
   runs_the_images_process(&containers, &runtime, &platform, &base);
   let hidden = containers
     .create(
       "whiteouts",
       &layered,
-      Configuration {
-        network: Network::None,
-        ..Configuration::default()
+      container::Configuration {
+        network: network::Network::None,
+        ..container::Configuration::default()
       },
     )
     .expect("create a container of the layered image");
@@ -1221,7 +1244,12 @@ fn pulls_unpacks_and_runs_oci_images() {
 /// Makes an image of two layers on top of the runtime's and names it
 /// `localhost/cfbsd/whiteouts:1`. The second layer whites out a file from the
 /// first and one from the runtime's, and makes a directory opaque.
-fn layers_an_image_on_the_runtime(work: &Path, store: &ImageStore, runtime: &Image, platform: &Platform) -> Image {
+fn layers_an_image_on_the_runtime(
+  work: &Path,
+  store: &images::ImageStore,
+  runtime: &images::Image,
+  platform: &oci::Platform,
+) -> images::Image {
   let added = layer(
     work,
     "added",
@@ -1247,7 +1275,7 @@ fn layers_an_image_on_the_runtime(work: &Path, store: &ImageStore, runtime: &Ima
   config
     .rootfs
     .diff_ids
-    .extend([Digest::of(&added), Digest::of(&hiding)]);
+    .extend([digest::Digest::of(&added), digest::Digest::of(&hiding)]);
   let (_, mut manifest) = runtime.manifest(platform).expect("its manifest");
   manifest.config = blob(
     content,
@@ -1284,12 +1312,12 @@ fn layers_an_image_on_the_runtime(work: &Path, store: &ImageStore, runtime: &Ima
 /// snapshots. Each layer becomes a snapshot, unpacked once however many
 /// images share it.
 fn unpacks_each_layer_once(
-  machine: &Machine,
-  runtime: &Image,
-  layered: &Image,
-  platform: &Platform,
+  machine: &machine::Machine,
+  runtime: &images::Image,
+  layered: &images::Image,
+  platform: &oci::Platform,
 ) -> (String, String) {
-  let unpacker = Unpacker::new(&machine.agent, "zroot/cfbsd/layers");
+  let unpacker = unpack::Unpacker::new(&machine.agent, "zroot/cfbsd/layers");
   let base = unpacker
     .unpack(runtime, platform)
     .expect("unpack the runtime image");
@@ -1307,15 +1335,20 @@ fn unpacks_each_layer_once(
 
 /// Runs a container of the runtime image, at `snapshot`, with the image's
 /// configured process: a shell that reads commands from stdin.
-fn runs_the_images_process(containers: &Containers, runtime: &Image, platform: &Platform, snapshot: &str) {
+fn runs_the_images_process(
+  containers: &container::Containers,
+  runtime: &images::Image,
+  platform: &oci::Platform,
+  snapshot: &str,
+) {
   let mut shell = containers
     .create(
       "runtime",
       snapshot,
-      Configuration {
+      container::Configuration {
         process: runtime.config(platform).expect("its config").process(),
-        network: Network::None,
-        ..Configuration::default()
+        network: network::Network::None,
+        ..container::Configuration::default()
       },
     )
     .expect("create a container of the image");
@@ -1327,14 +1360,14 @@ fn runs_the_images_process(containers: &Containers, runtime: &Image, platform: &
   main.close_input().expect("end its input");
   let (stdout, exit) = finish(main);
   assert!(stdout.starts_with("15.1-RELEASE"), "{stdout}");
-  assert_eq!(exit, Exit::Code(3));
+  assert_eq!(exit, message::Exit::Code(3));
   shell.delete().expect("delete the container");
 }
 
 /// Checks `hidden`, a container of the layered image: the whiteouts hide a
 /// file from the first layer, the opaque directory's old file and a file from
 /// the runtime, while a name that only contains `.wh.` stays.
-fn applies_whiteouts(hidden: &Container) {
+fn applies_whiteouts(hidden: &container::Container) {
   let ran = hidden
     .check(
       &sh("cat /cfbsd/kept /cfbsd/x.wh.y; ls -A /cfbsd/opaque /cfbsd; test ! -e /bin/freebsd-version && echo hidden"),
@@ -1360,7 +1393,7 @@ fn applies_whiteouts(hidden: &Container) {
 
 /// Copies files and directories in and out of `hidden`, through the guest's
 /// `/rescue` tools rather than the image's.
-fn copies_in_and_out(hidden: &Container, work: &Path) {
+fn copies_in_and_out(hidden: &container::Container, work: &Path) {
   let copies = work.join("copies");
   let tree = copies.join("tree");
   std::fs::create_dir_all(tree.join("sub")).expect("make a tree to copy");
@@ -1369,16 +1402,16 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
   let big: Vec<u8> = (0..1u32 << 20).map(|i| (i % 251) as u8).collect();
   std::fs::write(copies.join("big"), &big).expect("write a file to copy");
   hidden
-    .copy_in(&copies.join("big"), "/cfbsd/new/", 0o644, Parents::Create)
+    .copy_in(&copies.join("big"), "/cfbsd/new/", 0o644, copy::Parents::Create)
     .expect_err("copy a file into a missing directory");
   hidden
-    .copy_in(&copies.join("big"), "/cfbsd/new/big", 0o600, Parents::Create)
+    .copy_in(&copies.join("big"), "/cfbsd/new/big", 0o600, copy::Parents::Create)
     .expect("copy a file in");
   hidden
-    .copy_in(&tree, "/cfbsd", 0o644, Parents::Create)
+    .copy_in(&tree, "/cfbsd", 0o644, copy::Parents::Create)
     .expect("copy a directory into a directory");
   hidden
-    .copy_in(&tree, "/cfbsd/kept", 0o644, Parents::Create)
+    .copy_in(&tree, "/cfbsd/kept", 0o644, copy::Parents::Create)
     .expect_err("copy a directory over a file");
   let ran = hidden
     .check(
@@ -1389,7 +1422,7 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
   assert_eq!(ran.lines(), ["-rw------- 0", "-rw-r--r-- 0", "one"]);
   let out = copies.join("out");
   hidden
-    .copy_out("/cfbsd/new/big", &out.join("big"), Parents::Create)
+    .copy_out("/cfbsd/new/big", &out.join("big"), copy::Parents::Create)
     .expect("copy a file out");
   assert_eq!(std::fs::read(out.join("big")).expect("read the file copied out"), big);
   let mode = std::fs::metadata(out.join("big"))
@@ -1398,21 +1431,21 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
     .mode();
   assert_eq!(mode & 0o777, 0o644);
   hidden
-    .copy_out("/cfbsd/tree", &out.join("tree"), Parents::Create)
+    .copy_out("/cfbsd/tree", &out.join("tree"), copy::Parents::Create)
     .expect("copy a directory out");
   for (path, text) in [("one", "one\n"), ("sub/two", "two\n")] {
     let copied = std::fs::read_to_string(out.join("tree").join(path)).expect("read a file copied out");
     assert_eq!(copied, text);
   }
   hidden
-    .copy_out("/cfbsd/missing", &out.join("missing"), Parents::Create)
+    .copy_out("/cfbsd/missing", &out.join("missing"), copy::Parents::Create)
     .expect_err("copy out what is missing");
   // Copying refuses devices and FIFOs, which could block or never end.
   hidden
-    .copy_out("/dev/null", &out.join("null"), Parents::Create)
+    .copy_out("/dev/null", &out.join("null"), copy::Parents::Create)
     .expect_err("copy out a device");
   hidden
-    .copy_in(&copies.join("big"), "/dev/null", 0o644, Parents::Create)
+    .copy_in(&copies.join("big"), "/dev/null", 0o644, copy::Parents::Create)
     .expect_err("copy over a device");
   let fifo = copies.join("fifo");
   let made = std::process::Command::new("mkfifo")
@@ -1421,6 +1454,6 @@ fn copies_in_and_out(hidden: &Container, work: &Path) {
     .expect("run mkfifo");
   assert!(made.success(), "make a FIFO on the host");
   hidden
-    .copy_in(&fifo, "/cfbsd/fifo", 0o644, Parents::Create)
+    .copy_in(&fifo, "/cfbsd/fifo", 0o644, copy::Parents::Create)
     .expect_err("copy in a FIFO");
 }

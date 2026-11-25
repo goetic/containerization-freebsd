@@ -1,9 +1,8 @@
 //! Relays Unix sockets between the host and the guest or a jail, like
 //! Containerization's `UnixSocketConfiguration`.
 
-use crate::agent::{Agent, Listener};
-use crate::error::{Error, Result};
-use containerization_freebsd_protocol::{Address, Connect, Listen};
+use crate::{agent, error};
+use containerization_freebsd_protocol::message;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -45,7 +44,7 @@ pub struct SocketRelay {
 }
 
 enum Relaying {
-  Into(Listener),
+  Into(agent::channel::Listener),
   OutOf(HostListener),
 }
 
@@ -55,20 +54,20 @@ struct HostListener {
   stopped: Arc<AtomicBool>,
 }
 
-impl Agent {
+impl agent::Agent {
   /// Relays `socket` between the host and the guest, replacing any socket
   /// already at the listening path. For `Into`, the socket's guest directory
   /// must exist.
-  pub fn relay_socket(&self, socket: &UnixSocket) -> Result<SocketRelay> {
+  pub fn relay_socket(&self, socket: &UnixSocket) -> error::Result<SocketRelay> {
     self.relay_socket_in(socket, None)
   }
 
   /// Like `relay_socket`, with the socket's guest path in `jail`, if given.
-  pub(crate) fn relay_socket_in(&self, socket: &UnixSocket, jail: Option<&str>) -> Result<SocketRelay> {
+  pub(crate) fn relay_socket_in(&self, socket: &UnixSocket, jail: Option<&str>) -> error::Result<SocketRelay> {
     let jail = jail.map(str::to_string);
     let relaying = match socket.direction {
       Direction::Into => {
-        let listen = Listen {
+        let listen = message::Listen {
           path: socket.guest.clone(),
           jail,
           mode: socket.mode,
@@ -76,13 +75,13 @@ impl Agent {
         Relaying::Into(self.listen(listen, socket.host.clone())?)
       }
       Direction::OutOf => {
-        let connect = Connect {
-          to: Address::Unix(socket.guest.clone()),
+        let connect = message::Connect {
+          to: message::Address::Unix(socket.guest.clone()),
           jail,
         };
         Relaying::OutOf(
           HostListener::start(self.share(), socket, connect)
-            .map_err(Error::io(format!("listening on {}", socket.host.display())))?,
+            .map_err(error::Error::io(format!("listening on {}", socket.host.display())))?,
         )
       }
     };
@@ -95,7 +94,7 @@ impl SocketRelay {
   /// Stops the relay and removes its socket. For `Into`, waits for the agent
   /// to close the listener and unlink the socket, so the listener no longer
   /// holds the socket's file system busy.
-  pub fn close(self) -> Result<()> {
+  pub fn close(self) -> error::Result<()> {
     match self.relaying {
       Relaying::Into(listener) => listener.close(),
       Relaying::OutOf(listener) => {
@@ -109,7 +108,7 @@ impl SocketRelay {
 impl HostListener {
   /// Listens at `socket.host` and relays each connection to the guest
   /// address in `connect`.
-  fn start(agent: Agent, socket: &UnixSocket, connect: Connect) -> io::Result<Self> {
+  fn start(agent: agent::Agent, socket: &UnixSocket, connect: message::Connect) -> io::Result<Self> {
     let path = socket.host.clone();
     remove_socket(&path)?;
     let listener = UnixListener::bind(&path)?;
@@ -161,7 +160,6 @@ fn remove_socket(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::agent::tests::started;
   use std::io::{Read, Write};
   use std::net::Shutdown;
 
@@ -204,7 +202,7 @@ mod tests {
 
   #[test]
   fn relays_a_host_socket_into_the_guest() {
-    let agent = started();
+    let agent = agent::tests::started();
     let directory = tempfile::tempdir().unwrap();
     let (host, guest) = (directory.path().join("host.sock"), directory.path().join("guest.sock"));
     answer_in_capitals(UnixListener::bind(&host).unwrap());
@@ -224,7 +222,7 @@ mod tests {
 
   #[test]
   fn relays_a_guest_socket_out_to_the_host() {
-    let agent = started();
+    let agent = agent::tests::started();
     let directory = tempfile::tempdir().unwrap();
     let (host, guest) = (directory.path().join("host.sock"), directory.path().join("guest.sock"));
     answer_in_capitals(UnixListener::bind(&guest).unwrap());
@@ -242,7 +240,7 @@ mod tests {
 
   #[test]
   fn closes_connections_it_cannot_relay() {
-    let agent = started();
+    let agent = agent::tests::started();
     let directory = tempfile::tempdir().unwrap();
     let path = |name: &str| directory.path().join(name);
 

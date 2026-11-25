@@ -7,10 +7,8 @@
 //! If a child inherits the process's stdout and keeps it open, the host sees
 //! the process as running until that child exits too.
 
-use crate::pipe::{Stopped, read_chunks, write_until_eof};
-use crate::session::{Handle, Outbox};
-use crate::{sys, user};
-use containerization_freebsd_protocol::{Exec, Exit, Message, WindowSize};
+use crate::{pipe, session, sys, user};
+use containerization_freebsd_protocol::message;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -41,17 +39,17 @@ impl Process {
 
   /// Sends `signal`, numbered as on the guest, to the process.
   pub(crate) fn signal(&self, signal: i32) -> io::Result<()> {
-    self.while_alive(|pid| sys::signal(pid, signal))
+    self.while_alive(|pid| sys::process::signal(pid, signal))
   }
 
   /// Kills the process and the rest of its process group.
   pub(crate) fn kill(&self) {
-    let _ = self.while_alive(sys::kill_group);
+    let _ = self.while_alive(sys::process::kill_group);
   }
 
-  pub(crate) fn resize(&self, size: WindowSize) -> io::Result<()> {
+  pub(crate) fn resize(&self, size: message::WindowSize) -> io::Result<()> {
     match &self.terminal {
-      Some(terminal) => sys::resize(terminal, window(size)),
+      Some(terminal) => sys::terminal::resize(terminal, window(size)),
       None => Ok(()),
     }
   }
@@ -66,7 +64,7 @@ impl Process {
   /// Waits for the process to exit without reaping it, then disables
   /// signalling it.
   fn exited(&self) {
-    if let Err(error) = sys::wait_exited(self.pid) {
+    if let Err(error) = sys::process::wait_exited(self.pid) {
       eprintln!("agent: waiting for process {}: {error}", self.pid);
     }
     *self.alive.lock().unwrap_or_else(PoisonError::into_inner) = false;
@@ -76,7 +74,7 @@ impl Process {
 /// Starts the process `exec` describes and sends its output to `outbox`.
 /// `exec`'s environment is added to the agent's. An error names the step
 /// that failed.
-pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
+pub(crate) fn spawn(exec: &message::Exec, outbox: session::Outbox) -> io::Result<session::Handle> {
   let (program, args) = exec
     .argv
     .split_first()
@@ -89,11 +87,11 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
     // Make the process a session leader with the pty as its controlling
     // terminal, as for a login shell. Registered first, so the hook runs
     // before privileges are dropped.
-    sys::take_terminal_on_exec(&mut command);
+    sys::terminal::take_terminal_on_exec(&mut command);
   }
   let mut entering = enter(&mut command, exec)?;
   if exec.rescue {
-    sys::rescue_on_exec(&mut command, &exec.argv)?;
+    sys::exec::rescue_on_exec(&mut command, &exec.argv)?;
   }
 
   let started = match exec.pty {
@@ -101,14 +99,14 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
     None => on_pipes(command, outbox),
   };
   started.map_err(|error| {
-    let doing = match entering.as_mut().and_then(sys::Entering::failed) {
-      Some(sys::Step::Jail) => format!("entering jail {:?}", exec.jail.as_deref().unwrap_or_default()),
-      Some(sys::Step::Limits) => "setting its resource limits".to_string(),
-      Some(sys::Step::User) => format!(
+    let doing = match entering.as_mut().and_then(sys::exec::Entering::failed) {
+      Some(sys::exec::Step::Jail) => format!("entering jail {:?}", exec.jail.as_deref().unwrap_or_default()),
+      Some(sys::exec::Step::Limits) => "setting its resource limits".to_string(),
+      Some(sys::exec::Step::User) => format!(
         "becoming {:?}",
         exec.user.as_ref().map_or("", |user| user.name.as_str())
       ),
-      Some(sys::Step::Directory) => format!("changing to {:?}", exec.cwd.as_deref().unwrap_or("/")),
+      Some(sys::exec::Step::Directory) => format!("changing to {:?}", exec.cwd.as_deref().unwrap_or("/")),
       None => format!("running {program:?}"),
     };
     io::Error::new(error.kind(), format!("{doing}: {error}"))
@@ -119,7 +117,7 @@ pub(crate) fn spawn(exec: &Exec, outbox: Outbox) -> io::Result<Handle> {
 /// privileges to its user, then change directory. In a jail, the directory
 /// defaults to `/`. The returned `Entering` reports which step failed; it is
 /// `None` when `exec` asks for none of these steps.
-fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>> {
+fn enter(command: &mut Command, exec: &message::Exec) -> io::Result<Option<sys::exec::Entering>> {
   if exec.jail.is_none() && exec.user.is_none() && exec.umask.is_none() && exec.limits.is_empty() && exec.cwd.is_none()
   {
     return Ok(None);
@@ -127,7 +125,7 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
 
   let (jail, root) = match &exec.jail {
     Some(name) => {
-      let (jail, root) = sys::find_jail(name)?;
+      let (jail, root) = sys::jail::find_jail(name)?;
       (Some(jail), root)
     }
     None => (None, PathBuf::from("/")),
@@ -144,14 +142,14 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
   }
   let cwd = exec.cwd.as_deref().or(jail.map(|_| "/")).map(PathBuf::from);
 
-  sys::enter_on_exec(
+  sys::exec::enter_on_exec(
     command,
-    sys::Entry {
+    sys::exec::Entry {
       jail,
       limits: exec
         .limits
         .iter()
-        .map(|limit| sys::Limit {
+        .map(|limit| sys::exec::Limit {
           resource: limit.resource.0,
           soft: limit.soft,
           hard: limit.hard,
@@ -165,14 +163,14 @@ fn enter(command: &mut Command, exec: &Exec) -> io::Result<Option<sys::Entering>
   .map(Some)
 }
 
-fn window(size: WindowSize) -> sys::WindowSize {
-  sys::WindowSize {
+fn window(size: message::WindowSize) -> sys::terminal::WindowSize {
+  sys::terminal::WindowSize {
     rows: size.rows,
     columns: size.columns,
   }
 }
 
-fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
+fn on_pipes(mut command: Command, outbox: session::Outbox) -> io::Result<session::Handle> {
   // A process group of its own, so ending the channel also kills the
   // process's children.
   command
@@ -190,7 +188,7 @@ fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
   thread::spawn(move || {
     let mut stdin = stdin;
     // Returning drops stdin, which closes the process's input.
-    write_until_eof(&mut stdin, &inputs);
+    pipe::write_until_eof(&mut stdin, &inputs);
   });
   let output = vec![
     pump(stdout, outbox.clone(), Output::Stdout),
@@ -198,11 +196,15 @@ fn on_pipes(mut command: Command, outbox: Outbox) -> io::Result<Handle> {
   ];
   watch(child, process.clone(), output, outbox);
 
-  Ok(Handle::Process { input, process })
+  Ok(session::Handle::Process { input, process })
 }
 
-fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Result<Handle> {
-  let (terminal, child_end) = sys::open_terminal(window(size))?;
+fn in_terminal(
+  mut command: Command,
+  size: message::WindowSize,
+  outbox: session::Outbox,
+) -> io::Result<session::Handle> {
+  let (terminal, child_end) = sys::terminal::open_terminal(window(size))?;
   let terminal = Arc::new(terminal);
   command
     .stdin(child_end.try_clone()?)
@@ -219,11 +221,11 @@ fn in_terminal(mut command: Command, size: WindowSize, outbox: Outbox) -> io::Re
   let mut writer = terminal.clone();
   // A terminal has no end of input to send: the host sends ^D as Data, so its
   // Eof is ignored.
-  thread::spawn(move || while write_until_eof(&mut writer, &inputs) {});
+  thread::spawn(move || while pipe::write_until_eof(&mut writer, &inputs) {});
   let output = vec![pump(terminal, outbox.clone(), Output::Stdout)];
   watch(child, process.clone(), output, outbox);
 
-  Ok(Handle::Process { input, process })
+  Ok(session::Handle::Process { input, process })
 }
 
 /// Which of a process's outputs `pump` reads. On a terminal, stdout carries
@@ -236,27 +238,27 @@ enum Output {
 
 /// Reads `source` until it ends, sending each read as Data for stdout or as
 /// Stderr, and then Eof for stdout.
-fn pump(source: impl Read + Send + 'static, outbox: Outbox, output: Output) -> JoinHandle<()> {
+fn pump(source: impl Read + Send + 'static, outbox: session::Outbox, output: Output) -> JoinHandle<()> {
   thread::spawn(move || {
     let wrap = match output {
-      Output::Stdout => Message::Data,
-      Output::Stderr => Message::Stderr,
+      Output::Stdout => message::Message::Data,
+      Output::Stderr => message::Message::Stderr,
     };
     // Once no descriptor for a pty's child end is open, reading the
     // controller end fails instead of returning EOF, so failing ends the
     // output too.
-    if let Stopped::Refused = read_chunks(source, |bytes| outbox.send(wrap(bytes))) {
+    if let pipe::Stopped::Refused = pipe::read_chunks(source, |bytes| outbox.send(wrap(bytes))) {
       return;
     }
     if output == Output::Stdout {
-      outbox.send(Message::Eof);
+      outbox.send(message::Message::Eof);
     }
   })
 }
 
 /// Sends Exited once the output has ended and the process has exited.
 /// Signalling is disabled before `child.wait()` reaps the process.
-fn watch(mut child: Child, process: Arc<Process>, output: Vec<JoinHandle<()>>, outbox: Outbox) {
+fn watch(mut child: Child, process: Arc<Process>, output: Vec<JoinHandle<()>>, outbox: session::Outbox) {
   thread::spawn(move || {
     for pump in output {
       let _ = pump.join();
@@ -264,16 +266,16 @@ fn watch(mut child: Child, process: Arc<Process>, output: Vec<JoinHandle<()>>, o
     process.exited();
 
     let message = match child.wait() {
-      Ok(status) => Message::Exited(exit(status)),
-      Err(error) => Message::Error(format!("waiting for the process: {error}")),
+      Ok(status) => message::Message::Exited(exit(status)),
+      Err(error) => message::Message::Error(format!("waiting for the process: {error}")),
     };
     outbox.send(message);
   });
 }
 
-fn exit(status: ExitStatus) -> Exit {
+fn exit(status: ExitStatus) -> message::Exit {
   match status.code() {
-    Some(code) => Exit::Code(code),
-    None => Exit::Signal(status.signal().unwrap_or_default()),
+    Some(code) => message::Exit::Code(code),
+    None => message::Exit::Signal(status.signal().unwrap_or_default()),
   }
 }

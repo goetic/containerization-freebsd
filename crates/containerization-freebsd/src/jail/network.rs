@@ -1,11 +1,9 @@
 //! Jail networking: none, the guest's stack, VNET behind pf NAT on a guest
 //! bridge, or VNET on dedicated Virtualization NAT devices.
 
-use super::Jail;
-use crate::agent::{Agent, QUICK, Spawn};
-use crate::error::{Error, Result};
-use crate::machine::Mac;
-use containerization_freebsd_protocol::{Addressing, Bridge, DeviceAddress, FileCopy, GuestPath, Lease};
+use crate::agent::{self, Spawn};
+use crate::{error, machine};
+use containerization_freebsd_protocol::message;
 use std::net::Ipv4Addr;
 
 /// The bridge that NAT jails' epairs join.
@@ -38,7 +36,7 @@ pub enum Network {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Interface {
   /// The device's MAC address.
-  pub mac: Mac,
+  pub mac: machine::Mac,
   /// IPv4 address and prefix length, such as `192.168.64.3/24`. The NAT's
   /// DHCP server leases from the same subnet, so pick an address it hasn't
   /// leased, or get a leased one from `Interface::leased`.
@@ -50,7 +48,7 @@ pub struct Interface {
 impl Network {
   /// The jail(8) parameters for this network. For `Nat`, first sets up NAT in
   /// the guest and creates the jail's epair, which it also returns.
-  pub(super) fn parameters(&self, agent: &Agent) -> Result<(Vec<String>, Option<Epair>)> {
+  pub(super) fn parameters(&self, agent: &agent::Agent) -> error::Result<(Vec<String>, Option<Epair>)> {
     Ok(match self {
       Self::None => (Vec::new(), None),
       Self::Inherit => (vec!["ip4=inherit".into(), "ip6=inherit".into()], None),
@@ -70,18 +68,18 @@ impl Interface {
   /// The server gives that address to no other machine while the lease lasts.
   /// Nothing renews the lease, but the server leases the same address to the
   /// same MAC again. Call this before a jail claims the device.
-  pub fn leased(agent: &Agent, mac: Mac) -> Result<Self> {
-    let Lease { address, gateway } = agent.lease(&mac.to_string())?;
+  pub fn leased(agent: &agent::Agent, mac: machine::Mac) -> error::Result<Self> {
+    let message::Lease { address, gateway } = agent.lease(&mac.to_string())?;
 
     Ok(Self { mac, address, gateway })
   }
 }
 
-impl Jail<'_> {
+impl super::Jail<'_> {
   /// Configures a new jail's network: lo0 and the epair's b end for `Nat`,
   /// lo0 and the claimed devices for `Interfaces`, and resolv.conf for any
   /// networked jail.
-  pub(super) fn configure(&self, network: &Network, epair: Option<&Epair>) -> Result<()> {
+  pub(super) fn configure(&self, network: &Network, epair: Option<&Epair>) -> error::Result<()> {
     if let Some(epair) = epair {
       let address = format!("{}/{PREFIX}", epair.address);
       self.set_address(Some((format!("{}b", epair.name), address)), Some(GATEWAY.to_string()))?;
@@ -103,20 +101,20 @@ impl Jail<'_> {
 
   /// Removes the jail's resolv.conf if it is the copy of the guest's that
   /// `start` made, and nothing has changed it since.
-  pub(crate) fn remove_resolv_conf(&self) -> Result<()> {
+  pub(crate) fn remove_resolv_conf(&self) -> error::Result<()> {
     self.agent.remove_copy(self.resolv_conf())
   }
 
   /// The guest's resolv.conf, and where the jail's is.
-  fn resolv_conf(&self) -> FileCopy {
+  fn resolv_conf(&self) -> message::FileCopy {
     let path = "/etc/resolv.conf".to_string();
 
-    FileCopy {
-      from: GuestPath {
+    message::FileCopy {
+      from: message::GuestPath {
         path: path.clone(),
         jail: None,
       },
-      to: GuestPath {
+      to: message::GuestPath {
         path,
         jail: Some(self.name.clone()),
       },
@@ -125,10 +123,10 @@ impl Jail<'_> {
 
   /// Brings up the VNET jail's lo0, gives the device, if any, its address,
   /// and routes the jail's traffic through the gateway, if any.
-  fn set_address(&self, device: Option<(String, String)>, gateway: Option<String>) -> Result<()> {
-    self.agent.set_address(Addressing {
+  fn set_address(&self, device: Option<(String, String)>, gateway: Option<String>) -> error::Result<()> {
+    self.agent.set_address(message::Addressing {
       jail: self.name.clone(),
-      device: device.map(|(device, address)| DeviceAddress { device, address }),
+      device: device.map(|(device, address)| message::DeviceAddress { device, address }),
       gateway,
     })
   }
@@ -144,24 +142,24 @@ pub(super) struct Epair {
 
 impl Epair {
   /// Destroys both ends, as destroying either does.
-  pub(super) fn destroy(&self, agent: &Agent) -> Result<()> {
+  pub(super) fn destroy(&self, agent: &agent::Agent) -> error::Result<()> {
     agent
-      .check(&["ifconfig", &format!("{}a", self.name), "destroy"], QUICK)
+      .check(&["ifconfig", &format!("{}a", self.name), "destroy"], agent::QUICK)
       .map(|_| ())
   }
 }
 
-fn epair(agent: &Agent) -> Result<Epair> {
-  let outside = agent.create_epair(Bridge {
+fn epair(agent: &agent::Agent) -> error::Result<Epair> {
+  let outside = agent.create_epair(message::Bridge {
     name: BRIDGE.to_string(),
     address: format!("{GATEWAY}/{PREFIX}"),
     subnet: format!("{SUBNET}/{PREFIX}"),
   })?;
   let name = outside
     .strip_suffix('a')
-    .ok_or_else(|| Error::Guest(format!("ifconfig made {outside:?}, not an epair")))?
+    .ok_or_else(|| error::Error::Guest(format!("ifconfig made {outside:?}, not an epair")))?
     .to_string();
-  let address = address(&name).ok_or_else(|| Error::Guest(format!("no address for {name}")))?;
+  let address = address(&name).ok_or_else(|| error::Error::Guest(format!("no address for {name}")))?;
 
   Ok(Epair { name, address })
 }

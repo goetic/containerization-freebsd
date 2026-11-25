@@ -1,20 +1,13 @@
 //! Host-side OCI support: image references, image-spec documents, a
 //! distribution API client, and a content-addressable store.
 
-mod auth;
-mod content;
-mod reference;
-mod registry;
+pub mod auth;
+pub mod content;
+pub mod reference;
+pub mod registry;
 
-pub use crate::digest::Digest;
-pub use auth::{Credentials, Secret};
-pub use content::ContentStore;
-pub(crate) use content::{BLOBS, blob_path};
-pub use reference::Reference;
-pub use registry::RegistryClient;
-
-use crate::agent::{Exec, User};
-use crate::error::{Error, Result};
+use crate::{digest, error};
+use containerization_freebsd_protocol::message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -43,7 +36,7 @@ pub const REF_NAME: &str = "org.opencontainers.image.ref.name";
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
   pub media_type: String,
-  pub digest: Digest,
+  pub digest: digest::Digest,
   pub size: u64,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub platform: Option<Platform>,
@@ -53,7 +46,7 @@ pub struct Descriptor {
 
 impl Descriptor {
   /// A descriptor with no platform or annotations.
-  pub fn new(media_type: impl Into<String>, digest: Digest, size: u64) -> Self {
+  pub fn new(media_type: impl Into<String>, digest: digest::Digest, size: u64) -> Self {
     Self {
       media_type: media_type.into(),
       digest,
@@ -208,31 +201,31 @@ pub struct RunConfig {
 pub struct RootFs {
   #[serde(rename = "type")]
   pub kind: String,
-  pub diff_ids: Vec<Digest>,
+  pub diff_ids: Vec<digest::Digest>,
 }
 
 impl ImageConfig {
   /// The container's default process: `Entrypoint` then `Cmd` as argv, with
   /// `Env`, `WorkingDir` and `User`. `User` is `user` or `user:group`, each a
   /// name or a numeric ID.
-  pub fn process(&self) -> Exec {
+  pub fn process(&self) -> message::Exec {
     let run = self.config.clone().unwrap_or_default();
     let user = run
       .user
       .filter(|user| !user.is_empty())
       .map(|user| match user.split_once(':') {
-        Some((name, group)) => User {
+        Some((name, group)) => message::User {
           name: name.to_string(),
           group: Some(group.to_string()),
           groups: Vec::new(),
         },
-        None => User {
+        None => message::User {
           name: user,
-          ..User::default()
+          ..message::User::default()
         },
       });
 
-    Exec {
+    message::Exec {
       argv: run
         .entrypoint
         .unwrap_or_default()
@@ -247,7 +240,7 @@ impl ImageConfig {
         .collect(),
       cwd: run.working_dir.filter(|directory| !directory.is_empty()),
       user,
-      ..Exec::default()
+      ..message::Exec::default()
     }
   }
 
@@ -263,12 +256,12 @@ impl ImageConfig {
   /// ID, and each later one is the sha256 of `<parent chain ID> <diff ID>`.
   /// A chain ID thus identifies a layer together with every layer beneath
   /// it.
-  pub fn chain_ids(&self) -> Vec<Digest> {
-    let mut chain: Vec<Digest> = Vec::with_capacity(self.rootfs.diff_ids.len());
+  pub fn chain_ids(&self) -> Vec<digest::Digest> {
+    let mut chain: Vec<digest::Digest> = Vec::with_capacity(self.rootfs.diff_ids.len());
 
     for diff_id in &self.rootfs.diff_ids {
       let next = match chain.last() {
-        Some(below) => Digest::of(format!("{below} {diff_id}").as_bytes()),
+        Some(below) => digest::Digest::of(format!("{below} {diff_id}").as_bytes()),
         None => diff_id.clone(),
       };
       chain.push(next);
@@ -278,8 +271,8 @@ impl ImageConfig {
 }
 
 /// Parses an image document; errors name it as `what`.
-pub(crate) fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
-  serde_json::from_slice(bytes).map_err(|error| Error::Invalid(format!("{what} is not valid: {error}")))
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> error::Result<T> {
+  serde_json::from_slice(bytes).map_err(|error| error::Error::Invalid(format!("{what} is not valid: {error}")))
 }
 
 #[cfg(test)]
@@ -302,7 +295,7 @@ mod tests {
     let config = ImageConfig {
       rootfs: RootFs {
         kind: "layers".into(),
-        diff_ids: vec![Digest::of(b"one"), Digest::of(b"two")],
+        diff_ids: vec![digest::Digest::of(b"one"), digest::Digest::of(b"two")],
       },
       ..ImageConfig::default()
     };
@@ -312,7 +305,7 @@ mod tests {
     assert_eq!(chain[0], config.rootfs.diff_ids[0]);
     assert_eq!(
       chain[1],
-      Digest::of(format!("{} {}", chain[0], config.rootfs.diff_ids[1]).as_bytes())
+      digest::Digest::of(format!("{} {}", chain[0], config.rootfs.diff_ids[1]).as_bytes())
     );
   }
 
@@ -340,7 +333,7 @@ mod tests {
       ]
     );
     assert_eq!(process.cwd.as_deref(), Some("/srv"));
-    assert_eq!(ImageConfig::default().process(), Exec::default());
+    assert_eq!(ImageConfig::default().process(), message::Exec::default());
   }
 
   #[test]
@@ -359,14 +352,14 @@ mod tests {
 
     assert_eq!(
       user("www"),
-      Some(User {
+      Some(message::User {
         name: "www".into(),
-        ..User::default()
+        ..message::User::default()
       })
     );
     assert_eq!(
       user("1000:wheel"),
-      Some(User {
+      Some(message::User {
         name: "1000".into(),
         group: Some("wheel".into()),
         groups: Vec::new(),

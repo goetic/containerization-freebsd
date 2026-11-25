@@ -1,10 +1,9 @@
 //! The session state an agent's handles share, and the thread that handles
 //! what the agent sends.
 
-use super::channel::{Stream, relay_accepted};
-use super::console::{self, Credit, Outgoing};
-use crate::error::{Error, Result};
-use containerization_freebsd_protocol::{CONTROL, Frame, Message, Mux, Side, VersionMismatch};
+use super::{channel, console};
+use crate::error;
+use containerization_freebsd_protocol::{frame, message, mux};
 use std::collections::HashMap;
 use std::io::{PipeReader, PipeWriter};
 use std::path::PathBuf;
@@ -23,13 +22,13 @@ pub(super) struct Shared {
 }
 
 pub(super) struct State {
-  pub(super) mux: Mux,
+  pub(super) mux: mux::Mux,
   /// The writer thread's queue. Frames go on it while the mux that made them
   /// is locked, so they reach the console in the order it made them.
-  outgoing: Sender<Outgoing>,
+  outgoing: Sender<console::Outgoing>,
   /// Where each open channel's messages go.
   pub(super) channels: HashMap<u32, Route>,
-  pub(super) mismatch: Option<VersionMismatch>,
+  pub(super) mismatch: Option<mux::VersionMismatch>,
   pub(super) closed: bool,
   /// How many sessions have started.
   pub(super) sessions: u64,
@@ -37,7 +36,7 @@ pub(super) struct State {
 
 /// Where an open channel's messages go.
 pub(super) struct Route {
-  pub(super) sender: mpsc::Sender<Message>,
+  pub(super) sender: mpsc::Sender<message::Message>,
   /// For a Listen channel, the host socket its connections are relayed to.
   pub(super) relay_to: Option<PathBuf>,
 }
@@ -52,7 +51,7 @@ enum Heard {
   Accepted {
     channel: u32,
     host: PathBuf,
-    messages: Receiver<Message>,
+    messages: Receiver<message::Message>,
   },
 }
 
@@ -61,7 +60,7 @@ pub(super) enum Event {
   /// Raw bytes as read, so that console text before a session can be shown.
   /// The reader stops passing them once a session starts.
   Read(Vec<u8>),
-  Frame(Frame),
+  Frame(frame::Frame),
   Skipped,
 }
 
@@ -70,7 +69,7 @@ pub(super) enum Event {
 /// handler thread can route what the agent sends while the frame waits for
 /// room in the window.
 #[must_use]
-pub(super) struct Written(Option<Receiver<Result<()>>>);
+pub(super) struct Written(Option<Receiver<error::Result<()>>>);
 
 impl Written {
   /// Nothing was queued, so there is nothing to wait for.
@@ -78,11 +77,13 @@ impl Written {
     Self(None)
   }
 
-  pub(super) fn wait(self) -> Result<()> {
+  pub(super) fn wait(self) -> error::Result<()> {
     match self.0 {
-      Some(written) => written
-        .recv()
-        .unwrap_or_else(|_| Err(Error::Guest("the thread writing to the console stopped".to_string()))),
+      Some(written) => written.recv().unwrap_or_else(|_| {
+        Err(error::Error::Guest(
+          "the thread writing to the console stopped".to_string(),
+        ))
+      }),
       None => Ok(()),
     }
   }
@@ -93,11 +94,11 @@ impl Shared {
   /// handler thread, and returns the state they share with the agent's
   /// handles.
   pub(super) fn start(output: PipeReader, input: PipeWriter) -> Arc<Self> {
-    let credit = Arc::new(Credit::default());
+    let credit = Arc::new(console::Credit::default());
     let (outgoing, queue) = mpsc::channel();
     let shared = Arc::new(Self {
       state: Mutex::new(State {
-        mux: Mux::new(Side::Host),
+        mux: mux::Mux::new(mux::Side::Host),
         outgoing,
         channels: HashMap::new(),
         mismatch: None,
@@ -124,7 +125,7 @@ impl Shared {
 
 impl State {
   /// Queues `frame` for the console, after every frame queued before it.
-  pub(super) fn queue(&self, frame: Frame) -> Written {
+  pub(super) fn queue(&self, frame: frame::Frame) -> Written {
     self.queue_encoded(frame.to_bytes())
   }
 
@@ -132,28 +133,28 @@ impl State {
     let (done, written) = mpsc::sync_channel(1);
 
     // If the writer thread has stopped, `wait` reports it.
-    let _ = self.outgoing.send(Outgoing { bytes, done });
+    let _ = self.outgoing.send(console::Outgoing { bytes, done });
     Written(Some(written))
   }
 
   /// Frames `message` for `channel` and queues it. Errors name what the
   /// message was for as `what`.
-  pub(super) fn send(&mut self, channel: u32, message: Message, what: &str) -> Result<Written> {
+  pub(super) fn send(&mut self, channel: u32, message: message::Message, what: &str) -> error::Result<Written> {
     let frame = self
       .mux
       .send(channel, message)
-      .map_err(Error::protocol(what))?;
+      .map_err(error::Error::protocol(what))?;
     Ok(self.queue(frame))
   }
 
   /// Frames `bytes` as Data for `channel` and queues it, encoding the frame
   /// straight from the slice. Errors name what the bytes were for as `what`.
-  pub(super) fn send_data(&mut self, channel: u32, bytes: &[u8], what: &str) -> Result<Written> {
+  pub(super) fn send_data(&mut self, channel: u32, bytes: &[u8], what: &str) -> error::Result<Written> {
     let mut encoded = Vec::new();
     self
       .mux
       .send_data(channel, bytes, &mut encoded)
-      .map_err(Error::protocol(what))?;
+      .map_err(error::Error::protocol(what))?;
     Ok(self.queue_encoded(encoded))
   }
 
@@ -164,23 +165,27 @@ impl State {
     self.queue(hello)
   }
 
-  pub(super) fn sync_clock(&mut self) -> Result<Written> {
+  pub(super) fn sync_clock(&mut self) -> error::Result<Written> {
     if !self.mux.in_session() {
       return Ok(Written::nothing());
     }
     let now = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .unwrap_or_default();
-    let time = Message::SetTime {
+    let time = message::Message::SetTime {
       seconds: now.as_secs(),
       nanoseconds: now.subsec_nanos(),
     };
-    self.send(CONTROL, time, "setting the guest's clock")
+    self.send(mux::CONTROL, time, "setting the guest's clock")
   }
 
   pub(super) fn close(&mut self, channel: u32, reason: &str) -> Written {
     self
-      .send(channel, Message::Error(reason.to_string()), "closing a channel")
+      .send(
+        channel,
+        message::Message::Error(reason.to_string()),
+        "closing a channel",
+      )
       .unwrap_or_else(|_| Written::nothing())
   }
 
@@ -188,29 +193,29 @@ impl State {
     self.channels.remove(&channel);
   }
 
-  fn receive(&mut self, frame: Frame) -> Heard {
+  fn receive(&mut self, frame: frame::Frame) -> Heard {
     let channel = frame.channel;
 
     match self.mux.receive(frame) {
       // The agent has no session because it just started or lost frames.
-      Ok((_, Message::Hello { answer: false, .. })) => {
+      Ok((_, message::Message::Hello { answer: false, .. })) => {
         let _ = self.hello();
         Heard::Nothing
       }
       // A session has started. The guest just booted or was restored, so its
       // clock may be behind.
-      Ok((_, Message::Hello { answer: true, .. })) => {
+      Ok((_, message::Message::Hello { answer: true, .. })) => {
         self.sessions += 1;
         let _ = self.sync_clock();
         Heard::Changed
       }
       // The console reader thread has already counted it.
-      Ok((_, Message::Received(_))) => Heard::Nothing,
-      Ok((_, Message::Ping(number))) => {
-        let _ = self.send(channel, Message::Pong(number), "answering a ping");
+      Ok((_, message::Message::Received(_))) => Heard::Nothing,
+      Ok((_, message::Message::Ping(number))) => {
+        let _ = self.send(channel, message::Message::Pong(number), "answering a ping");
         Heard::Nothing
       }
-      Ok((_, Message::Accepted { listener })) => match self
+      Ok((_, message::Message::Accepted { listener })) => match self
         .channels
         .get(&listener)
         .and_then(|route| route.relay_to.clone())
@@ -241,7 +246,7 @@ impl State {
         }
         Heard::Nothing
       }
-      Err(containerization_freebsd_protocol::Error::Version(mismatch)) => {
+      Err(mux::Error::Version(mismatch)) => {
         self.mismatch = Some(mismatch);
         Heard::Changed
       }
@@ -287,8 +292,8 @@ fn handle(inbound: &Receiver<Event>, shared: &Arc<Shared>) {
         messages,
       } => {
         let what = format!("a connection to {}", host.display());
-        let stream = Stream::new(channel, shared.clone(), messages, what);
-        std::thread::spawn(move || relay_accepted(stream, &host));
+        let stream = channel::Stream::new(channel, shared.clone(), messages, what);
+        std::thread::spawn(move || channel::relay_accepted(stream, &host));
       }
     }
   }

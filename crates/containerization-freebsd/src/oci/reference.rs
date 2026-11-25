@@ -1,5 +1,4 @@
-use super::Digest;
-use crate::error::{Error, Result};
+use crate::{digest, error};
 use std::fmt;
 use std::str::FromStr;
 
@@ -14,12 +13,12 @@ pub struct Reference {
   domain: String,
   repository: String,
   tag: Option<String>,
-  digest: Option<Digest>,
+  digest: Option<digest::Digest>,
 }
 
 impl Reference {
-  pub fn parse(text: &str) -> Result<Self> {
-    let invalid = |why: &str| Error::Invalid(format!("{text:?} is not an image reference: {why}"));
+  pub fn parse(text: &str) -> error::Result<Self> {
+    let invalid = |why: &str| error::Error::Invalid(format!("{text:?} is not an image reference: {why}"));
 
     let (rest, digest) = match text.split_once('@') {
       Some((rest, digest)) => (rest, Some(digest)),
@@ -66,7 +65,7 @@ impl Reference {
     let digest = digest
       .map(|digest| {
         digest
-          .parse::<Digest>()
+          .parse::<digest::Digest>()
           .ok()
           .filter(|digest| digest.sha256_hex().is_some())
           .ok_or_else(|| invalid("its digest must be sha256:<64 lowercase hex digits>"))
@@ -100,7 +99,7 @@ impl Reference {
   }
 
   /// The digest, such as `sha256:…`. Only sha256 is supported.
-  pub fn digest(&self) -> Option<&Digest> {
+  pub fn digest(&self) -> Option<&digest::Digest> {
     self.digest.as_ref()
   }
 
@@ -109,7 +108,7 @@ impl Reference {
     self
       .digest
       .as_ref()
-      .map(Digest::as_str)
+      .map(digest::Digest::as_str)
       .or(self.tag.as_deref())
       .unwrap_or("latest")
   }
@@ -162,9 +161,9 @@ fn valid_tag(tag: &str) -> bool {
 }
 
 impl FromStr for Reference {
-  type Err = Error;
+  type Err = error::Error;
 
-  fn from_str(text: &str) -> Result<Self> {
+  fn from_str(text: &str) -> error::Result<Self> {
     Self::parse(text)
   }
 }

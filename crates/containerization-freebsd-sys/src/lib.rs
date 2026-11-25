@@ -10,38 +10,20 @@
 //! thread only, as the agent's session loop does; otherwise a process spawned
 //! in that window inherits them.
 
-mod clock;
-mod disk;
-mod exec;
-mod file;
-mod interface;
-mod jail;
-mod mount;
-mod netif;
-mod process;
-mod rctl;
-mod sha256;
-mod socket;
-mod sysctl;
-mod terminal;
-
-pub use clock::set_time;
-pub use disk::{disk_ident, disks};
-pub use exec::{Entering, Entry, Ids, Limit, Step, enter_on_exec, rescue_on_exec};
-pub use file::{clear_flags, create_in, open_in, remove_in};
-pub use interface::{Interface, interfaces, interfaces_in};
-pub use jail::{FileType, JailId, Terminating, file_type_in, find_jail, has_vnet, jail_id, jail_remains, terminate_in};
-pub use mount::{Mounted, mount, mounts, unmount};
-pub use netif::{
-  Addressing, add_address, address_in, bridge_add, bring_down, bring_up, create_interface, default_route,
-  destroy_interface, interface_exists, load_module, move_to_vnet, rename_interface, start_pf,
-};
-pub use process::{kill_group, signal, wait_exited};
-pub use rctl::{add_rule, racct, remove_rules};
-pub use sha256::Sha256;
-pub use socket::{Ready, SocketAddress, connect_in, listen_in, remove_socket_in, wait_for_connection};
-pub use sysctl::{Mib, set_int, sysctl, text};
-pub use terminal::{WindowSize, make_raw, open_terminal, resize, take_terminal_on_exec};
+pub mod clock;
+pub mod disk;
+pub mod exec;
+pub mod file;
+pub mod interface;
+pub mod jail;
+pub mod mount;
+pub mod netif;
+pub mod process;
+pub mod rctl;
+pub mod sha256;
+pub mod socket;
+pub mod sysctl;
+pub mod terminal;
 
 use std::ffi::{CString, OsStr};
 use std::io;

@@ -1,6 +1,6 @@
 //! SHA-256 hashes as lowercase hex, and OCI content digests.
 
-use crate::error::{Error, Result};
+use crate::error;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fmt;
@@ -36,10 +36,10 @@ impl Digest {
 
   /// Like `sha256_hex`, but fails unless this is a sha256 digest, which
   /// naming a blob needs.
-  pub(crate) fn require_sha256(&self) -> Result<&str> {
+  pub(crate) fn require_sha256(&self) -> error::Result<&str> {
     self
       .sha256_hex()
-      .ok_or_else(|| Error::Invalid(format!("{self} is not a sha256 digest")))
+      .ok_or_else(|| error::Error::Invalid(format!("{self} is not a sha256 digest")))
   }
 
   pub fn as_str(&self) -> &str {
@@ -48,11 +48,11 @@ impl Digest {
 }
 
 impl FromStr for Digest {
-  type Err = Error;
+  type Err = error::Error;
 
   /// Accepts the image spec's digest grammar. A sha256 digest must also be 64
   /// lowercase hex digits.
-  fn from_str(text: &str) -> Result<Self> {
+  fn from_str(text: &str) -> error::Result<Self> {
     let lowercase_word = |part: &str| {
       !part.is_empty()
         && part
@@ -75,15 +75,15 @@ impl FromStr for Digest {
     if valid {
       Ok(Self(text.to_string()))
     } else {
-      Err(Error::Invalid(format!("{text:?} is not a digest")))
+      Err(error::Error::Invalid(format!("{text:?} is not a digest")))
     }
   }
 }
 
 impl TryFrom<String> for Digest {
-  type Error = Error;
+  type Error = error::Error;
 
-  fn try_from(text: String) -> Result<Self> {
+  fn try_from(text: String) -> error::Result<Self> {
     text.parse()
   }
 }
@@ -106,11 +106,11 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
 }
 
 /// The lowercase hex sha256 of the file at `path`, and the file's length.
-pub(crate) fn sha256_file(path: &Path) -> Result<(String, u64)> {
+pub(crate) fn sha256_file(path: &Path) -> error::Result<(String, u64)> {
   let reading = || format!("reading {}", path.display());
-  let mut file = File::open(path).map_err(Error::io(reading()))?;
+  let mut file = File::open(path).map_err(error::Error::io(reading()))?;
   let mut hashing = Hashing::new(io::sink());
-  let length = io::copy(&mut file, &mut hashing).map_err(Error::io(reading()))?;
+  let length = io::copy(&mut file, &mut hashing).map_err(error::Error::io(reading()))?;
 
   Ok((hashing.finish(), length))
 }
@@ -183,7 +183,7 @@ mod tests {
       .unwrap();
 
     assert_eq!((sha512.sha256_hex(), multihash.sha256_hex()), (None, None));
-    assert!(matches!(sha512.require_sha256(), Err(Error::Invalid(_))));
+    assert!(matches!(sha512.require_sha256(), Err(error::Error::Invalid(_))));
     for text in [
       "",
       "sha256",

@@ -1,20 +1,17 @@
 //! Runs both sides of a session in memory, passing their frames through an
 //! encoded byte stream as the console would.
 
-use containerization_freebsd_protocol::{
-  Address, CONTROL, Call, Connect, Decoder, Error, Exec, Exit, FileType, Frame, GuestPath, Listen, MAX_PAYLOAD,
-  Message, Mux, Return, Side, VERSION, VersionMismatch, WindowSize,
-};
+use containerization_freebsd_protocol::{frame, message, mux};
 
-const TERMINAL: WindowSize = WindowSize { rows: 24, columns: 80 };
+const TERMINAL: message::WindowSize = message::WindowSize { rows: 24, columns: 80 };
 
 /// Encodes `frames` into one byte stream and decodes them again.
-fn carry(frames: impl IntoIterator<Item = Frame>) -> Vec<Frame> {
+fn carry(frames: impl IntoIterator<Item = frame::Frame>) -> Vec<frame::Frame> {
   let mut bytes = Vec::new();
   for frame in frames {
     frame.encode(&mut bytes);
   }
-  let mut decoder = Decoder::new();
+  let mut decoder = frame::Decoder::new();
   decoder.push(&bytes);
 
   std::iter::from_fn(|| decoder.decode())
@@ -23,83 +20,91 @@ fn carry(frames: impl IntoIterator<Item = Frame>) -> Vec<Frame> {
 }
 
 /// Carries `frames` to `to` and returns what it receives.
-fn deliver(to: &mut Mux, frames: impl IntoIterator<Item = Frame>) -> Vec<(u32, Message)> {
+fn deliver(to: &mut mux::Mux, frames: impl IntoIterator<Item = frame::Frame>) -> Vec<(u32, message::Message)> {
   carry(frames)
     .into_iter()
     .map(|frame| to.receive(frame).expect("receives"))
     .collect()
 }
 
-fn session() -> (Mux, Mux) {
-  let mut host = Mux::new(Side::Host);
-  let mut guest = Mux::new(Side::Guest);
+fn session() -> (mux::Mux, mux::Mux) {
+  let mut host = mux::Mux::new(mux::Side::Host);
+  let mut guest = mux::Mux::new(mux::Side::Guest);
 
   deliver(&mut guest, [host.hello()]);
   deliver(&mut host, [guest.hello()]);
   (host, guest)
 }
 
-fn exec(argv: &[&str], pty: Option<WindowSize>) -> Message {
-  Message::Exec(Exec { pty, ..Exec::new(argv) })
+fn exec(argv: &[&str], pty: Option<message::WindowSize>) -> message::Message {
+  message::Message::Exec(message::Exec {
+    pty,
+    ..message::Exec::new(argv)
+  })
 }
 
-fn connect(port: u16) -> Message {
-  Message::Connect(Connect {
-    to: Address::Port(port),
+fn connect(port: u16) -> message::Message {
+  message::Message::Connect(message::Connect {
+    to: message::Address::Port(port),
     jail: None,
   })
 }
 
-fn listen(path: &str) -> Message {
-  Message::Listen(Listen {
+fn listen(path: &str) -> message::Message {
+  message::Message::Listen(message::Listen {
     path: path.into(),
-    ..Listen::default()
+    ..message::Listen::default()
   })
 }
 
-fn not_allowed(channel: u32, message: &'static str) -> Error {
-  Error::NotAllowed { channel, message }
+fn not_allowed(channel: u32, message: &'static str) -> mux::Error {
+  mux::Error::NotAllowed { channel, message }
 }
 
 #[test]
 fn opens_nothing_when_the_versions_differ() {
-  let mut host = Mux::new(Side::Host);
-  let mut guest = Mux::new(Side::Guest);
+  let mut host = mux::Mux::new(mux::Side::Host);
+  let mut guest = mux::Mux::new(mux::Side::Guest);
   let newer = |answer| {
-    Message::Hello {
-      version: VERSION + 1,
+    message::Message::Hello {
+      version: mux::VERSION + 1,
       answer,
     }
-    .frame(CONTROL)
+    .frame(mux::CONTROL)
   };
-  let mismatch = Error::Version(VersionMismatch {
-    ours: VERSION,
-    theirs: VERSION + 1,
+  let mismatch = mux::Error::Version(mux::VersionMismatch {
+    ours: mux::VERSION,
+    theirs: mux::VERSION + 1,
   });
 
   host.hello();
   assert_eq!(host.receive(newer(true)).unwrap_err(), mismatch);
   assert_eq!(guest.receive(newer(false)).unwrap_err(), mismatch);
 
-  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NoSession);
+  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), mux::Error::NoSession);
 }
 
 #[test]
 fn passes_only_control_messages_before_the_hellos() {
-  let mut host = Mux::new(Side::Host);
-  let mut guest = Mux::new(Side::Guest);
+  let mut host = mux::Mux::new(mux::Side::Host);
+  let mut guest = mux::Mux::new(mux::Side::Guest);
 
-  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NoSession);
+  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), mux::Error::NoSession);
   assert_eq!(
     guest.receive(exec(&["true"], None).frame(2)).unwrap_err(),
-    Error::NoSession
+    mux::Error::NoSession
   );
   // A ping checks whether the agent is running at all.
-  let ping = host.send(CONTROL, Message::Ping(1)).unwrap();
-  assert_eq!(deliver(&mut guest, [ping]), [(CONTROL, Message::Ping(1))]);
+  let ping = host.send(mux::CONTROL, message::Message::Ping(1)).unwrap();
+  assert_eq!(deliver(&mut guest, [ping]), [(mux::CONTROL, message::Message::Ping(1))]);
   // The agent reads the console whether or not there is a session.
-  let received = guest.send(CONTROL, Message::Received(64)).unwrap();
-  assert_eq!(deliver(&mut host, [received]), [(CONTROL, Message::Received(64))]);
+  let received = guest
+    .send(mux::CONTROL, message::Message::Received(64))
+    .unwrap();
+  assert_eq!(
+    deliver(&mut host, [received]),
+    [(mux::CONTROL, message::Message::Received(64))]
+  );
 }
 
 #[test]
@@ -107,38 +112,40 @@ fn lets_only_the_guest_say_what_it_received() {
   let (mut host, mut guest) = session();
 
   assert_eq!(
-    host.send(CONTROL, Message::Received(1)).unwrap_err(),
-    not_allowed(CONTROL, "received")
+    host
+      .send(mux::CONTROL, message::Message::Received(1))
+      .unwrap_err(),
+    not_allowed(mux::CONTROL, "received")
   );
   assert_eq!(
     guest
-      .receive(Message::Received(1).frame(CONTROL))
+      .receive(message::Message::Received(1).frame(mux::CONTROL))
       .unwrap_err(),
-    not_allowed(CONTROL, "received")
+    not_allowed(mux::CONTROL, "received")
   );
   assert_eq!(
-    guest.send(2, Message::Received(1)).unwrap_err(),
-    Error::UnknownChannel(2)
+    guest.send(2, message::Message::Received(1)).unwrap_err(),
+    mux::Error::UnknownChannel(2)
   );
 }
 
 #[test]
 fn lets_only_the_host_set_the_time() {
   let (mut host, mut guest) = session();
-  let time = Message::SetTime {
+  let time = message::Message::SetTime {
     seconds: 1,
     nanoseconds: 2,
   };
 
-  let frame = host.send(CONTROL, time.clone()).unwrap();
-  assert_eq!(deliver(&mut guest, [frame]), [(CONTROL, time.clone())]);
+  let frame = host.send(mux::CONTROL, time.clone()).unwrap();
+  assert_eq!(deliver(&mut guest, [frame]), [(mux::CONTROL, time.clone())]);
   assert_eq!(
-    guest.send(CONTROL, time.clone()).unwrap_err(),
-    not_allowed(CONTROL, "set time")
+    guest.send(mux::CONTROL, time.clone()).unwrap_err(),
+    not_allowed(mux::CONTROL, "set time")
   );
   assert_eq!(
-    host.receive(time.frame(CONTROL)).unwrap_err(),
-    not_allowed(CONTROL, "set time")
+    host.receive(time.frame(mux::CONTROL)).unwrap_err(),
+    not_allowed(mux::CONTROL, "set time")
   );
 }
 
@@ -153,17 +160,17 @@ fn keeps_interleaved_channels_apart() {
 
   let mut send = |channel, message| guest.send(channel, message).unwrap();
   let frames = [
-    send(relay, Message::Opened),
-    send(plain, Message::Opened),
-    send(plain, Message::Data(b"cc -c a.c\n".to_vec())),
-    send(pty, Message::Opened),
-    send(relay, Message::Data(b"HTTP/1.1 200 OK\r\n".to_vec())),
-    send(plain, Message::Stderr(b"warning\n".to_vec())),
-    send(pty, Message::Data(b"$ ".to_vec())),
-    send(plain, Message::Exited(Exit::Code(0))),
+    send(relay, message::Message::Opened),
+    send(plain, message::Message::Opened),
+    send(plain, message::Message::Data(b"cc -c a.c\n".to_vec())),
+    send(pty, message::Message::Opened),
+    send(relay, message::Message::Data(b"HTTP/1.1 200 OK\r\n".to_vec())),
+    send(plain, message::Message::Stderr(b"warning\n".to_vec())),
+    send(pty, message::Message::Data(b"$ ".to_vec())),
+    send(plain, message::Message::Exited(message::Exit::Code(0))),
   ];
   let received = deliver(&mut host, frames);
-  let on = |channel| -> Vec<Message> {
+  let on = |channel| -> Vec<message::Message> {
     received
       .iter()
       .filter(|(on, _)| *on == channel)
@@ -174,16 +181,22 @@ fn keeps_interleaved_channels_apart() {
   assert_eq!(
     on(plain),
     [
-      Message::Opened,
-      Message::Data(b"cc -c a.c\n".to_vec()),
-      Message::Stderr(b"warning\n".to_vec()),
-      Message::Exited(Exit::Code(0)),
+      message::Message::Opened,
+      message::Message::Data(b"cc -c a.c\n".to_vec()),
+      message::Message::Stderr(b"warning\n".to_vec()),
+      message::Message::Exited(message::Exit::Code(0)),
     ]
   );
-  assert_eq!(on(pty), [Message::Opened, Message::Data(b"$ ".to_vec())]);
+  assert_eq!(
+    on(pty),
+    [message::Message::Opened, message::Message::Data(b"$ ".to_vec())]
+  );
   assert_eq!(
     on(relay),
-    [Message::Opened, Message::Data(b"HTTP/1.1 200 OK\r\n".to_vec())]
+    [
+      message::Message::Opened,
+      message::Message::Data(b"HTTP/1.1 200 OK\r\n".to_vec())
+    ]
   );
   assert_eq!(
     [plain, pty, relay].map(|channel| (host.is_open(channel), guest.is_open(channel))),
@@ -197,22 +210,26 @@ fn resizes_only_a_terminal_and_only_from_its_initiator() {
   let (pty, open_pty) = host.open(exec(&["sh"], Some(TERMINAL))).unwrap();
   let (plain, open_plain) = host.open(exec(&["make"], None)).unwrap();
   deliver(&mut guest, [open_pty, open_plain]);
-  let bigger = WindowSize { rows: 50, columns: 132 };
+  let bigger = message::WindowSize { rows: 50, columns: 132 };
 
-  let resize = host.send(pty, Message::Resize(bigger)).unwrap();
-  assert_eq!(deliver(&mut guest, [resize]), [(pty, Message::Resize(bigger))]);
+  let resize = host.send(pty, message::Message::Resize(bigger)).unwrap();
+  assert_eq!(deliver(&mut guest, [resize]), [(pty, message::Message::Resize(bigger))]);
 
   assert_eq!(
-    host.send(plain, Message::Resize(bigger)).unwrap_err(),
+    host
+      .send(plain, message::Message::Resize(bigger))
+      .unwrap_err(),
     not_allowed(plain, "resize")
   );
   assert_eq!(
-    guest.send(pty, Message::Resize(bigger)).unwrap_err(),
+    guest
+      .send(pty, message::Message::Resize(bigger))
+      .unwrap_err(),
     not_allowed(pty, "resize")
   );
   assert_eq!(
     host
-      .receive(Message::Resize(bigger).frame(pty))
+      .receive(message::Message::Resize(bigger).frame(pty))
       .unwrap_err(),
     not_allowed(pty, "resize")
   );
@@ -223,30 +240,30 @@ fn closes_a_relay_once_both_ends_have_finished() {
   let (mut host, mut guest) = session();
   let (relay, open) = host.open(connect(5432)).unwrap();
   deliver(&mut guest, [open]);
-  deliver(&mut host, [guest.send(relay, Message::Opened).unwrap()]);
+  deliver(&mut host, [guest.send(relay, message::Message::Opened).unwrap()]);
 
   // The host has finished writing, but the guest can still answer.
-  deliver(&mut guest, [host.send(relay, Message::Eof).unwrap()]);
+  deliver(&mut guest, [host.send(relay, message::Message::Eof).unwrap()]);
   assert_eq!(
     host
-      .send(relay, Message::Data(b"late".to_vec()))
+      .send(relay, message::Message::Data(b"late".to_vec()))
       .unwrap_err(),
     not_allowed(relay, "data")
   );
   let answer = guest
-    .send(relay, Message::Data(b"answer".to_vec()))
+    .send(relay, message::Message::Data(b"answer".to_vec()))
     .unwrap();
   assert_eq!(
     deliver(&mut host, [answer]),
-    [(relay, Message::Data(b"answer".to_vec()))]
+    [(relay, message::Message::Data(b"answer".to_vec()))]
   );
   assert!(host.is_open(relay) && guest.is_open(relay));
 
-  deliver(&mut host, [guest.send(relay, Message::Eof).unwrap()]);
+  deliver(&mut host, [guest.send(relay, message::Message::Eof).unwrap()]);
   assert!(!host.is_open(relay) && !guest.is_open(relay));
   assert_eq!(
-    host.send(relay, Message::Eof).unwrap_err(),
-    Error::UnknownChannel(relay)
+    host.send(relay, message::Message::Eof).unwrap_err(),
+    mux::Error::UnknownChannel(relay)
   );
 }
 
@@ -257,11 +274,11 @@ fn closes_a_refused_relay() {
   deliver(&mut guest, [open]);
 
   let refused = guest
-    .send(relay, Message::Error("connection refused".into()))
+    .send(relay, message::Message::Error("connection refused".into()))
     .unwrap();
   assert_eq!(
     deliver(&mut host, [refused]),
-    [(relay, Message::Error("connection refused".into()))]
+    [(relay, message::Message::Error("connection refused".into()))]
   );
   assert!(!host.is_open(relay) && !guest.is_open(relay));
 }
@@ -274,22 +291,24 @@ fn sends_data_from_borrowed_bytes_as_send_does() {
   let mut encoded = Vec::new();
 
   host.send_data(channel, b"stdin", &mut encoded).unwrap();
-  let mut decoder = Decoder::new();
+  let mut decoder = frame::Decoder::new();
   decoder.push(&encoded);
   let frame = decoder.decode().unwrap().unwrap();
   assert_eq!(
     guest.receive(frame).unwrap(),
-    (channel, Message::Data(b"stdin".to_vec()))
+    (channel, message::Message::Data(b"stdin".to_vec()))
   );
 
-  deliver(&mut guest, [host.send(channel, Message::Eof).unwrap()]);
+  deliver(&mut guest, [host.send(channel, message::Message::Eof).unwrap()]);
   assert_eq!(
     host.send_data(channel, b"late", &mut encoded).unwrap_err(),
     not_allowed(channel, "data")
   );
   assert_eq!(
-    host.send_data(CONTROL, b"x", &mut encoded).unwrap_err(),
-    not_allowed(CONTROL, "data")
+    host
+      .send_data(mux::CONTROL, b"x", &mut encoded)
+      .unwrap_err(),
+    not_allowed(mux::CONTROL, "data")
   );
 }
 
@@ -297,7 +316,7 @@ fn sends_data_from_borrowed_bytes_as_send_does() {
 fn closes_a_call_channel_with_its_answer() {
   let (mut host, mut guest) = session();
   let call = || {
-    Message::Call(Call::FileType(GuestPath {
+    message::Message::Call(message::Call::FileType(message::GuestPath {
       path: "/etc".into(),
       jail: None,
     }))
@@ -307,20 +326,23 @@ fn closes_a_call_channel_with_its_answer() {
   deliver(&mut guest, [open, also_open]);
   assert_eq!(
     host
-      .send(answered, Message::Data(b"x".to_vec()))
+      .send(answered, message::Message::Data(b"x".to_vec()))
       .unwrap_err(),
     not_allowed(answered, "data")
   );
   assert_eq!(
-    guest.send(answered, Message::Opened).unwrap_err(),
+    guest.send(answered, message::Message::Opened).unwrap_err(),
     not_allowed(answered, "opened")
   );
 
   let answer = guest
-    .send(answered, Message::Return(Return::FileType(FileType::Directory)))
+    .send(
+      answered,
+      message::Message::Return(message::Return::FileType(message::FileType::Directory)),
+    )
     .unwrap();
   let refusal = guest
-    .send(refused, Message::Error("no jail is named \"web\"".into()))
+    .send(refused, message::Message::Error("no jail is named \"web\"".into()))
     .unwrap();
   deliver(&mut host, [answer, refusal]);
   assert!(!host.is_open(answered) && !guest.is_open(answered));
@@ -332,24 +354,26 @@ fn relays_each_connection_to_a_listener_on_a_channel_the_guest_opens() {
   let (mut host, mut guest) = session();
   let (listener, open) = host.open(listen("/var/run/host.sock")).unwrap();
   deliver(&mut guest, [open]);
-  deliver(&mut host, [guest.send(listener, Message::Opened).unwrap()]);
+  deliver(&mut host, [guest.send(listener, message::Message::Opened).unwrap()]);
 
-  let (first, accepted) = guest.open(Message::Accepted { listener }).unwrap();
-  let (second, also_accepted) = guest.open(Message::Accepted { listener }).unwrap();
+  let (first, accepted) = guest.open(message::Message::Accepted { listener }).unwrap();
+  let (second, also_accepted) = guest.open(message::Message::Accepted { listener }).unwrap();
   assert_eq!([first, second], [1, 3]);
   // The guest may send data before the host has connected its end.
-  let early = guest.send(first, Message::Data(b"hello".to_vec())).unwrap();
+  let early = guest
+    .send(first, message::Message::Data(b"hello".to_vec()))
+    .unwrap();
   assert_eq!(
     deliver(&mut host, [accepted, also_accepted, early]),
     [
-      (first, Message::Accepted { listener }),
-      (second, Message::Accepted { listener }),
-      (first, Message::Data(b"hello".to_vec())),
+      (first, message::Message::Accepted { listener }),
+      (second, message::Message::Accepted { listener }),
+      (first, message::Message::Data(b"hello".to_vec())),
     ]
   );
   assert_eq!(
     host
-      .send(first, Message::Data(b"early".to_vec()))
+      .send(first, message::Message::Data(b"early".to_vec()))
       .unwrap_err(),
     not_allowed(first, "data")
   );
@@ -357,17 +381,21 @@ fn relays_each_connection_to_a_listener_on_a_channel_the_guest_opens() {
   deliver(
     &mut guest,
     [
-      host.send(first, Message::Opened).unwrap(),
-      host.send(first, Message::Data(b"HELLO".to_vec())).unwrap(),
-      host.send(first, Message::Eof).unwrap(),
+      host.send(first, message::Message::Opened).unwrap(),
+      host
+        .send(first, message::Message::Data(b"HELLO".to_vec()))
+        .unwrap(),
+      host.send(first, message::Message::Eof).unwrap(),
     ],
   );
-  deliver(&mut host, [guest.send(first, Message::Eof).unwrap()]);
+  deliver(&mut host, [guest.send(first, message::Message::Eof).unwrap()]);
   assert!(!host.is_open(first) && !guest.is_open(first));
   // The host could not connect the second connection.
   deliver(
     &mut guest,
-    [host.send(second, Message::Error("refused".into())).unwrap()],
+    [host
+      .send(second, message::Message::Error("refused".into()))
+      .unwrap()],
   );
   assert!(!host.is_open(second) && !guest.is_open(second));
   assert!(host.is_open(listener) && guest.is_open(listener));
@@ -378,21 +406,21 @@ fn closes_a_listener_once_both_sides_have_sent_eof() {
   let (mut host, mut guest) = session();
   let (listener, open) = host.open(listen("/var/run/host.sock")).unwrap();
   deliver(&mut guest, [open]);
-  deliver(&mut host, [guest.send(listener, Message::Opened).unwrap()]);
+  deliver(&mut host, [guest.send(listener, message::Message::Opened).unwrap()]);
   assert_eq!(
     host
-      .send(listener, Message::Data(b"x".to_vec()))
+      .send(listener, message::Message::Data(b"x".to_vec()))
       .unwrap_err(),
     not_allowed(listener, "data")
   );
 
-  deliver(&mut guest, [host.send(listener, Message::Eof).unwrap()]);
+  deliver(&mut guest, [host.send(listener, message::Message::Eof).unwrap()]);
   // A connection accepted before the listener stopped can still open.
-  let (_, accepted) = guest.open(Message::Accepted { listener }).unwrap();
+  let (_, accepted) = guest.open(message::Message::Accepted { listener }).unwrap();
   deliver(&mut host, [accepted]);
   assert!(host.is_open(listener) && guest.is_open(listener));
 
-  deliver(&mut host, [guest.send(listener, Message::Eof).unwrap()]);
+  deliver(&mut host, [guest.send(listener, message::Message::Eof).unwrap()]);
   assert!(!host.is_open(listener) && !guest.is_open(listener));
 }
 
@@ -405,27 +433,31 @@ fn closes_a_process_when_it_exits_not_when_its_output_ends() {
   deliver(
     &mut host,
     [
-      guest.send(channel, Message::Opened).unwrap(),
-      guest.send(channel, Message::Eof).unwrap(),
+      guest.send(channel, message::Message::Opened).unwrap(),
+      guest.send(channel, message::Message::Eof).unwrap(),
     ],
   );
   assert!(host.is_open(channel));
 
   deliver(
     &mut host,
-    [guest.send(channel, Message::Exited(Exit::Code(1))).unwrap()],
+    [guest
+      .send(channel, message::Message::Exited(message::Exit::Code(1)))
+      .unwrap()],
   );
   assert!(!host.is_open(channel) && !guest.is_open(channel));
   assert_eq!(
-    host.send(channel, Message::Signal(15)).unwrap_err(),
-    Error::UnknownChannel(channel)
+    host
+      .send(channel, message::Message::Signal(15))
+      .unwrap_err(),
+    mux::Error::UnknownChannel(channel)
   );
 }
 
 #[test]
 fn lets_each_side_open_only_its_own_channels() {
   let (mut host, mut guest) = session();
-  let accepted = Message::Accepted { listener: 2 };
+  let accepted = message::Message::Accepted { listener: 2 };
 
   assert_eq!(guest.open(exec(&["true"], None)).unwrap_err(), not_allowed(1, "exec"));
   assert_eq!(guest.open(connect(22)).unwrap_err(), not_allowed(1, "connect"));
@@ -438,13 +470,13 @@ fn lets_each_side_open_only_its_own_channels() {
   );
   assert_eq!(
     guest.receive(exec(&["true"], None).frame(3)).unwrap_err(),
-    Error::BadChannel(3)
+    mux::Error::BadChannel(3)
   );
   assert_eq!(
     guest.receive(accepted.clone().frame(1)).unwrap_err(),
     not_allowed(1, "accepted")
   );
-  assert_eq!(host.receive(accepted.frame(2)).unwrap_err(), Error::BadChannel(2));
+  assert_eq!(host.receive(accepted.frame(2)).unwrap_err(), mux::Error::BadChannel(2));
 }
 
 #[test]
@@ -457,7 +489,7 @@ fn forgets_the_old_session_at_a_new_hello() {
 
   let hello = host.hello();
   assert!(!host.is_open(channel));
-  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), Error::NoSession);
+  assert_eq!(host.open(exec(&["true"], None)).unwrap_err(), mux::Error::NoSession);
   deliver(&mut guest, [hello]);
   assert!(!guest.is_open(channel));
   deliver(&mut host, [guest.hello()]);
@@ -465,9 +497,9 @@ fn forgets_the_old_session_at_a_new_hello() {
   assert!(host.in_session());
   assert_eq!(
     host
-      .receive(Message::Data(b"late".to_vec()).frame(channel))
+      .receive(message::Message::Data(b"late".to_vec()).frame(channel))
       .unwrap_err(),
-    Error::UnknownChannel(channel)
+    mux::Error::UnknownChannel(channel)
   );
 }
 
@@ -478,11 +510,11 @@ fn starts_over_when_the_agent_announces_it_has_no_session() {
   deliver(&mut guest, [open]);
 
   // The agent restarts.
-  let mut agent = Mux::new(Side::Guest);
+  let mut agent = mux::Mux::new(mux::Side::Guest);
   let received = deliver(&mut host, [agent.hello()]);
   assert!(matches!(
     received[..],
-    [(CONTROL, Message::Hello { answer: false, .. })]
+    [(mux::CONTROL, message::Message::Hello { answer: false, .. })]
   ));
   assert!(!host.is_open(channel) && !host.in_session());
 
@@ -493,8 +525,8 @@ fn starts_over_when_the_agent_announces_it_has_no_session() {
 
 #[test]
 fn settles_when_the_agent_starts_as_the_host_says_hello() {
-  let mut host = Mux::new(Side::Host);
-  let mut guest = Mux::new(Side::Guest);
+  let mut host = mux::Mux::new(mux::Side::Host);
+  let mut guest = mux::Mux::new(mux::Side::Guest);
   let first = host.hello();
   let announcement = guest.hello();
   deliver(&mut guest, [first]);
@@ -518,13 +550,13 @@ fn settles_when_the_agent_starts_as_the_host_says_hello() {
 fn refuses_an_answer_to_another_hosts_hello() {
   // Simulates a restore: the guest answers the Hello of the host that saved
   // the VM.
-  let mut saved = Mux::new(Side::Host);
-  let mut guest = Mux::new(Side::Guest);
+  let mut saved = mux::Mux::new(mux::Side::Host);
+  let mut guest = mux::Mux::new(mux::Side::Guest);
   deliver(&mut guest, [saved.hello()]);
   let answer = carry([guest.hello()]).remove(0);
-  let mut host = Mux::new(Side::Host);
+  let mut host = mux::Mux::new(mux::Side::Host);
 
-  assert_eq!(host.receive(answer).unwrap_err(), not_allowed(CONTROL, "hello"));
+  assert_eq!(host.receive(answer).unwrap_err(), not_allowed(mux::CONTROL, "hello"));
   assert!(!host.in_session());
 }
 
@@ -536,13 +568,13 @@ fn refuses_a_payload_over_the_limit() {
 
   assert_eq!(
     host
-      .send(channel, Message::Data(vec![0; MAX_PAYLOAD + 1]))
+      .send(channel, message::Message::Data(vec![0; frame::MAX_PAYLOAD + 1]))
       .unwrap_err(),
-    Error::TooLarge(MAX_PAYLOAD + 1)
+    mux::Error::TooLarge(frame::MAX_PAYLOAD + 1)
   );
   assert!(
     host
-      .send(channel, Message::Data(vec![0; MAX_PAYLOAD]))
+      .send(channel, message::Message::Data(vec![0; frame::MAX_PAYLOAD]))
       .is_ok()
   );
 }

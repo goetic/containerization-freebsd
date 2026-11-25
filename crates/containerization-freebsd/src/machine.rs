@@ -1,12 +1,11 @@
 //! A guest's Virtualization.framework configuration and VM lifecycle: start,
 //! pause, save, restore and shutdown.
 
-use crate::agent::{Agent, QUICK, Spawn};
-use crate::clock::ClockSync;
-use crate::error::{Error, Result};
+use crate::agent::{self, Spawn};
 #[cfg(feature = "kernel-messages")]
-use crate::kernel_messages::Memory;
-use containerization_freebsd_protocol::{GuestPath, Mount};
+use crate::kernel_messages;
+use crate::{clock, error};
+use containerization_freebsd_protocol::message;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use std::fmt;
 use std::fs::File;
@@ -58,11 +57,11 @@ impl fmt::Display for Mac {
 }
 
 impl FromStr for Mac {
-  type Err = Error;
+  type Err = error::Error;
 
   /// Parses six pairs of hex digits separated by colons.
-  fn from_str(text: &str) -> Result<Self> {
-    let invalid = || Error::Invalid(format!("{text:?} is not a MAC address"));
+  fn from_str(text: &str) -> error::Result<Self> {
+    let invalid = || error::Error::Invalid(format!("{text:?} is not a MAC address"));
     let mut octets = [0; 6];
     let mut parts = text.split(':');
 
@@ -94,14 +93,14 @@ pub struct Disk {
 impl Disk {
   /// Creates a sparse raw disk of `size` bytes at `path`, failing if `path`
   /// exists, and returns it to attach read-write as `identifier`.
-  pub fn create(path: impl Into<PathBuf>, identifier: impl Into<String>, size: u64) -> Result<Self> {
+  pub fn create(path: impl Into<PathBuf>, identifier: impl Into<String>, size: u64) -> error::Result<Self> {
     let path = path.into();
     File::options()
       .write(true)
       .create_new(true)
       .open(&path)
       .and_then(|file| file.set_len(size))
-      .map_err(Error::io(format!("creating {}", path.display())))?;
+      .map_err(error::Error::io(format!("creating {}", path.display())))?;
 
     Ok(Self {
       path,
@@ -138,8 +137,8 @@ pub struct Layout {
 }
 
 pub struct Machine {
-  pub agent: Agent,
-  clock: ClockSync,
+  pub agent: agent::Agent,
+  clock: clock::ClockSync,
   nat: bool,
   #[cfg_attr(not(feature = "kernel-messages"), allow(dead_code))]
   debug: DebugDevices,
@@ -151,18 +150,18 @@ pub struct Machine {
 #[derive(Default)]
 struct DebugDevices {
   #[cfg(feature = "kernel-messages")]
-  memory: Memory,
+  memory: kernel_messages::Memory,
 }
 
-fn url(path: &Path) -> Result<Url> {
-  Url::from_file_path(path).map_err(|()| Error::Invalid(format!("{} is not absolute", path.display())))
+fn url(path: &Path) -> error::Result<Url> {
+  Url::from_file_path(path).map_err(|()| error::Error::Invalid(format!("{} is not absolute", path.display())))
 }
 
 impl Layout {
   /// A first-boot layout for `disk`: a new machine identifier, a random
   /// locally administered MAC, and a fresh EFI variable store in `directory`;
   /// 4 CPUs, 4 GiB, and no NAT, seed, extra disks, shares or interfaces.
-  pub fn first(directory: &Path, disk: PathBuf) -> Result<Self> {
+  pub fn first(directory: &Path, disk: PathBuf) -> error::Result<Self> {
     let variables = directory.join("efi-variables");
     let _ = std::fs::remove_file(&variables);
 
@@ -170,7 +169,7 @@ impl Layout {
       &url(&variables)?,
       EFIVariableStoreInitializationOptions::new(0),
     )
-    .map_err(Error::virtualization("create the EFI variable store"))?;
+    .map_err(error::Error::virtualization("create the EFI variable store"))?;
 
     Ok(Self {
       cpus: 4,
@@ -182,11 +181,11 @@ impl Layout {
       shares: Vec::new(),
       variables,
       identifier: GenericMachineIdentifier::new()
-        .map_err(Error::virtualization("make a machine identifier"))?
+        .map_err(error::Error::virtualization("make a machine identifier"))?
         .data_representation(),
       mac: Mac(
         MACAddress::random_locally_administered()
-          .map_err(Error::virtualization("make a MAC address"))?
+          .map_err(error::Error::virtualization("make a MAC address"))?
           .ethernet_address(),
       ),
       interfaces: Vec::new(),
@@ -194,8 +193,11 @@ impl Layout {
   }
 
   #[cfg_attr(not(feature = "kernel-messages"), allow(unused_variables))]
-  fn configuration(&self, debug: &DebugDevices) -> Result<(VirtualMachineConfiguration, PipeReader, PipeWriter)> {
-    let failed = Error::virtualization;
+  fn configuration(
+    &self,
+    debug: &DebugDevices,
+  ) -> error::Result<(VirtualMachineConfiguration, PipeReader, PipeWriter)> {
+    let failed = error::Error::virtualization;
     let configuration = VirtualMachineConfiguration::new().map_err(failed("make a configuration"))?;
 
     configuration.set_platform(&self.platform()?);
@@ -244,19 +246,19 @@ impl Layout {
     Ok((configuration, output, input))
   }
 
-  fn platform(&self) -> Result<GenericPlatformConfiguration> {
-    let failed = Error::virtualization;
+  fn platform(&self) -> error::Result<GenericPlatformConfiguration> {
+    let failed = error::Error::virtualization;
     let platform = GenericPlatformConfiguration::new().map_err(failed("make a platform"))?;
     let identifier = GenericMachineIdentifier::with_data_representation(&self.identifier)
       .map_err(failed("read the machine identifier"))?
-      .ok_or_else(|| Error::Guest("the machine identifier did not parse".to_string()))?;
+      .ok_or_else(|| error::Error::Guest("the machine identifier did not parse".to_string()))?;
 
     platform.set_machine_identifier(&identifier);
     Ok(platform)
   }
 
-  fn boot_loader(&self) -> Result<EFIBootLoader> {
-    let failed = Error::virtualization;
+  fn boot_loader(&self) -> error::Result<EFIBootLoader> {
+    let failed = error::Error::virtualization;
     let boot_loader = EFIBootLoader::new().map_err(failed("make the EFI boot loader"))?;
     let variables = EFIVariableStore::new(&url(&self.variables)?).map_err(failed("open the EFI variable store"))?;
 
@@ -265,7 +267,7 @@ impl Layout {
   }
 
   /// The disk, then the seed, then the other disks.
-  fn storage_devices(&self) -> Result<Vec<VirtioBlockDeviceConfiguration>> {
+  fn storage_devices(&self) -> error::Result<Vec<VirtioBlockDeviceConfiguration>> {
     let mut devices = vec![block_device(&self.disk, false, "the disk")?];
 
     if let Some(seed) = &self.seed {
@@ -273,7 +275,7 @@ impl Layout {
     }
     for disk in &self.disks {
       VirtioBlockDeviceConfiguration::validate_block_device_identifier(&disk.identifier)
-        .map_err(Error::virtualization("check the disk's identifier"))?;
+        .map_err(error::Error::virtualization("check the disk's identifier"))?;
       let device = block_device(&disk.path, disk.read_only, "a disk")?;
       device.set_block_device_identifier(&disk.identifier);
       devices.push(device);
@@ -283,8 +285,8 @@ impl Layout {
 
   /// A NAT network device with `mac` if `nat` is set, then one for each of
   /// `interfaces`.
-  fn network_devices(&self) -> Result<Vec<VirtioNetworkDeviceConfiguration>> {
-    let failed = Error::virtualization;
+  fn network_devices(&self) -> error::Result<Vec<VirtioNetworkDeviceConfiguration>> {
+    let failed = error::Error::virtualization;
 
     self
       .nat
@@ -300,8 +302,8 @@ impl Layout {
       .collect()
   }
 
-  fn share_devices(&self) -> Result<Vec<VirtioFileSystemDeviceConfiguration>> {
-    let failed = Error::virtualization;
+  fn share_devices(&self) -> error::Result<Vec<VirtioFileSystemDeviceConfiguration>> {
+    let failed = error::Error::virtualization;
 
     self
       .shares
@@ -320,7 +322,7 @@ impl Layout {
   }
 
   /// Checks that Virtualization can save and restore this configuration.
-  pub fn validate_save_restore(&self) -> Result<()> {
+  pub fn validate_save_restore(&self) -> error::Result<()> {
     let queue = DispatchQueue::new("containerization-freebsd-validate", None);
     let debug = DebugDevices::default();
 
@@ -328,25 +330,25 @@ impl Layout {
       let (configuration, _, _) = self.configuration(&debug)?;
       configuration
         .validate_save_restore_support()
-        .map_err(Error::virtualization("validate save/restore support"))
+        .map_err(error::Error::virtualization("validate save/restore support"))
     })
   }
 
   /// Creates a machine for this guest without starting it.
-  pub fn machine(&self, name: &str) -> Result<Machine> {
+  pub fn machine(&self, name: &str) -> error::Result<Machine> {
     let queue = DispatchQueue::new(name, None);
     let debug = DebugDevices::default();
     let (machine, output, input) = on_queue(&queue, || {
       let (configuration, output, input) = self.configuration(&debug)?;
       let machine =
-        VirtualMachine::with_queue(&configuration, &queue).map_err(Error::virtualization("make the machine"))?;
+        VirtualMachine::with_queue(&configuration, &queue).map_err(error::Error::virtualization("make the machine"))?;
 
-      Ok::<_, Error>((machine, output, input))
+      Ok::<_, error::Error>((machine, output, input))
     })?;
 
-    let agent = Agent::new(output, input);
+    let agent = agent::Agent::new(output, input);
     Ok(Machine {
-      clock: ClockSync::start(agent.share()),
+      clock: clock::ClockSync::start(agent.share()),
       agent,
       nat: self.nat,
       debug,
@@ -358,21 +360,21 @@ impl Layout {
 
 /// A virtio-blk device for the disk image at `path`; `what` names it in
 /// errors.
-fn block_device(path: &Path, read_only: bool, what: &str) -> Result<VirtioBlockDeviceConfiguration> {
+fn block_device(path: &Path, read_only: bool, what: &str) -> error::Result<VirtioBlockDeviceConfiguration> {
   let attachment = DiskImageStorageDeviceAttachment::new(&url(path)?, read_only)
-    .map_err(Error::virtualization(format!("attach {what}")))?;
+    .map_err(error::Error::virtualization(format!("attach {what}")))?;
 
-  VirtioBlockDeviceConfiguration::new(&attachment).map_err(Error::virtualization(format!("make {what} device")))
+  VirtioBlockDeviceConfiguration::new(&attachment).map_err(error::Error::virtualization(format!("make {what} device")))
 }
 
 /// The agent's channel, a single-port virtio console (`/dev/ttyV0.0` in the
 /// guest), and the host's pipe ends for its output and input. Not multiport:
 /// when vtcon(4) attaches a multiport console under Virtualization, rc stalls
 /// before networking.
-fn console() -> Result<(VirtioConsoleDeviceSerialPortConfiguration, PipeReader, PipeWriter)> {
-  let failed = Error::virtualization;
-  let (output, guest_output) = std::io::pipe().map_err(Error::io("make the console's pipes"))?;
-  let (guest_input, input) = std::io::pipe().map_err(Error::io("make the console's pipes"))?;
+fn console() -> error::Result<(VirtioConsoleDeviceSerialPortConfiguration, PipeReader, PipeWriter)> {
+  let failed = error::Error::virtualization;
+  let (output, guest_output) = std::io::pipe().map_err(error::Error::io("make the console's pipes"))?;
+  let (guest_input, input) = std::io::pipe().map_err(error::Error::io("make the console's pipes"))?;
   let serial = VirtioConsoleDeviceSerialPortConfiguration::new().map_err(failed("make the console"))?;
 
   serial.set_attachment(Some(
@@ -390,7 +392,7 @@ pub(crate) fn on_queue<T: Send>(queue: &DispatchQueue, work: impl FnOnce() -> T 
   result.expect("the queue ran the work")
 }
 
-type Done = Box<dyn FnOnce(Result<(), virtualization::Error>) + Send>;
+type Done = Box<dyn FnOnce(error::Result<(), virtualization::Error>) + Send>;
 
 impl Machine {
   /// Runs `operation` on the machine's queue and waits for its completion
@@ -398,8 +400,8 @@ impl Machine {
   fn completed(
     &self,
     action: &str,
-    operation: impl FnOnce(&VirtualMachine, Done) -> Result<(), virtualization::Error> + Send,
-  ) -> Result<()> {
+    operation: impl FnOnce(&VirtualMachine, Done) -> error::Result<(), virtualization::Error> + Send,
+  ) -> error::Result<()> {
     let (sender, receiver) = mpsc::channel();
     let machine = &self.machine;
 
@@ -411,22 +413,22 @@ impl Machine {
         }),
       )
     })
-    .map_err(Error::virtualization(action))?;
+    .map_err(error::Error::virtualization(action))?;
 
     receiver
       .recv()
-      .map_err(|_| Error::Guest(format!("{action}: Virtualization dropped the completion handler")))?
-      .map_err(Error::virtualization(action))
+      .map_err(|_| error::Error::Guest(format!("{action}: Virtualization dropped the completion handler")))?
+      .map_err(error::Error::virtualization(action))
   }
 
-  pub fn start(&self) -> Result<()> {
+  pub fn start(&self) -> error::Result<()> {
     self.completed("start", |machine, done| {
       machine.start(done);
       Ok(())
     })
   }
 
-  pub fn pause(&self) -> Result<()> {
+  pub fn pause(&self) -> error::Result<()> {
     self.completed("pause", |machine, done| {
       machine.pause(done);
       Ok(())
@@ -437,7 +439,7 @@ impl Machine {
 
   /// Resumes the machine and syncs the guest's clock, which fell behind while
   /// the machine was paused.
-  pub fn resume(&self) -> Result<()> {
+  pub fn resume(&self) -> error::Result<()> {
     self.completed("resume", |machine, done| {
       machine.resume(done);
       Ok(())
@@ -448,7 +450,7 @@ impl Machine {
   }
 
   /// Stops the VM without a guest shutdown, like pulling its power.
-  pub fn force_stop(&self) -> Result<()> {
+  pub fn force_stop(&self) -> error::Result<()> {
     self.completed("stop", |machine, done| {
       machine.stop(done);
       Ok(())
@@ -462,12 +464,12 @@ impl Machine {
   /// A share mounted across a save goes stale: the host's virtio-fs server
   /// restarts with the restored machine and forgets the files the guest
   /// cached, so each cached file fails once.
-  pub fn save(&self, path: &Path) -> Result<()> {
+  pub fn save(&self, path: &Path) -> error::Result<()> {
     let url = url(path)?;
 
     self
       .agent
-      .check(&["umount", "-A", "-t", "virtiofs"], QUICK)?;
+      .check(&["umount", "-A", "-t", "virtiofs"], agent::QUICK)?;
     self.pause()?;
     self.completed("save the machine's state", |machine, done| {
       machine.save_machine_state_to(&url, done)
@@ -477,7 +479,7 @@ impl Machine {
   /// Returns the guest device of the disk with `identifier`, such as
   /// `/dev/vtbd1`. It scans `kern.disks` because the image disables the
   /// `/dev/diskid` labels that would otherwise name it.
-  pub fn disk_device(&self, identifier: &str) -> Result<String> {
+  pub fn disk_device(&self, identifier: &str) -> error::Result<String> {
     let mut devices: Vec<String> = self
       .agent
       .disks()?
@@ -488,8 +490,10 @@ impl Machine {
 
     match devices.len() {
       1 => Ok(devices.remove(0)),
-      0 => Err(Error::Guest(format!("no disk has the identifier {identifier:?}"))),
-      _ => Err(Error::Guest(format!(
+      0 => Err(error::Error::Guest(format!(
+        "no disk has the identifier {identifier:?}"
+      ))),
+      _ => Err(error::Error::Guest(format!(
         "disks {devices:?} all have the identifier {identifier:?}"
       ))),
     }
@@ -497,11 +501,11 @@ impl Machine {
 
   /// Mounts the share tagged `tag` at `path` in the guest, creating the
   /// directory if needed.
-  pub fn mount_share(&self, tag: &str, path: &str) -> Result<()> {
-    self.agent.mount(Mount {
+  pub fn mount_share(&self, tag: &str, path: &str) -> error::Result<()> {
+    self.agent.mount(message::Mount {
       kind: "virtiofs".to_string(),
       source: tag.to_string(),
-      destination: GuestPath {
+      destination: message::GuestPath {
         path: path.to_string(),
         jail: None,
       },
@@ -512,7 +516,7 @@ impl Machine {
   /// Restores a state written by `save` into this machine, which must have the
   /// same layout and not have started. The machine stays paused; on resume,
   /// the guest's agent answers the Hello this sends.
-  pub fn restore(&self, path: &Path) -> Result<()> {
+  pub fn restore(&self, path: &Path) -> error::Result<()> {
     let url = url(path)?;
 
     self.completed("restore the machine's state", |machine, done| {
@@ -532,7 +536,7 @@ impl Machine {
   /// default route and its interface's link: rc adds the route after starting
   /// the agent, and a restored machine's link comes up after the agent
   /// answers.
-  pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
+  pub fn wait_ready(&self, timeout: Duration) -> error::Result<()> {
     let started = Instant::now();
 
     self.agent.wait_ready(timeout)?;
@@ -545,13 +549,13 @@ impl Machine {
   }
 
   /// Asks the guest to power off and waits for it to stop.
-  pub fn shut_down(&self, timeout: Duration) -> Result<()> {
+  pub fn shut_down(&self, timeout: Duration) -> error::Result<()> {
     self.agent.launch(&["shutdown", "-p", "now"])?;
     self.wait_stopped(timeout)
   }
 
   /// Waits for the guest to power itself off.
-  pub fn wait_stopped(&self, timeout: Duration) -> Result<()> {
+  pub fn wait_stopped(&self, timeout: Duration) -> error::Result<()> {
     let started = Instant::now();
 
     while started.elapsed() < timeout {
@@ -561,17 +565,17 @@ impl Machine {
       std::thread::sleep(Duration::from_millis(100));
     }
 
-    Err(Error::Timeout(format!(
+    Err(error::Error::Timeout(format!(
       "the guest did not stop within {}s",
       timeout.as_secs()
     )))
   }
 
   /// Whether the machine has stopped. Fails if it stopped with an error.
-  pub(crate) fn stopped(&self) -> Result<bool> {
+  pub(crate) fn stopped(&self) -> error::Result<bool> {
     match self.state() {
       VirtualMachineState::Stopped => Ok(true),
-      VirtualMachineState::Error => Err(Error::Guest("the machine stopped with an error".to_string())),
+      VirtualMachineState::Error => Err(error::Error::Guest("the machine stopped with an error".to_string())),
       _ => Ok(false),
     }
   }
@@ -579,7 +583,7 @@ impl Machine {
   /// Returns the kernel message buffer, read from guest RAM, or why it
   /// couldn't be read.
   #[cfg(feature = "kernel-messages")]
-  pub fn kernel_messages(&self) -> Result<String> {
+  pub fn kernel_messages(&self) -> error::Result<String> {
     self.debug.memory.kernel_messages()
   }
 }
@@ -603,7 +607,7 @@ mod tests {
       "02-00-5e-10-0a-ff",
       "zz:00:5e:10:0a:ff",
     ] {
-      assert!(matches!(text.parse::<Mac>(), Err(Error::Invalid(_))), "{text:?}");
+      assert!(matches!(text.parse::<Mac>(), Err(error::Error::Invalid(_))), "{text:?}");
     }
   }
 
@@ -611,6 +615,6 @@ mod tests {
   fn refuses_a_relative_path() {
     let result = url(Path::new("disk.raw"));
 
-    assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
+    assert!(matches!(result, Err(error::Error::Invalid(_))), "{result:?}");
   }
 }

@@ -1,6 +1,5 @@
 //! Reading sysctl(3) values, by name or by walking the tree of names.
 
-use crate::{c_string, check};
 use std::ffi::CStr;
 use std::io;
 use std::ptr;
@@ -16,13 +15,13 @@ pub struct Mib(Vec<libc::c_int>);
 impl Mib {
   /// The MIB of the node or leaf named `name`, such as `kern.disks`.
   pub fn named(name: &str) -> io::Result<Self> {
-    let name = c_string(name)?;
+    let name = crate::c_string(name)?;
     let mut mib = vec![0; LONGEST];
     let mut length = mib.len();
 
     // SAFETY: sysctlnametomib writes no more than `length` numbers to `mib`,
     // and sets `length` to how many it wrote.
-    check(unsafe { libc::sysctlnametomib(name.as_ptr(), mib.as_mut_ptr(), &mut length) })?;
+    crate::check(unsafe { libc::sysctlnametomib(name.as_ptr(), mib.as_mut_ptr(), &mut length) })?;
     mib.truncate(length);
     Ok(Self(mib))
   }
@@ -79,7 +78,7 @@ pub fn set_int(name: &str, value: libc::c_int) -> io::Result<()> {
 
   // SAFETY: sysctl reads the new value, which outlives the call, and writes
   // nothing, since the old value's buffer and length are null.
-  check(unsafe {
+  crate::check(unsafe {
     libc::sysctl(
       mib.as_mut_ptr(),
       mib.len() as libc::c_uint,
@@ -127,7 +126,7 @@ fn read(mib: &[libc::c_int], buffer: *mut libc::c_void, room: usize) -> io::Resu
   // SAFETY: sysctl writes no more than `length` bytes to `buffer`, and sets
   // `length` to how many it wrote; with a null buffer, it writes only
   // `length`. It sets nothing, since the new value is null.
-  check(unsafe {
+  crate::check(unsafe {
     libc::sysctl(
       mib.as_mut_ptr(),
       mib.len() as libc::c_uint,

@@ -4,9 +4,9 @@
 //! paths resolve as the jail sees them, and no symlink escapes it.
 //! Directories travel as tar streams, with the host's `tar` at the other end.
 
-use crate::agent::{Exec, FileType, Process, Spawn};
-use crate::error::{Error, Result};
-use crate::jail::Jail;
+use crate::agent::{self, Spawn};
+use crate::{error, jail};
+use containerization_freebsd_protocol::message;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -26,14 +26,20 @@ pub enum Parents {
   Require,
 }
 
-pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, parents: Parents) -> Result<()> {
-  let metadata = fs::metadata(source).map_err(Error::io(format!("reading {}", source.display())))?;
+pub(crate) fn copy_in(
+  jail: &jail::Jail,
+  source: &Path,
+  destination: &str,
+  mode: u32,
+  parents: Parents,
+) -> error::Result<()> {
+  let metadata = fs::metadata(source).map_err(error::Error::io(format!("reading {}", source.display())))?;
   let copying = if metadata.is_dir() {
-    FileType::Directory
+    message::FileType::Directory
   } else if metadata.is_file() {
-    FileType::File
+    message::FileType::File
   } else {
-    return Err(Error::Invalid(format!(
+    return Err(error::Error::Invalid(format!(
       "{} is not a regular file or directory",
       source.display()
     )));
@@ -45,14 +51,14 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
     check(jail, &["mkdir", "-p", "--", parent])?;
   }
 
-  if copying == FileType::File {
-    let mut file = File::open(source).map_err(Error::io(format!("reading {}", source.display())))?;
+  if copying == message::FileType::File {
+    let mut file = File::open(source).map_err(error::Error::io(format!("reading {}", source.display())))?;
     let argv = ["dd", &format!("of={target}"), "bs=64k", "status=none"];
     // The umask keeps the file private to its owner until chmod sets `mode`.
-    let dd = jail.spawn(Exec {
+    let dd = jail.spawn(message::Exec {
       umask: Some(0o077),
       rescue: true,
-      ..Exec::new(argv)
+      ..message::Exec::new(argv)
     })?;
     dd.feed(&mut file, &source.display().to_string(), &format!("{argv:?}"), None)?;
     // No `--`: chmod(1) parses no options after the mode, so it would be
@@ -62,7 +68,7 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
 
   if parents == Parents::Create {
     check(jail, &["mkdir", "-p", "--", &target])?;
-  } else if jail.file_type(&target)? == FileType::Missing {
+  } else if jail.file_type(&target)? == message::FileType::Missing {
     check(jail, &["mkdir", "--", &target])?;
   }
   let mut tar = HostTar::start(
@@ -82,16 +88,16 @@ pub(crate) fn copy_in(jail: &Jail, source: &Path, destination: &str, mode: u32, 
   tar.finish().and(fed)
 }
 
-pub(crate) fn copy_out(jail: &Jail, source: &str, destination: &Path, parents: Parents) -> Result<()> {
+pub(crate) fn copy_out(jail: &jail::Jail, source: &str, destination: &Path, parents: Parents) -> error::Result<()> {
   let copying = match jail.file_type(source)? {
-    FileType::Missing => {
-      return Err(Error::Invalid(format!(
+    message::FileType::Missing => {
+      return Err(error::Error::Invalid(format!(
         "{source} does not exist in jail {}",
         jail.name()
       )));
     }
-    FileType::Other => {
-      return Err(Error::Invalid(format!(
+    message::FileType::Other => {
+      return Err(error::Error::Invalid(format!(
         "{source} in jail {} is not a regular file or directory",
         jail.name()
       )));
@@ -101,17 +107,17 @@ pub(crate) fn copy_out(jail: &Jail, source: &str, destination: &Path, parents: P
   if parents == Parents::Create
     && let Some(parent) = destination.parent()
   {
-    fs::create_dir_all(parent).map_err(Error::io(format!("creating {}", parent.display())))?;
+    fs::create_dir_all(parent).map_err(error::Error::io(format!("creating {}", parent.display())))?;
   }
 
-  if copying == FileType::File {
+  if copying == message::FileType::File {
     let mut file = OpenOptions::new()
       .write(true)
       .create(true)
       .truncate(true)
       .mode(0o644)
       .open(destination)
-      .map_err(Error::io(format!("creating {}", destination.display())))?;
+      .map_err(error::Error::io(format!("creating {}", destination.display())))?;
     let argv = ["cat", "--", source];
     let copied = rescue(jail, &argv)?.finish(&format!("{argv:?}"), None, &mut file);
     if copied.is_err() {
@@ -122,7 +128,7 @@ pub(crate) fn copy_out(jail: &Jail, source: &str, destination: &Path, parents: P
 
   match fs::create_dir(destination) {
     Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
-      return Err(Error::io(format!("creating {}", destination.display()))(error));
+      return Err(error::Error::io(format!("creating {}", destination.display()))(error));
     }
     _ => {}
   }
@@ -144,27 +150,32 @@ pub(crate) fn copy_out(jail: &Jail, source: &str, destination: &Path, parents: P
 
 /// Returns where cp(1) would put `source`, a file or directory as `copying`
 /// says, when copied to `destination`, whose existing type is `found`.
-fn target(source: &Path, copying: FileType, destination: &str, found: FileType) -> Result<String> {
-  let directory = copying == FileType::Directory;
+fn target(
+  source: &Path,
+  copying: message::FileType,
+  destination: &str,
+  found: message::FileType,
+) -> error::Result<String> {
+  let directory = copying == message::FileType::Directory;
 
   match found {
-    FileType::Missing if destination.ends_with('/') && !directory => Err(Error::Invalid(format!(
+    message::FileType::Missing if destination.ends_with('/') && !directory => Err(error::Error::Invalid(format!(
       "the destination directory {destination} does not exist"
     ))),
-    FileType::Missing => Ok(destination.to_string()),
-    FileType::Directory => {
+    message::FileType::Missing => Ok(destination.to_string()),
+    message::FileType::Directory => {
       let name = source
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::Invalid(format!("{} has no name to copy it by", source.display())))?;
+        .ok_or_else(|| error::Error::Invalid(format!("{} has no name to copy it by", source.display())))?;
       Ok(format!("{}/{name}", destination.trim_end_matches('/')))
     }
-    FileType::File if directory => Err(Error::Invalid(format!(
+    message::FileType::File if directory => Err(error::Error::Invalid(format!(
       "cannot copy the directory {} over the file {destination}",
       source.display()
     ))),
-    FileType::File => Ok(destination.to_string()),
-    FileType::Other => Err(Error::Invalid(format!(
+    message::FileType::File => Ok(destination.to_string()),
+    message::FileType::Other => Err(error::Error::Invalid(format!(
       "the destination {destination} is not a regular file or directory"
     ))),
   }
@@ -180,14 +191,14 @@ fn parent(path: &str) -> Option<&str> {
 }
 
 /// Starts the `/rescue` tool that `argv` names, in the jail.
-fn rescue(jail: &Jail, argv: &[&str]) -> Result<Process> {
-  jail.spawn(Exec {
+fn rescue(jail: &jail::Jail, argv: &[&str]) -> error::Result<agent::channel::Process> {
+  jail.spawn(message::Exec {
     rescue: true,
-    ..Exec::new(argv)
+    ..message::Exec::new(argv)
   })
 }
 
-fn check(jail: &Jail, argv: &[&str]) -> Result<()> {
+fn check(jail: &jail::Jail, argv: &[&str]) -> error::Result<()> {
   rescue(jail, argv)?.finish(&format!("{argv:?}"), None, &mut io::sink())
 }
 
@@ -207,14 +218,14 @@ impl Drop for HostTar {
 }
 
 impl HostTar {
-  fn start(command: &mut Command) -> Result<Self> {
+  fn start(command: &mut Command) -> error::Result<Self> {
     // Without COPYFILE_DISABLE, macOS's tar archives xattrs as AppleDouble
     // `._` files.
     let mut child = command
       .env("COPYFILE_DISABLE", "1")
       .stderr(Stdio::piped())
       .spawn()
-      .map_err(Error::io("running tar"))?;
+      .map_err(error::Error::io("running tar"))?;
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let stderr = thread::spawn(move || {
       let mut text = String::new();
@@ -228,8 +239,11 @@ impl HostTar {
     })
   }
 
-  fn finish(mut self) -> Result<()> {
-    let status = self.child.wait().map_err(Error::io("waiting for tar"))?;
+  fn finish(mut self) -> error::Result<()> {
+    let status = self
+      .child
+      .wait()
+      .map_err(error::Error::io("waiting for tar"))?;
     let stderr = self
       .stderr
       .take()
@@ -239,7 +253,7 @@ impl HostTar {
     if status.success() {
       Ok(())
     } else {
-      Err(Error::Command {
+      Err(error::Error::Command {
         command: "tar".to_string(),
         failure: format!("{status}: {}", stderr.trim_end()),
       })
@@ -253,9 +267,9 @@ mod tests {
 
   fn target_of(
     source: &str,
-    copying: FileType,
+    copying: message::FileType,
     destination: &str,
-    found: FileType,
+    found: message::FileType,
   ) -> std::result::Result<String, String> {
     target(Path::new(source), copying, destination, found).map_err(|error| error.to_string())
   }
@@ -263,27 +277,52 @@ mod tests {
   #[test]
   fn targets_as_cp_does() {
     assert_eq!(
-      target_of("/h/a.txt", FileType::File, "/srv/b.txt", FileType::Missing),
+      target_of(
+        "/h/a.txt",
+        message::FileType::File,
+        "/srv/b.txt",
+        message::FileType::Missing
+      ),
       Ok("/srv/b.txt".into())
     );
     assert_eq!(
-      target_of("/h/a.txt", FileType::File, "/srv/b.txt", FileType::File),
+      target_of(
+        "/h/a.txt",
+        message::FileType::File,
+        "/srv/b.txt",
+        message::FileType::File
+      ),
       Ok("/srv/b.txt".into())
     );
     assert_eq!(
-      target_of("/h/a.txt", FileType::File, "/srv/", FileType::Directory),
+      target_of(
+        "/h/a.txt",
+        message::FileType::File,
+        "/srv/",
+        message::FileType::Directory
+      ),
       Ok("/srv/a.txt".into())
     );
     assert_eq!(
-      target_of("/h/a.txt", FileType::File, "/", FileType::Directory),
+      target_of("/h/a.txt", message::FileType::File, "/", message::FileType::Directory),
       Ok("/a.txt".into())
     );
     assert_eq!(
-      target_of("/h/d", FileType::Directory, "/srv/d2/", FileType::Missing),
+      target_of(
+        "/h/d",
+        message::FileType::Directory,
+        "/srv/d2/",
+        message::FileType::Missing
+      ),
       Ok("/srv/d2/".into())
     );
     assert_eq!(
-      target_of("/h/d", FileType::Directory, "/srv", FileType::Directory),
+      target_of(
+        "/h/d",
+        message::FileType::Directory,
+        "/srv",
+        message::FileType::Directory
+      ),
       Ok("/srv/d".into())
     );
   }
@@ -291,18 +330,23 @@ mod tests {
   #[test]
   fn refuses_what_cp_refuses() {
     assert_eq!(
-      target_of("/h/a.txt", FileType::File, "/srv/", FileType::Missing),
+      target_of("/h/a.txt", message::FileType::File, "/srv/", message::FileType::Missing),
       Err("the destination directory /srv/ does not exist".into())
     );
     assert_eq!(
-      target_of("/h/d", FileType::Directory, "/srv/f", FileType::File),
+      target_of("/h/d", message::FileType::Directory, "/srv/f", message::FileType::File),
       Err("cannot copy the directory /h/d over the file /srv/f".into())
     );
     assert_eq!(
-      target_of("/h/a.txt", FileType::File, "/srv/fifo", FileType::Other),
+      target_of(
+        "/h/a.txt",
+        message::FileType::File,
+        "/srv/fifo",
+        message::FileType::Other
+      ),
       Err("the destination /srv/fifo is not a regular file or directory".into())
     );
-    assert!(target_of("/", FileType::File, "/srv", FileType::Directory).is_err());
+    assert!(target_of("/", message::FileType::File, "/srv", message::FileType::Directory).is_err());
   }
 
   #[test]

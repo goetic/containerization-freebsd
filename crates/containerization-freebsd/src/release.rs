@@ -2,9 +2,7 @@
 //! guest bundle built for it, each verified against a published or pinned
 //! sha256.
 
-use crate::digest::sha256_file;
-use crate::error::{Error, Result};
-use crate::http::{self, Method, Request};
+use crate::{digest, error, http};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -29,31 +27,31 @@ const USERLAND_SHA256: &str = "5b7a46a0abfbe23a1d4454b5600e2efcfce16b705bc7e9c85
 /// its sha256 against `expected`, if given. A download is hashed as it is
 /// written, and a file already there is read to hash it. A file whose
 /// sha256 differs is removed.
-fn fetch(url: &str, destination: &Path, expected: Option<&str>) -> Result<()> {
+fn fetch(url: &str, destination: &Path, expected: Option<&str>) -> error::Result<()> {
   let actual = if destination.exists() {
     match expected {
-      Some(_) => sha256_file(destination)?.0,
+      Some(_) => digest::sha256_file(destination)?.0,
       None => return Ok(()),
     }
   } else {
     let partial = destination.with_extension("partial");
     let agent = http::agent();
-    let parsed = Url::parse(url).map_err(|error| Error::Invalid(format!("{url:?} is not a URL: {error}")))?;
-    let mut get = Request::new(Method::Get, parsed);
+    let parsed = Url::parse(url).map_err(|error| error::Error::Invalid(format!("{url:?} is not a URL: {error}")))?;
+    let mut get = http::Request::new(http::Method::Get, parsed);
     let what = get.to_string();
     let downloaded = http::download(&partial, None, &what, |from| {
       get.from = from;
       http::send(&agent, &get, None)?.content(&get)
     })?;
     std::fs::rename(&partial, destination)
-      .map_err(Error::io(format!("moving {} into place", destination.display())))?;
+      .map_err(error::Error::io(format!("moving {} into place", destination.display())))?;
     downloaded.sha256
   };
 
   match expected {
     Some(expected) if actual != expected => {
       let _ = std::fs::remove_file(destination);
-      Err(Error::Checksum {
+      Err(error::Error::Checksum {
         path: destination.to_path_buf(),
         actual,
         expected: expected.to_string(),
@@ -65,7 +63,7 @@ fn fetch(url: &str, destination: &Path, expected: Option<&str>) -> Result<()> {
 
 /// The decompressed base disk in `cache`, downloaded, verified and
 /// decompressed if the cache lacks it.
-pub fn base_disk(cache: &Path) -> Result<PathBuf> {
+pub fn base_disk(cache: &Path) -> error::Result<PathBuf> {
   base_disk_from(
     &format!("https://download.freebsd.org/releases/VM-IMAGES/{RELEASE}/aarch64/Latest"),
     cache,
@@ -73,47 +71,47 @@ pub fn base_disk(cache: &Path) -> Result<PathBuf> {
 }
 
 /// `base_disk`, from the release directory URL `directory`.
-fn base_disk_from(directory: &str, cache: &Path) -> Result<PathBuf> {
+fn base_disk_from(directory: &str, cache: &Path) -> error::Result<PathBuf> {
   let raw = cache.join(BASE_DISK);
 
   if raw.exists() {
     return Ok(raw);
   }
 
-  std::fs::create_dir_all(cache).map_err(Error::io(format!("making {}", cache.display())))?;
+  std::fs::create_dir_all(cache).map_err(error::Error::io(format!("making {}", cache.display())))?;
   let sums = cache.join("CHECKSUM.SHA256");
   let compressed = cache.join(IMAGE);
 
   fetch(&format!("{directory}/CHECKSUM.SHA256"), &sums, None)?;
-  let sums = std::fs::read_to_string(&sums).map_err(Error::io("reading CHECKSUM.SHA256"))?;
-  let expected =
-    published_sha256(&sums, IMAGE).ok_or_else(|| Error::Guest(format!("CHECKSUM.SHA256 does not list {IMAGE}")))?;
+  let sums = std::fs::read_to_string(&sums).map_err(error::Error::io("reading CHECKSUM.SHA256"))?;
+  let expected = published_sha256(&sums, IMAGE)
+    .ok_or_else(|| error::Error::Guest(format!("CHECKSUM.SHA256 does not list {IMAGE}")))?;
   fetch(&format!("{directory}/{IMAGE}"), &compressed, Some(expected))?;
 
   let partial = raw.with_extension("partial");
   decompress_sparse(&compressed, &partial)?;
-  std::fs::rename(&partial, &raw).map_err(Error::io("moving the base disk into place"))?;
+  std::fs::rename(&partial, &raw).map_err(error::Error::io("moving the base disk into place"))?;
 
   Ok(raw)
 }
 
 /// The guest bundle in `cache`, downloaded and verified if the cache lacks
 /// it.
-pub fn bundle(cache: &Path) -> Result<PathBuf> {
+pub fn bundle(cache: &Path) -> error::Result<PathBuf> {
   pinned(cache, BUNDLE, BUNDLE_URL, BUNDLE_SHA256)
 }
 
 /// `RELEASE`'s `base.txz` in `cache`, downloaded and verified if the cache
 /// lacks it. A jail's root starts as this userland.
-pub fn userland(cache: &Path) -> Result<PathBuf> {
+pub fn userland(cache: &Path) -> error::Result<PathBuf> {
   pinned(cache, USERLAND, USERLAND_URL, USERLAND_SHA256)
 }
 
-fn pinned(cache: &Path, name: &str, url: &str, sha256: &str) -> Result<PathBuf> {
+fn pinned(cache: &Path, name: &str, url: &str, sha256: &str) -> error::Result<PathBuf> {
   let path = cache.join(name);
 
   if !path.exists() {
-    std::fs::create_dir_all(cache).map_err(Error::io(format!("making {}", cache.display())))?;
+    std::fs::create_dir_all(cache).map_err(error::Error::io(format!("making {}", cache.display())))?;
     fetch(url, &path, Some(sha256))?;
   }
   Ok(path)
@@ -130,11 +128,11 @@ fn published_sha256<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
 
 /// Decompresses the xz file `source` to `destination`, seeking over zeroed
 /// chunks so the result is sparse.
-fn decompress_sparse(source: &Path, destination: &Path) -> Result<()> {
+fn decompress_sparse(source: &Path, destination: &Path) -> error::Result<()> {
   let decompressing = || format!("decompressing {}", source.display());
-  let input = File::open(source).map_err(Error::io(decompressing()))?;
+  let input = File::open(source).map_err(error::Error::io(decompressing()))?;
   let mut decoder = xz2::read::XzDecoder::new(BufReader::new(input));
-  let mut output = File::create(destination).map_err(Error::io(decompressing()))?;
+  let mut output = File::create(destination).map_err(error::Error::io(decompressing()))?;
   let mut chunk = vec![0u8; 1 << 20];
   let mut length = 0u64;
 
@@ -145,7 +143,7 @@ fn decompress_sparse(source: &Path, destination: &Path) -> Result<()> {
       match decoder.read(&mut chunk[filled..]) {
         Ok(0) => break,
         Ok(read) => filled += read,
-        Err(error) => return Err(Error::io(decompressing())(error)),
+        Err(error) => return Err(error::Error::io(decompressing())(error)),
       }
     }
 
@@ -157,20 +155,24 @@ fn decompress_sparse(source: &Path, destination: &Path) -> Result<()> {
     if data.iter().all(|&byte| byte == 0) {
       output
         .seek(SeekFrom::Current(filled as i64))
-        .map_err(Error::io(decompressing()))?;
+        .map_err(error::Error::io(decompressing()))?;
     } else {
-      output.write_all(data).map_err(Error::io(decompressing()))?;
+      output
+        .write_all(data)
+        .map_err(error::Error::io(decompressing()))?;
     }
     length += filled as u64;
   }
 
-  output.set_len(length).map_err(Error::io(decompressing()))
+  output
+    .set_len(length)
+    .map_err(error::Error::io(decompressing()))
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::testing::serve_files;
+  use crate::testing;
 
   #[test]
   fn reads_the_sha256_published_for_an_image() {
@@ -209,7 +211,7 @@ mod tests {
 
     let sha256 = match listed {
       Some(listed) => listed.to_string(),
-      None => sha256_file(&directory.join(IMAGE)).unwrap().0,
+      None => digest::sha256_file(&directory.join(IMAGE)).unwrap().0,
     };
     std::fs::write(
       directory.join("CHECKSUM.SHA256"),
@@ -217,7 +219,7 @@ mod tests {
     )
     .unwrap();
 
-    serve_files(directory.to_path_buf())
+    testing::serve_files(directory.to_path_buf())
   }
 
   #[test]
@@ -240,7 +242,7 @@ mod tests {
     let url = release(source.path(), b"disk", Some("0000"));
 
     let error = base_disk_from(&url, cache.path()).unwrap_err();
-    assert!(matches!(error, Error::Checksum { .. }), "{error}");
+    assert!(matches!(error, error::Error::Checksum { .. }), "{error}");
     assert!(!cache.path().join(IMAGE).exists());
     assert!(!cache.path().join(BASE_DISK).exists());
   }
@@ -248,11 +250,11 @@ mod tests {
   #[test]
   fn fails_when_the_release_is_missing() {
     let (source, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let empty = serve_files(source.path().to_path_buf());
+    let empty = testing::serve_files(source.path().to_path_buf());
 
     let error = base_disk_from(&empty, cache.path()).unwrap_err();
     assert!(
-      matches!(&error, Error::Command { failure, .. } if failure.starts_with("HTTP 404")),
+      matches!(&error, error::Error::Command { failure, .. } if failure.starts_with("HTTP 404")),
       "{error}"
     );
   }

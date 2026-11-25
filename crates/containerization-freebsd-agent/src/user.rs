@@ -3,14 +3,14 @@
 //! do.
 
 use crate::sys;
-use containerization_freebsd_protocol::User;
+use containerization_freebsd_protocol::message;
 use std::io;
 use std::path::Path;
 
 /// The ids a process runs with, and its home directory.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
-  pub(crate) ids: sys::Ids,
+  pub(crate) ids: sys::exec::Ids,
   pub(crate) home: String,
 }
 
@@ -30,7 +30,7 @@ struct Group<'a> {
 /// Looks up `user` in the files under `root`, a directory in the guest. A
 /// missing file counts as empty; a file whose path leads out of `root` is
 /// refused.
-pub(crate) fn look_up(user: &User, root: &Path) -> io::Result<Identity> {
+pub(crate) fn look_up(user: &message::User, root: &Path) -> io::Result<Identity> {
   let passwd = read(root, "etc/passwd")?;
   let group = read(root, "etc/group")?;
 
@@ -42,7 +42,7 @@ pub(crate) fn look_up(user: &User, root: &Path) -> io::Result<Identity> {
 /// supplementary groups are those that list the user as a member, unless
 /// `user.group` is set: then it replaces the primary group and no listed
 /// groups are added. `user.groups` are always added.
-fn resolve(user: &User, passwd: &str, group: &str) -> Result<Identity, String> {
+fn resolve(user: &message::User, passwd: &str, group: &str) -> Result<Identity, String> {
   let uid = user.name.parse::<u32>().ok();
   let account = accounts(passwd).find(|account| match uid {
     Some(uid) => account.uid == uid,
@@ -77,7 +77,7 @@ fn resolve(user: &User, passwd: &str, group: &str) -> Result<Identity, String> {
   }
 
   Ok(Identity {
-    ids: sys::Ids { uid, gid, groups },
+    ids: sys::exec::Ids { uid, gid, groups },
     home: home.to_string(),
   })
 }
@@ -172,16 +172,16 @@ nogroup:*:65533:
 nobody:*:65534:
 ";
 
-  fn user(name: &str) -> User {
-    User {
+  fn user(name: &str) -> message::User {
+    message::User {
       name: name.into(),
-      ..User::default()
+      ..message::User::default()
     }
   }
 
   fn identity(uid: u32, gid: u32, groups: &[u32], home: &str) -> Identity {
     Identity {
-      ids: sys::Ids {
+      ids: sys::exec::Ids {
         uid,
         gid,
         groups: groups.to_vec(),
@@ -222,11 +222,11 @@ nobody:*:65534:
 
   #[test]
   fn a_group_given_replaces_the_users_own_and_those_that_list_them() {
-    let by_name = User {
+    let by_name = message::User {
       group: Some("nogroup".into()),
       ..user("www")
     };
-    let by_gid = User {
+    let by_gid = message::User {
       group: Some("4343".into()),
       ..user("www")
     };
@@ -243,7 +243,7 @@ nobody:*:65534:
 
   #[test]
   fn adds_more_groups_by_name_or_gid_once_each() {
-    let more = User {
+    let more = message::User {
       groups: vec!["operator".into(), "20".into(), "4444".into()],
       ..user("www")
     };
@@ -256,7 +256,7 @@ nobody:*:65534:
 
   #[test]
   fn refuses_a_group_name_that_is_not_listed() {
-    let unlisted = User {
+    let unlisted = message::User {
       groups: vec!["ghosts".into()],
       ..user("www")
     };

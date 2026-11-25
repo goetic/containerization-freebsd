@@ -1,10 +1,9 @@
 //! The channels the host opens with the agent: processes, relays and
 //! listeners, each over a stream of the agent's messages.
 
-use super::AGENT_TIMEOUT;
-use super::session::{Shared, Written};
-use crate::error::{Error, Result};
-use containerization_freebsd_protocol::{Exit, Message, WINDOW, WindowSize};
+use super::session;
+use crate::error;
+use containerization_freebsd_protocol::{message, mux};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -17,7 +16,7 @@ use std::time::{Duration, Instant};
 
 /// The largest Data payload the host sends, so that channels take turns on
 /// the console.
-const CHUNK: usize = WINDOW / 2;
+const CHUNK: usize = mux::WINDOW / 2;
 
 /// A process the agent runs. Dropping it before it exits kills it.
 pub struct Process {
@@ -32,7 +31,7 @@ pub enum Output {
   Stdout(Vec<u8>),
   Stderr(Vec<u8>),
   /// The process exited. Nothing follows this.
-  Exited(Exit),
+  Exited(message::Exit),
 }
 
 /// A connection to a socket in the guest: a TCP port on the loopback of the
@@ -52,8 +51,8 @@ pub(crate) struct Listener {
 /// An open channel and the messages the agent sends on it.
 pub(super) struct Stream {
   channel: u32,
-  shared: Arc<Shared>,
-  messages: Mutex<Receiver<Message>>,
+  shared: Arc<session::Shared>,
+  messages: Mutex<Receiver<message::Message>>,
   /// A description of the process or socket, for error messages.
   what: String,
 }
@@ -67,28 +66,31 @@ impl Process {
   }
 
   /// Writes to the process's stdin.
-  pub fn write(&self, bytes: &[u8]) -> Result<()> {
+  pub fn write(&self, bytes: &[u8]) -> error::Result<()> {
     self.stream.write(bytes)
   }
 
   /// Closes the process's stdin. On a terminal, write ^D instead. Does
   /// nothing once the process has exited.
-  pub fn close_input(&self) -> Result<()> {
-    self.stream.send_while_open(Message::Eof).map(|_| ())
+  pub fn close_input(&self) -> error::Result<()> {
+    self
+      .stream
+      .send_while_open(message::Message::Eof)
+      .map(|_| ())
   }
 
   /// Resizes the process's terminal.
-  pub fn resize(&self, size: WindowSize) -> Result<()> {
-    self.stream.send(Message::Resize(size))
+  pub fn resize(&self, size: message::WindowSize) -> error::Result<()> {
+    self.stream.send(message::Message::Resize(size))
   }
 
   /// Sends the process a signal. Signal numbers are the guest's.
-  pub fn signal(&self, signal: i32) -> Result<()> {
-    self.stream.send(Message::Signal(signal))
+  pub fn signal(&self, signal: i32) -> error::Result<()> {
+    self.stream.send(message::Message::Signal(signal))
   }
 
   /// Returns the process's next output, waiting as long as it takes.
-  pub fn recv(&self) -> Result<Output> {
+  pub fn recv(&self) -> error::Result<Output> {
     self.check_running()?;
     loop {
       if let Some(output) = self.output(self.stream.recv()?) {
@@ -99,7 +101,7 @@ impl Process {
 
   /// Returns the process's next output, or `None` if none arrives within
   /// `timeout`.
-  pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<Output>> {
+  pub fn recv_timeout(&self, timeout: Duration) -> error::Result<Option<Output>> {
     self.check_running()?;
     loop {
       let Some(message) = self.stream.recv_timeout(timeout)? else {
@@ -113,7 +115,7 @@ impl Process {
 
   /// Waits for the process to exit, writing its stdout to `stdout` and its
   /// stderr to `stderr`, and returns how it exited.
-  pub fn wait(&self, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<Exit> {
+  pub fn wait(&self, stdout: &mut dyn Write, stderr: &mut dyn Write) -> error::Result<message::Exit> {
     loop {
       if let Some(exit) = self.write_out(self.recv()?, stdout, stderr)? {
         return Ok(exit);
@@ -129,7 +131,7 @@ impl Process {
     timeout: Duration,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-  ) -> Result<Option<Exit>> {
+  ) -> error::Result<Option<message::Exit>> {
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -145,19 +147,19 @@ impl Process {
   /// Waits up to `timeout`, if given, for the process to exit 0, writing its
   /// stdout to `stdout`. Errors describe the process by `what` and carry its
   /// stderr.
-  pub(crate) fn finish(&self, what: &str, timeout: Option<Duration>, stdout: &mut dyn Write) -> Result<()> {
+  pub(crate) fn finish(&self, what: &str, timeout: Option<Duration>, stdout: &mut dyn Write) -> error::Result<()> {
     let mut stderr = Vec::new();
     let exit = match timeout {
       None => self.wait(stdout, &mut stderr)?,
       Some(timeout) => self
         .wait_timeout(timeout, stdout, &mut stderr)?
-        .ok_or_else(|| Error::Timeout(format!("{what} did not finish within {}s", timeout.as_secs())))?,
+        .ok_or_else(|| error::Error::Timeout(format!("{what} did not finish within {}s", timeout.as_secs())))?,
     };
 
     if exit.success() {
       return Ok(());
     }
-    Err(Error::Guest(format!(
+    Err(error::Error::Guest(format!(
       "{what} exited with {exit}: {}",
       String::from_utf8_lossy(&stderr).trim()
     )))
@@ -174,14 +176,14 @@ impl Process {
     source_what: &str,
     what: &str,
     timeout: Option<Duration>,
-  ) -> Result<()> {
+  ) -> error::Result<()> {
     let sent = match io::copy(source, &mut &*self) {
       Ok(_) => self.close_input(),
       // Only writing to the process wraps an `Error`.
-      Err(error) => match error.downcast::<Error>() {
+      Err(error) => match error.downcast::<error::Error>() {
         Ok(error) => Err(error),
         // The caller drops the process, which kills it.
-        Err(error) => return Err(Error::io(format!("reading {source_what}"))(error)),
+        Err(error) => return Err(error::Error::io(format!("reading {source_what}"))(error)),
       },
     };
 
@@ -189,7 +191,12 @@ impl Process {
   }
 
   /// Writes `output` to `stdout` or `stderr`, or returns the exit it reports.
-  fn write_out(&self, output: Output, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<Option<Exit>> {
+  fn write_out(
+    &self,
+    output: Output,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+  ) -> error::Result<Option<message::Exit>> {
     let written = match output {
       Output::Stdout(bytes) => stdout.write_all(&bytes),
       Output::Stderr(bytes) => stderr.write_all(&bytes),
@@ -197,7 +204,7 @@ impl Process {
     };
     // This runs for every chunk of output, so the message is built only on
     // failure.
-    written.map_err(|error| Error::Io {
+    written.map_err(|error| error::Error::Io {
       action: format!("writing the output of {}", self.stream.what),
       error,
     })?;
@@ -205,19 +212,19 @@ impl Process {
   }
 
   /// Fails once the process has exited, since nothing follows Exited.
-  fn check_running(&self) -> Result<()> {
+  fn check_running(&self) -> error::Result<()> {
     if self.exited.load(Ordering::Relaxed) {
-      return Err(Error::Guest(format!("{} has exited", self.stream.what)));
+      return Err(error::Error::Guest(format!("{} has exited", self.stream.what)));
     }
     Ok(())
   }
 
   /// The output `message` carries, if any.
-  fn output(&self, message: Message) -> Option<Output> {
+  fn output(&self, message: message::Message) -> Option<Output> {
     match message {
-      Message::Data(bytes) => Some(Output::Stdout(bytes)),
-      Message::Stderr(bytes) => Some(Output::Stderr(bytes)),
-      Message::Exited(exit) => {
+      message::Message::Data(bytes) => Some(Output::Stdout(bytes)),
+      message::Message::Stderr(bytes) => Some(Output::Stderr(bytes)),
+      message::Message::Exited(exit) => {
         self.exited.store(true, Ordering::Relaxed);
         Some(Output::Exited(exit))
       }
@@ -236,25 +243,25 @@ impl Relay {
   }
 
   /// Writes to the connection.
-  pub fn write(&self, bytes: &[u8]) -> Result<()> {
+  pub fn write(&self, bytes: &[u8]) -> error::Result<()> {
     self.stream.write(bytes)
   }
 
   /// Half-closes the connection.
-  pub fn close_write(&self) -> Result<()> {
-    self.stream.send(Message::Eof)
+  pub fn close_write(&self) -> error::Result<()> {
+    self.stream.send(message::Message::Eof)
   }
 
   /// Returns the next bytes from the connection, or `None` once it has ended.
-  pub fn read(&self) -> Result<Option<Vec<u8>>> {
+  pub fn read(&self) -> error::Result<Option<Vec<u8>>> {
     if self.ended.load(Ordering::Relaxed) {
       return Ok(None);
     }
 
     loop {
       match self.stream.recv()? {
-        Message::Data(bytes) => return Ok(Some(bytes)),
-        Message::Eof => {
+        message::Message::Data(bytes) => return Ok(Some(bytes)),
+        message::Message::Eof => {
           self.ended.store(true, Ordering::Relaxed);
           return Ok(None);
         }
@@ -330,20 +337,20 @@ impl Listener {
 
   /// Stops the listener and waits for the agent to close and remove the
   /// socket.
-  pub(crate) fn close(self) -> Result<()> {
-    if !self.stream.send_while_open(Message::Eof)? {
+  pub(crate) fn close(self) -> error::Result<()> {
+    if !self.stream.send_while_open(message::Message::Eof)? {
       return Ok(());
     }
 
     loop {
-      match self.stream.recv_timeout(AGENT_TIMEOUT)? {
-        Some(Message::Eof) => return Ok(()),
+      match self.stream.recv_timeout(super::AGENT_TIMEOUT)? {
+        Some(message::Message::Eof) => return Ok(()),
         Some(_) => {}
         None => {
-          return Err(Error::Timeout(format!(
+          return Err(error::Error::Timeout(format!(
             "{}: the agent did not close it within {}s",
             self.stream.what,
-            AGENT_TIMEOUT.as_secs()
+            super::AGENT_TIMEOUT.as_secs()
           )));
         }
       }
@@ -355,18 +362,26 @@ impl Listener {
 pub(super) fn relay_accepted(stream: Stream, host: &Path) {
   match UnixStream::connect(host) {
     Ok(local) => {
-      if stream.send(Message::Opened).is_ok() {
+      if stream.send(message::Message::Opened).is_ok() {
         Relay::new(stream).splice(local);
       }
     }
     Err(error) => {
-      let _ = stream.send(Message::Error(format!("connecting to {}: {error}", host.display())));
+      let _ = stream.send(message::Message::Error(format!(
+        "connecting to {}: {error}",
+        host.display()
+      )));
     }
   }
 }
 
 impl Stream {
-  pub(super) fn new(channel: u32, shared: Arc<Shared>, messages: Receiver<Message>, what: String) -> Self {
+  pub(super) fn new(
+    channel: u32,
+    shared: Arc<session::Shared>,
+    messages: Receiver<message::Message>,
+    what: String,
+  ) -> Self {
     Self {
       channel,
       shared,
@@ -376,18 +391,18 @@ impl Stream {
   }
 
   /// Waits for the agent to send Opened on the new channel.
-  pub(super) fn opened(self) -> Result<Self> {
-    match self.recv_timeout(AGENT_TIMEOUT)? {
-      Some(Message::Opened) => Ok(self),
-      Some(other) => Err(Error::Guest(format!(
+  pub(super) fn opened(self) -> error::Result<Self> {
+    match self.recv_timeout(super::AGENT_TIMEOUT)? {
+      Some(message::Message::Opened) => Ok(self),
+      Some(other) => Err(error::Error::Guest(format!(
         "{}: the agent sent {} before opened",
         self.what,
         other.name()
       ))),
-      None => Err(Error::Timeout(format!(
+      None => Err(error::Error::Timeout(format!(
         "{}: the agent did not open it within {}s",
         self.what,
-        AGENT_TIMEOUT.as_secs()
+        super::AGENT_TIMEOUT.as_secs()
       ))),
     }
   }
@@ -395,10 +410,10 @@ impl Stream {
   /// Waits up to `timeout` for the agent's answer on a channel that carries
   /// just one message from it, such as a Call channel. An Error fails the
   /// channel.
-  pub(super) fn answer(&self, timeout: Duration) -> Result<Message> {
+  pub(super) fn answer(&self, timeout: Duration) -> error::Result<message::Message> {
     match self.recv_timeout(timeout)? {
       Some(message) => Ok(message),
-      None => Err(Error::Timeout(format!(
+      None => Err(error::Error::Timeout(format!(
         "{}: the agent did not answer within {}s",
         self.what,
         timeout.as_secs()
@@ -407,16 +422,16 @@ impl Stream {
   }
 
   /// The error for a message from the agent that the channel didn't expect.
-  pub(super) fn unexpected(&self, message: &Message) -> Error {
-    Error::Guest(format!("{}: the agent sent {}", self.what, message.name()))
+  pub(super) fn unexpected(&self, message: &message::Message) -> error::Error {
+    error::Error::Guest(format!("{}: the agent sent {}", self.what, message.name()))
   }
 
   /// The error for a Return that doesn't answer the channel's Call.
-  pub(super) fn misreturned(&self) -> Error {
-    Error::Guest(format!("{}: the agent returned the wrong kind of answer", self.what))
+  pub(super) fn misreturned(&self) -> error::Error {
+    error::Error::Guest(format!("{}: the agent returned the wrong kind of answer", self.what))
   }
 
-  fn send(&self, message: Message) -> Result<()> {
+  fn send(&self, message: message::Message) -> error::Result<()> {
     let written = self.shared.lock().send(self.channel, message, &self.what)?;
     written.wait()
   }
@@ -424,7 +439,7 @@ impl Stream {
   /// Like `send`, but only if the channel is still open. Returns whether it
   /// was. A process's channel closes when the process exits, which can happen
   /// before the host has acted on Opened.
-  fn send_while_open(&self, message: Message) -> Result<bool> {
+  fn send_while_open(&self, message: message::Message) -> error::Result<bool> {
     let written = {
       let mut state = self.shared.lock();
       if !state.mux.is_open(self.channel) {
@@ -437,7 +452,7 @@ impl Stream {
   }
 
   /// Sends `bytes` as Data in chunks, each framed straight from the slice.
-  fn write(&self, bytes: &[u8]) -> Result<()> {
+  fn write(&self, bytes: &[u8]) -> error::Result<()> {
     bytes.chunks(CHUNK).try_for_each(|chunk| {
       let written = self
         .shared
@@ -449,7 +464,7 @@ impl Stream {
 
   /// Returns the next message, waiting as long as it takes. An Error message
   /// from the agent, or the end of the session, is returned as an error.
-  fn recv(&self) -> Result<Message> {
+  fn recv(&self) -> error::Result<message::Message> {
     let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
     let message = messages.recv().map_err(|_| self.session_ended())?;
 
@@ -457,7 +472,7 @@ impl Stream {
   }
 
   /// Like `recv`, but returns `None` if no message arrives within `timeout`.
-  fn recv_timeout(&self, timeout: Duration) -> Result<Option<Message>> {
+  fn recv_timeout(&self, timeout: Duration) -> error::Result<Option<message::Message>> {
     let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
 
     match messages.recv_timeout(timeout) {
@@ -468,15 +483,15 @@ impl Stream {
   }
 
   /// `message`, unless it is the agent's Error, which fails the channel.
-  fn unless_error(&self, message: Message) -> Result<Message> {
+  fn unless_error(&self, message: message::Message) -> error::Result<message::Message> {
     match message {
-      Message::Error(reason) => Err(Error::Guest(format!("{}: {reason}", self.what))),
+      message::Message::Error(reason) => Err(error::Error::Guest(format!("{}: {reason}", self.what))),
       message => Ok(message),
     }
   }
 
-  fn session_ended(&self) -> Error {
-    Error::SessionEnded(format!("{} was open", self.what))
+  fn session_ended(&self) -> error::Error {
+    error::Error::SessionEnded(format!("{} was open", self.what))
   }
 }
 
@@ -489,7 +504,7 @@ impl Drop for Stream {
       let written = if state.channels.contains_key(&self.channel) && state.mux.is_open(self.channel) {
         state.close(self.channel, "closed by the host")
       } else {
-        Written::nothing()
+        session::Written::nothing()
       };
       state.forget(self.channel);
       written
@@ -501,18 +516,16 @@ impl Drop for Stream {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::agent::Exec;
-  use crate::agent::Spawn;
-  use crate::agent::tests::started;
+  use crate::agent::{self, Spawn};
 
   /// Far longer than any of these tests' commands take.
   const TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 
   #[test]
   fn waits_for_the_exit_keeping_stdout_and_stderr_apart() {
-    let agent = started();
+    let agent = agent::tests::started();
     let process = agent
-      .spawn(Exec::new(["sh", "-c", "echo out; echo err >&2; exit 2"]))
+      .spawn(message::Exec::new(["sh", "-c", "echo out; echo err >&2; exit 2"]))
       .unwrap();
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
 
@@ -520,16 +533,16 @@ mod tests {
 
     assert_eq!(
       (exit, stdout.as_slice(), stderr.as_slice()),
-      (Exit::Code(2), &b"out\n"[..], &b"err\n"[..])
+      (message::Exit::Code(2), &b"out\n"[..], &b"err\n"[..])
     );
   }
 
   #[test]
   fn finish_times_out_while_the_process_writes_to_stderr() {
-    let agent = started();
+    let agent = agent::tests::started();
     // Writes to stderr every 100ms for 5s, then exits 0.
     let process = agent
-      .spawn(Exec::new([
+      .spawn(message::Exec::new([
         "sh",
         "-c",
         "for i in $(seq 50); do echo $i >&2; sleep 0.1; done",
@@ -539,22 +552,22 @@ mod tests {
 
     let result = process.finish("writing", Some(Duration::from_millis(500)), &mut io::sink());
 
-    assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
+    assert!(matches!(result, Err(error::Error::Timeout(_))), "{result:?}");
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
   }
 
   #[test]
   fn finish_reports_a_failure_with_its_stderr() {
-    let agent = started();
+    let agent = agent::tests::started();
     let process = agent
-      .spawn(Exec::new(["sh", "-c", "echo out; echo broken >&2; exit 3"]))
+      .spawn(message::Exec::new(["sh", "-c", "echo out; echo broken >&2; exit 3"]))
       .unwrap();
     let mut stdout = Vec::new();
 
     let result = process.finish("writing", TIMEOUT, &mut stdout);
 
     assert!(
-      matches!(&result, Err(Error::Guest(message)) if message == "writing exited with status 3: broken"),
+      matches!(&result, Err(error::Error::Guest(message)) if message == "writing exited with status 3: broken"),
       "{result:?}"
     );
     assert_eq!(stdout, b"out\n");
@@ -562,9 +575,9 @@ mod tests {
 
   #[test]
   fn feeds_a_reader_to_stdin() {
-    let agent = started();
+    let agent = agent::tests::started();
     let process = agent
-      .spawn(Exec::new(["sh", "-c", "[ $(wc -c) -eq 1000000 ]"]))
+      .spawn(message::Exec::new(["sh", "-c", "[ $(wc -c) -eq 1000000 ]"]))
       .unwrap();
 
     process
@@ -582,28 +595,28 @@ mod tests {
       }
     }
 
-    let agent = started();
-    let process = agent.spawn(Exec::new(["cat"])).unwrap();
+    let agent = agent::tests::started();
+    let process = agent.spawn(message::Exec::new(["cat"])).unwrap();
 
     let result = process.feed(&mut Unreadable, "the input", "copying", TIMEOUT);
 
     assert!(
-      matches!(&result, Err(Error::Io { action, .. }) if action == "reading the input"),
+      matches!(&result, Err(error::Error::Io { action, .. }) if action == "reading the input"),
       "{result:?}"
     );
   }
 
   #[test]
   fn reports_why_a_process_stopped_reading() {
-    let agent = started();
+    let agent = agent::tests::started();
     let process = agent
-      .spawn(Exec::new(["sh", "-c", "echo refused >&2; exit 3"]))
+      .spawn(message::Exec::new(["sh", "-c", "echo refused >&2; exit 3"]))
       .unwrap();
 
     let result = process.feed(&mut io::repeat(b'x').take(16 << 20), "the input", "refusing", TIMEOUT);
 
     assert!(
-      matches!(&result, Err(Error::Guest(message)) if message == "refusing exited with status 3: refused"),
+      matches!(&result, Err(error::Error::Guest(message)) if message == "refusing exited with status 3: refused"),
       "{result:?}"
     );
   }

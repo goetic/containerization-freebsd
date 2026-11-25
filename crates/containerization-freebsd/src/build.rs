@@ -3,11 +3,10 @@
 //! hashed from that snapshot's name and the step, so a built step never runs
 //! again.
 
-use crate::agent::{Agent, Exec, Exit, Output, Spawn};
-use crate::digest::sha256;
-use crate::error::{Error, Result};
-use crate::jail::{Jail, Network};
-use crate::zfs::{Cache, SnapshotChain, Zfs};
+use crate::agent::{self, Spawn};
+use crate::jail::{self, network};
+use crate::{digest, error, zfs};
+use containerization_freebsd_protocol::message;
 
 /// The snapshot taken of each step's dataset once the step succeeds.
 const BUILT: &str = "built";
@@ -16,7 +15,7 @@ const BUILT: &str = "built";
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Step {
   pub script: String,
-  pub network: Network,
+  pub network: network::Network,
 }
 
 impl Step {
@@ -24,7 +23,7 @@ impl Step {
   pub fn new(script: impl Into<String>) -> Self {
     Self {
       script: script.into(),
-      network: Network::default(),
+      network: network::Network::default(),
     }
   }
 }
@@ -39,18 +38,18 @@ pub struct Built {
 }
 
 pub struct Builder<'a> {
-  agent: &'a Agent,
-  zfs: Zfs<'a>,
+  agent: &'a agent::Agent,
+  zfs: zfs::Zfs<'a>,
   store: String,
 }
 
 impl<'a> Builder<'a> {
   /// Builds into datasets under `store`, such as `images/builds`. `build`
   /// creates and mounts `store` if needed.
-  pub fn new(agent: &'a Agent, store: &str) -> Self {
+  pub fn new(agent: &'a agent::Agent, store: &str) -> Self {
     Self {
       agent,
-      zfs: Zfs::new(agent),
+      zfs: zfs::Zfs::new(agent),
       store: store.to_string(),
     }
   }
@@ -58,8 +57,8 @@ impl<'a> Builder<'a> {
   /// Builds `steps` on the snapshot `from`, running only those not built
   /// before, with their stdout and stderr to `output`. Builds into one store
   /// must not run concurrently.
-  pub fn build(&self, from: &str, steps: &[Step], output: &mut dyn FnMut(&[u8])) -> Result<Built> {
-    let chain = SnapshotChain::open(&self.zfs, &self.store, BUILT)?;
+  pub fn build(&self, from: &str, steps: &[Step], output: &mut dyn FnMut(&[u8])) -> error::Result<Built> {
+    let chain = zfs::SnapshotChain::open(&self.zfs, &self.store, BUILT)?;
     let mut built = Built {
       snapshot: from.to_string(),
       ran: 0,
@@ -74,8 +73,8 @@ impl<'a> Builder<'a> {
         })
         .map_err(|error| error.context(format!("step {} of {}", index + 1, steps.len())))?;
       match cache {
-        Cache::Hit => built.cached += 1,
-        Cache::Miss => built.ran += 1,
+        zfs::Cache::Hit => built.cached += 1,
+        zfs::Cache::Miss => built.ran += 1,
       }
       built.snapshot = snapshot;
     }
@@ -83,15 +82,15 @@ impl<'a> Builder<'a> {
   }
 
   /// Runs `step` in a jail rooted at `root`, a step's dataset.
-  fn in_jail(&self, root: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> Result<()> {
+  fn in_jail(&self, root: &str, key: &str, step: &Step, output: &mut dyn FnMut(&[u8])) -> error::Result<()> {
     let name = format!("cfbsd-build-{}", &key[..16]);
-    let jail = Jail::start(self.agent, &name, root, &step.network, &["mount.devfs"])?;
+    let jail = jail::Jail::start(self.agent, &name, root, &step.network, &["mount.devfs"])?;
 
     let exit = run_script(&jail, &step.script, output);
     // Remove resolv.conf from inside the jail, so that a symlink the script
     // left on the path can't lead outside.
     let removed = match step.network {
-      Network::None => Ok(()),
+      network::Network::None => Ok(()),
       _ => jail.remove_resolv_conf(),
     };
     jail.stop()?;
@@ -99,7 +98,7 @@ impl<'a> Builder<'a> {
 
     match exit? {
       exit if exit.success() => Ok(()),
-      exit => Err(Error::Guest(format!("the script exited with {exit}"))),
+      exit => Err(error::Error::Guest(format!("the script exited with {exit}"))),
     }
   }
 }
@@ -111,25 +110,25 @@ fn key(from: &str, step: &Step) -> String {
   let network = match step.network {
     // The variants' Debug names, which existing cached steps were keyed by.
     // Changing them invalidates those caches.
-    Network::None => "None",
-    Network::Inherit => "Inherit",
-    Network::Nat => "Nat",
-    Network::Interfaces(_) => "Interfaces",
+    network::Network::None => "None",
+    network::Network::Inherit => "Inherit",
+    network::Network::Nat => "Nat",
+    network::Network::Interfaces(_) => "Interfaces",
   };
-  sha256(format!("{from}\n{network}\n{}", step.script).as_bytes())
+  digest::sha256(format!("{from}\n{network}\n{}", step.script).as_bytes())
 }
 
-fn run_script(jail: &Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> Result<Exit> {
-  let process = jail.spawn(Exec {
+fn run_script(jail: &jail::Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> error::Result<message::Exit> {
+  let process = jail.spawn(message::Exec {
     cwd: Some("/".into()),
-    ..Exec::new(["/bin/sh", "-c", script])
+    ..message::Exec::new(["/bin/sh", "-c", script])
   })?;
   process.close_input()?;
 
   loop {
     match process.recv()? {
-      Output::Stdout(bytes) | Output::Stderr(bytes) => output(&bytes),
-      Output::Exited(exit) => return Ok(exit),
+      agent::channel::Output::Stdout(bytes) | agent::channel::Output::Stderr(bytes) => output(&bytes),
+      agent::channel::Output::Exited(exit) => return Ok(exit),
     }
   }
 }
@@ -137,21 +136,20 @@ fn run_script(jail: &Jail, script: &str, output: &mut dyn FnMut(&[u8])) -> Resul
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::jail::Interface;
-  use crate::machine::Mac;
+  use crate::machine;
 
   const FROM: &str = "images/userland@base";
 
-  fn on(network: Network) -> Step {
+  fn on(network: network::Network) -> Step {
     Step {
       network,
       ..Step::new("echo one")
     }
   }
 
-  fn leased(address: &str) -> Network {
-    Network::Interfaces(vec![Interface {
-      mac: Mac([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]),
+  fn leased(address: &str) -> network::Network {
+    network::Network::Interfaces(vec![network::Interface {
+      mac: machine::Mac([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]),
       address: address.into(),
       gateway: Some("192.168.64.1".into()),
     }])
@@ -160,11 +158,11 @@ mod tests {
   #[test]
   fn keeps_the_keys_of_steps_built_before() {
     assert_eq!(
-      key(FROM, &on(Network::Inherit)),
+      key(FROM, &on(network::Network::Inherit)),
       "e7187d7e27746dc0bfd6ae4488cabaaf08312ce97e55317bdcfac2e7254604f9"
     );
     assert_eq!(
-      key(FROM, &on(Network::None)),
+      key(FROM, &on(network::Network::None)),
       "f1a9bc418a10888b6829f466d3f2501fe3dd9fb97b32269d6b9357bd9f761801"
     );
   }
@@ -174,6 +172,6 @@ mod tests {
     let first = key(FROM, &on(leased("192.168.64.3/24")));
 
     assert_eq!(key(FROM, &on(leased("192.168.64.140/24"))), first);
-    assert_ne!(key(FROM, &on(Network::Nat)), first);
+    assert_ne!(key(FROM, &on(network::Network::Nat)), first);
   }
 }

@@ -1,7 +1,7 @@
 //! Syncs the guest's clock to the host's every 30 seconds while the machine
 //! isn't paused, like Containerization's TimeSyncer.
 
-use crate::agent::Agent;
+use crate::agent;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -16,7 +16,7 @@ pub(crate) struct ClockSync {
 }
 
 impl ClockSync {
-  pub(crate) fn start(agent: Agent) -> Self {
+  pub(crate) fn start(agent: agent::Agent) -> Self {
     let paused = Arc::new(AtomicBool::new(false));
     let (stop, stopped) = mpsc::channel::<()>();
     let syncing = paused.clone();

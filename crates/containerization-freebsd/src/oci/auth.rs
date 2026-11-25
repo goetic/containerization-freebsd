@@ -1,8 +1,8 @@
 //! Registry authentication: credentials, the authorization sent with each
 //! request, and the WWW-Authenticate challenges that ask for it.
 
-use super::Reference;
-use crate::error::{Error, Result};
+use super::reference;
+use crate::error;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use std::collections::HashMap;
 use std::fmt;
@@ -97,17 +97,17 @@ pub(super) struct TokenResponse {
 /// and `scope` as query parameters. Without a challenge scope, the scope is
 /// `reference`'s repository with the actions `access` needs.
 pub(super) fn token_url(
-  reference: &Reference,
+  reference: &reference::Reference,
   access: Access,
   challenge: &str,
   parameters: &HashMap<String, String>,
-) -> Result<url::Url> {
+) -> error::Result<url::Url> {
   let realm = parameters
     .get("realm")
-    .ok_or_else(|| Error::Guest(format!("{} named no token realm: {challenge}", reference.domain())))?;
+    .ok_or_else(|| error::Error::Guest(format!("{} named no token realm: {challenge}", reference.domain())))?;
   let scope = format!("repository:{}:{}", reference.repository(), access.actions());
   let mut url = url::Url::parse(realm)
-    .map_err(|error| Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain())))?;
+    .map_err(|error| error::Error::Invalid(format!("{}'s token realm {realm:?}: {error}", reference.domain())))?;
 
   let mut query = url.query_pairs_mut();
   if let Some(service) = parameters.get("service") {
@@ -200,7 +200,7 @@ mod tests {
 
   #[test]
   fn asks_for_a_token_to_the_repository() {
-    let reference = Reference::parse("ghcr.io/a/b").unwrap();
+    let reference = reference::Reference::parse("ghcr.io/a/b").unwrap();
     let (_, parameters) = parse_challenge(r#"Bearer realm="https://ghcr.io/token",service="ghcr.io""#);
 
     assert_eq!(

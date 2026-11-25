@@ -1,16 +1,11 @@
 //! FreeBSD jails in the guest, managed through the guest agent.
 
-mod mount;
-mod network;
+pub mod mount;
+pub mod network;
 
-pub use mount::Mount;
-pub use network::{Interface, Network};
-
-use crate::agent::{Agent, Exec, FileType, Process, QUICK, Ran, Relay, Spawn};
-use crate::copy::{self, Parents};
-use crate::error::{Error, Result};
-use crate::socket::{SocketRelay, UnixSocket};
-use containerization_freebsd_protocol::{Address, Connect, GuestPath, Statistics};
+use crate::agent::{self, Spawn};
+use crate::{copy, error, socket};
+use containerization_freebsd_protocol::message;
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,7 +17,7 @@ const GRACE: Duration = Duration::from_secs(10);
 const DYING: Duration = Duration::from_secs(90);
 
 pub struct Jail<'a> {
-  agent: &'a Agent,
+  agent: &'a agent::Agent,
   name: String,
 }
 
@@ -31,7 +26,13 @@ impl<'a> Jail<'a> {
   /// `parameters` are jail(8) parameters, as `key=value` or a bare boolean
   /// such as `mount.devfs`; `host.hostname` defaults to `name`. A jail with a
   /// network gets a copy of the guest's resolv.conf unless its root has one.
-  pub fn start(agent: &'a Agent, name: &str, path: &str, network: &Network, parameters: &[&str]) -> Result<Self> {
+  pub fn start(
+    agent: &'a agent::Agent,
+    name: &str,
+    path: &str,
+    network: &network::Network,
+    parameters: &[&str],
+  ) -> error::Result<Self> {
     let (name_parameter, path_parameter, hostname) = (
       format!("name={name}"),
       format!("path={path}"),
@@ -48,7 +49,7 @@ impl<'a> Jail<'a> {
     argv.extend(network_parameters.iter().map(String::as_str));
     argv.extend_from_slice(parameters);
 
-    if let Err(error) = agent.check(&argv, QUICK) {
+    if let Err(error) = agent.check(&argv, agent::QUICK) {
       if let Some(epair) = &epair {
         let _ = epair.destroy(agent);
       }
@@ -66,7 +67,7 @@ impl<'a> Jail<'a> {
   }
 
   /// Refers to a jail that is already running, such as after a restore.
-  pub fn running(agent: &'a Agent, name: &str) -> Self {
+  pub fn running(agent: &'a agent::Agent, name: &str) -> Self {
     Self {
       agent,
       name: name.to_string(),
@@ -74,8 +75,8 @@ impl<'a> Jail<'a> {
   }
 
   /// The running jail named `name`, if any.
-  pub fn find(agent: &'a Agent, name: &str) -> Result<Option<Self>> {
-    let ran = agent.run(&["jls", "-j", name, "jid"], QUICK)?;
+  pub fn find(agent: &'a agent::Agent, name: &str) -> error::Result<Option<Self>> {
+    let ran = agent.run(&["jls", "-j", name, "jid"], agent::QUICK)?;
 
     Ok(ran.exit.success().then(|| Self::running(agent, name)))
   }
@@ -86,32 +87,32 @@ impl<'a> Jail<'a> {
 
   /// Connects to `port` on the jail's loopback, which is the guest's unless
   /// it is a VNET jail.
-  pub fn connect(&self, port: u16) -> Result<Relay> {
-    self.agent.relay(Connect {
-      to: Address::Port(port),
+  pub fn connect(&self, port: u16) -> error::Result<agent::channel::Relay> {
+    self.agent.relay(message::Connect {
+      to: message::Address::Port(port),
       jail: Some(self.name.clone()),
     })
   }
 
   /// Connects to the Unix socket at `path` in the jail.
-  pub fn connect_unix(&self, path: &str) -> Result<Relay> {
-    self.agent.relay(Connect {
-      to: Address::Unix(path.to_string()),
+  pub fn connect_unix(&self, path: &str) -> error::Result<agent::channel::Relay> {
+    self.agent.relay(message::Connect {
+      to: message::Address::Unix(path.to_string()),
       jail: Some(self.name.clone()),
     })
   }
 
   /// The type of file at `path` in the jail, following symlinks as the jail
   /// sees them.
-  pub fn file_type(&self, path: &str) -> Result<FileType> {
-    self.agent.file_type_at(GuestPath {
+  pub fn file_type(&self, path: &str) -> error::Result<message::FileType> {
+    self.agent.file_type_at(message::GuestPath {
       path: path.to_string(),
       jail: Some(self.name.clone()),
     })
   }
 
   /// Like `Agent::relay_socket`, with the socket's guest path in the jail.
-  pub fn relay_socket(&self, socket: &UnixSocket) -> Result<SocketRelay> {
+  pub fn relay_socket(&self, socket: &socket::UnixSocket) -> error::Result<socket::SocketRelay> {
     self.agent.relay_socket_in(socket, Some(&self.name))
   }
 
@@ -119,7 +120,7 @@ impl<'a> Jail<'a> {
   /// limits on all its processes together: `cpus` CPUs and `memory_in_bytes`
   /// resident. Over a limit, they're throttled or paged out. `stop` lifts the
   /// rules.
-  pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Result<()> {
+  pub fn limit(&self, cpus: Option<u32>, memory_in_bytes: Option<u64>) -> error::Result<()> {
     self
       .agent
       .set_rules(&self.name, rules(cpus, memory_in_bytes))
@@ -129,7 +130,7 @@ impl<'a> Jail<'a> {
   /// Containerization's `copyIn`: to `destination`, or into it if it is a
   /// directory. A copied file gets `mode`. `parents` says whether to create
   /// missing parent directories. Paths resolve as the jail sees them.
-  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, parents: Parents) -> Result<()> {
+  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, parents: copy::Parents) -> error::Result<()> {
     copy::copy_in(self, source, destination, mode, parents)
   }
 
@@ -137,18 +138,18 @@ impl<'a> Jail<'a> {
   /// `destination`, like Containerization's `copyOut`. A file is written 0644;
   /// a directory's contents go into `destination`. `parents` says whether to
   /// create missing parent directories.
-  pub fn copy_out(&self, source: &str, destination: &Path, parents: Parents) -> Result<()> {
+  pub fn copy_out(&self, source: &str, destination: &Path, parents: copy::Parents) -> error::Result<()> {
     copy::copy_out(self, source, destination, parents)
   }
 
   /// The jail's aggregate racct usage (`rctl -u`) and its interface counters.
-  pub fn statistics(&self) -> Result<Statistics> {
+  pub fn statistics(&self) -> error::Result<message::Statistics> {
     self.statistics_with(None)
   }
 
   /// Like `statistics`, with the ZFS I/O counters of `dataset` if one is
   /// given, all from one Call.
-  pub(crate) fn statistics_with(&self, dataset: Option<&str>) -> Result<Statistics> {
+  pub(crate) fn statistics_with(&self, dataset: Option<&str>) -> error::Result<message::Statistics> {
     self.agent.statistics(&self.name, dataset)
   }
 
@@ -158,15 +159,15 @@ impl<'a> Jail<'a> {
   /// the jail's epair; by then the jail's interface devices are back in the
   /// guest. After removal, a failed step doesn't skip the rest; the first
   /// failure is returned.
-  pub fn stop(self) -> Result<()> {
+  pub fn stop(self) -> error::Result<()> {
     let ran = self
       .agent
-      .check(&["jls", "-j", &self.name, "path", "vnet"], QUICK)?;
+      .check(&["jls", "-j", &self.name, "path", "vnet"], agent::QUICK)?;
     let (path, vnet) = ran
       .stdout
       .trim()
       .rsplit_once(' ')
-      .ok_or_else(|| Error::Guest(format!("jls described jail {}: {:?}", self.name, ran.stdout)))?;
+      .ok_or_else(|| error::Error::Guest(format!("jls described jail {}: {:?}", self.name, ran.stdout)))?;
     let mut steps = Steps::default();
     // Only a VNET jail has its own interfaces. List its epairs while it can
     // still be entered.
@@ -192,7 +193,7 @@ impl<'a> Jail<'a> {
     // A failed removal leaves the jail running: return early so a later
     // `find` can stop it again.
     if steps
-      .take(self.agent.check(&["jail", "-r", &self.name], QUICK))
+      .take(self.agent.check(&["jail", "-r", &self.name], agent::QUICK))
       .is_none()
     {
       return steps.finish();
@@ -207,7 +208,7 @@ impl<'a> Jail<'a> {
         steps.take(
           self
             .agent
-            .check(&["ifconfig", &format!("{unit}a"), "destroy"], QUICK),
+            .check(&["ifconfig", &format!("{unit}a"), "destroy"], agent::QUICK),
         );
       }
     }
@@ -216,13 +217,13 @@ impl<'a> Jail<'a> {
 
   /// Like `check`, but runs the guest's `/rescue` tool `argv` names, so the
   /// jail needn't have it.
-  fn rescue(&self, argv: &[&str]) -> Result<Ran> {
-    let exec = Exec {
+  fn rescue(&self, argv: &[&str]) -> error::Result<agent::Ran> {
+    let exec = message::Exec {
       rescue: true,
-      ..Exec::new(argv)
+      ..message::Exec::new(argv)
     };
 
-    self.check_exec(exec, QUICK)
+    self.check_exec(exec, agent::QUICK)
   }
 }
 
@@ -230,8 +231,8 @@ impl Spawn for Jail<'_> {
   /// Starts `exec`'s process in the jail, as `Agent::spawn` does in the
   /// guest. The working directory is a path in the jail, `/` by default, and
   /// the user is looked up in the jail's `/etc/passwd` and `/etc/group`.
-  fn spawn(&self, exec: Exec) -> Result<Process> {
-    self.agent.spawn(Exec {
+  fn spawn(&self, exec: message::Exec) -> error::Result<agent::channel::Process> {
+    self.agent.spawn(message::Exec {
       jail: Some(self.name.clone()),
       ..exec
     })
@@ -244,7 +245,7 @@ impl Spawn for Jail<'_> {
 /// includes devfs: jail(8) mounts it for `mount.devfs`, but `jail -r <name>`
 /// can't unmount it, because the parameter lives in jail(8), not the kernel,
 /// so a jail removed by name has no record of it.
-pub(crate) fn clean_up(agent: &Agent, name: &str, path: &str) -> Result<()> {
+pub(crate) fn clean_up(agent: &agent::Agent, name: &str, path: &str) -> error::Result<()> {
   let mut steps = Steps::default();
 
   steps.take(agent.set_rules(name, Vec::new()));
@@ -268,10 +269,10 @@ fn rules(cpus: Option<u32>, memory_in_bytes: Option<u64>) -> Vec<String> {
 
 /// Keeps the first failure among steps that each run regardless.
 #[derive(Default)]
-struct Steps(Option<Error>);
+struct Steps(Option<error::Error>);
 
 impl Steps {
-  fn take<T>(&mut self, result: Result<T>) -> Option<T> {
+  fn take<T>(&mut self, result: error::Result<T>) -> Option<T> {
     result
       .map_err(|error| {
         self.0.get_or_insert(error);
@@ -279,7 +280,7 @@ impl Steps {
       .ok()
   }
 
-  fn finish(self) -> Result<()> {
+  fn finish(self) -> error::Result<()> {
     self.0.map_or(Ok(()), Err)
   }
 }
@@ -303,9 +304,9 @@ mod tests {
     let mut steps = Steps::default();
 
     assert_eq!(steps.take(Ok(1)), Some(1));
-    assert_eq!(steps.take::<()>(Err(Error::Invalid("first".into()))), None);
+    assert_eq!(steps.take::<()>(Err(error::Error::Invalid("first".into()))), None);
     assert_eq!(steps.take(Ok(2)), Some(2));
-    steps.take::<()>(Err(Error::Invalid("second".into())));
-    assert!(matches!(steps.finish(), Err(Error::Invalid(why)) if why == "first"));
+    steps.take::<()>(Err(error::Error::Invalid("second".into())));
+    assert!(matches!(steps.finish(), Err(error::Error::Invalid(why)) if why == "first"));
   }
 }

@@ -1,8 +1,7 @@
 //! File systems mounted into jails.
 
-use super::Jail;
-use crate::error::Result;
-use containerization_freebsd_protocol::GuestPath;
+use crate::error;
+use containerization_freebsd_protocol::message;
 
 /// A file system mounted into a jail, like Containerization's `Mount` for a
 /// container.
@@ -48,15 +47,15 @@ impl Mount {
   }
 }
 
-impl Jail<'_> {
+impl super::Jail<'_> {
   /// Mounts `mount` in the jail until `stop`. Mount before anything runs in
   /// the jail: otherwise a jailed process could swap a directory on the path
   /// for a symlink between the agent resolving it and mounting there.
-  pub fn mount(&self, mount: &Mount) -> Result<()> {
-    self.agent.mount(containerization_freebsd_protocol::Mount {
+  pub fn mount(&self, mount: &Mount) -> error::Result<()> {
+    self.agent.mount(message::Mount {
       kind: mount.kind.clone(),
       source: mount.source.clone(),
-      destination: GuestPath {
+      destination: message::GuestPath {
         path: mount.destination.clone(),
         jail: Some(self.name.clone()),
       },

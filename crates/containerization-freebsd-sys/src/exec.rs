@@ -2,8 +2,7 @@
 //! limits, umask, user and directory, or running a guest `/rescue` tool in
 //! place of its program.
 
-use crate::jail::{JailId, attach};
-use crate::{c_string, check};
+use crate::jail;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, PipeReader, Read};
@@ -33,7 +32,7 @@ pub struct Ids {
 
 /// The setup a process performs between fork and exec.
 pub struct Entry {
-  pub jail: Option<JailId>,
+  pub jail: Option<jail::JailId>,
   pub limits: Vec<Limit>,
   pub umask: Option<u16>,
   pub ids: Option<Ids>,
@@ -92,7 +91,7 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering
   // The reader is nonblocking because it is read after a failed spawn while
   // the command still holds the write end, so a blocking read would hang.
   // SAFETY: fcntl changes only the descriptor's flags.
-  check(unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) })?;
+  crate::check(unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) })?;
   let rlim = |value: u64| value.min(libc::RLIM_INFINITY as u64) as libc::rlim_t;
   let limits: Vec<(libc::c_int, libc::rlimit)> = entry
     .limits
@@ -106,7 +105,7 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering
     })
     .collect();
   let umask = entry.umask.map(|umask| umask as libc::mode_t);
-  let cwd = entry.cwd.as_ref().map(c_string).transpose()?;
+  let cwd = entry.cwd.as_ref().map(crate::c_string).transpose()?;
   let Entry { jail, ids, .. } = entry;
 
   // SAFETY: between fork and exec, the closure makes only async-signal-safe
@@ -115,10 +114,10 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering
     command.pre_exec(move || {
       let report = writer.as_fd();
       if let Some(jail) = jail {
-        attach(jail).map_err(failed_at(report, Step::Jail))?;
+        jail::attach(jail).map_err(failed_at(report, Step::Jail))?;
       }
       for (resource, limit) in &limits {
-        check(libc::setrlimit(*resource as _, limit)).map_err(failed_at(report, Step::Limits))?;
+        crate::check(libc::setrlimit(*resource as _, limit)).map_err(failed_at(report, Step::Limits))?;
       }
       if let Some(umask) = umask {
         libc::umask(umask);
@@ -126,13 +125,13 @@ pub fn enter_on_exec(command: &mut Command, entry: Entry) -> io::Result<Entering
       if let Some(ids) = &ids {
         // On FreeBSD 15, as on other systems, setgroups sets only the
         // supplementary groups; earlier FreeBSD took the first entry as egid.
-        check(libc::setgroups(ids.groups.len() as _, ids.groups.as_ptr()))
-          .and_then(|_| check(libc::setgid(ids.gid)))
-          .and_then(|_| check(libc::setuid(ids.uid)))
+        crate::check(libc::setgroups(ids.groups.len() as _, ids.groups.as_ptr()))
+          .and_then(|_| crate::check(libc::setgid(ids.gid)))
+          .and_then(|_| crate::check(libc::setuid(ids.uid)))
           .map_err(failed_at(report, Step::User))?;
       }
       if let Some(cwd) = &cwd {
-        check(libc::chdir(cwd.as_ptr())).map_err(failed_at(report, Step::Directory))?;
+        crate::check(libc::chdir(cwd.as_ptr())).map_err(failed_at(report, Step::Directory))?;
       }
       Ok(())
     });
@@ -179,7 +178,10 @@ pub fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> 
       None => environment.remove(name),
     };
   }
-  let args = argv.iter().map(c_string).collect::<io::Result<Vec<_>>>()?;
+  let args = argv
+    .iter()
+    .map(crate::c_string)
+    .collect::<io::Result<Vec<_>>>()?;
   let variables = environment
     .into_iter()
     .map(|(name, value)| {
@@ -187,7 +189,7 @@ pub fn rescue_on_exec(command: &mut Command, argv: &[String]) -> io::Result<()> 
       variable.push("=");
       variable.push(value);
       // The error names only the variable, since its value may be a secret.
-      c_string(variable)
+      crate::c_string(variable)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("variable {name:?} has a NUL")))
     })
     .collect::<io::Result<Vec<_>>>()?;

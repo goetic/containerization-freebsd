@@ -3,11 +3,9 @@
 //! so a layer stack shared by several images is unpacked once. The top
 //! layer's snapshot is what a container's root is cloned from.
 
-use crate::agent::{Agent, Exec, QUICK, Spawn};
-use crate::error::{Error, Result};
-use crate::images::Image;
-use crate::oci::{Descriptor, Platform, media_type};
-use crate::zfs::{Cache, SnapshotChain, Zfs};
+use crate::agent::{self, Spawn};
+use crate::{error, images, oci, zfs};
+use containerization_freebsd_protocol::message;
 use std::time::Duration;
 
 /// The guest agent's binary, where the guest bundle installs it. Its
@@ -19,8 +17,8 @@ const UNPACKING: Duration = Duration::from_secs(600);
 const UNPACKED: &str = "unpacked";
 
 pub struct Unpacker<'a> {
-  agent: &'a Agent,
-  zfs: Zfs<'a>,
+  agent: &'a agent::Agent,
+  zfs: zfs::Zfs<'a>,
   store: String,
 }
 
@@ -36,10 +34,10 @@ pub struct Unpacked {
 impl<'a> Unpacker<'a> {
   /// Unpacks into datasets under `store`, such as `images/layers`. `unpack`
   /// creates and mounts `store` if needed.
-  pub fn new(agent: &'a Agent, store: &str) -> Self {
+  pub fn new(agent: &'a agent::Agent, store: &str) -> Self {
     Self {
       agent,
-      zfs: Zfs::new(agent),
+      zfs: zfs::Zfs::new(agent),
       store: store.to_string(),
     }
   }
@@ -49,12 +47,12 @@ impl<'a> Unpacker<'a> {
   /// decompressed layer against its diff ID, so a snapshot always holds the
   /// content its chain ID names. Unpacks into one store must not run
   /// concurrently.
-  pub fn unpack(&self, image: &Image, platform: &Platform) -> Result<Unpacked> {
+  pub fn unpack(&self, image: &images::Image, platform: &oci::Platform) -> error::Result<Unpacked> {
     let (_, manifest) = image.manifest(platform)?;
     let config = image.config(platform)?;
     let diff_ids = &config.rootfs.diff_ids;
     if manifest.layers.is_empty() || manifest.layers.len() != diff_ids.len() {
-      return Err(Error::Invalid(format!(
+      return Err(error::Error::Invalid(format!(
         "{} has {} layers, and its config {} digests for them",
         image.reference,
         manifest.layers.len(),
@@ -62,7 +60,7 @@ impl<'a> Unpacker<'a> {
       )));
     }
 
-    let layers = SnapshotChain::open(&self.zfs, &self.store, UNPACKED)?;
+    let layers = zfs::SnapshotChain::open(&self.zfs, &self.store, UNPACKED)?;
     let mut unpacked = Unpacked {
       snapshot: String::new(),
       unpacked: 0,
@@ -87,8 +85,8 @@ impl<'a> Unpacker<'a> {
           ))
         })?;
       match cache {
-        Cache::Hit => unpacked.cached += 1,
-        Cache::Miss => unpacked.unpacked += 1,
+        zfs::Cache::Hit => unpacked.cached += 1,
+        zfs::Cache::Miss => unpacked.unpacked += 1,
       }
       below = Some(snapshot);
     }
@@ -101,30 +99,44 @@ impl<'a> Unpacker<'a> {
   /// `staging`, checks it against `diff_id`, and applies it to the dataset
   /// mounted at `root`. The agent removes `staging` as it exits, or this does
   /// if the agent was killed first.
-  fn layer(&self, image: &Image, layer: &Descriptor, diff_id: &str, root: &str, staging: &str) -> Result<()> {
+  fn layer(
+    &self,
+    image: &images::Image,
+    layer: &oci::Descriptor,
+    diff_id: &str,
+    root: &str,
+    staging: &str,
+  ) -> error::Result<()> {
     let compression = compression(&layer.media_type)?;
     let path = image.content().path(&layer.digest)?;
     let name = path.display().to_string();
-    let mut blob = std::fs::File::open(&path).map_err(Error::io(format!("reading {name}")))?;
-    let process = self
-      .agent
-      .spawn(Exec::new([AGENT, "unpack", compression, root, staging, diff_id]))?;
+    let mut blob = std::fs::File::open(&path).map_err(error::Error::io(format!("reading {name}")))?;
+    let process = self.agent.spawn(message::Exec::new([
+      AGENT,
+      "unpack",
+      compression,
+      root,
+      staging,
+      diff_id,
+    ]))?;
 
     let result = process.feed(&mut blob, &name, "unpacking", Some(UNPACKING));
     if result.is_err() {
-      let _ = self.agent.run(&["rm", "-f", staging], QUICK);
+      let _ = self.agent.run(&["rm", "-f", staging], agent::QUICK);
     }
     result
   }
 }
 
 /// A layer media type's compression, as the agent's `unpack` names it.
-fn compression(media_type: &str) -> Result<&'static str> {
+fn compression(media_type: &str) -> error::Result<&'static str> {
   match media_type {
-    media_type::LAYER | media_type::DOCKER_LAYER => Ok("none"),
-    media_type::LAYER_GZIP | media_type::DOCKER_LAYER_GZIP => Ok("gzip"),
-    media_type::LAYER_ZSTD => Ok("zstd"),
-    other => Err(Error::Invalid(format!("layers of type {other} aren't supported"))),
+    oci::media_type::LAYER | oci::media_type::DOCKER_LAYER => Ok("none"),
+    oci::media_type::LAYER_GZIP | oci::media_type::DOCKER_LAYER_GZIP => Ok("gzip"),
+    oci::media_type::LAYER_ZSTD => Ok("zstd"),
+    other => Err(error::Error::Invalid(format!(
+      "layers of type {other} aren't supported"
+    ))),
   }
 }
 
@@ -134,11 +146,11 @@ mod tests {
 
   #[test]
   fn decompresses_the_layer_types_it_knows() {
-    assert_eq!(compression(media_type::LAYER_GZIP).unwrap(), "gzip");
-    assert_eq!(compression(media_type::DOCKER_LAYER_GZIP).unwrap(), "gzip");
-    assert_eq!(compression(media_type::LAYER_ZSTD).unwrap(), "zstd");
-    assert_eq!(compression(media_type::LAYER).unwrap(), "none");
-    assert_eq!(compression(media_type::DOCKER_LAYER).unwrap(), "none");
+    assert_eq!(compression(oci::media_type::LAYER_GZIP).unwrap(), "gzip");
+    assert_eq!(compression(oci::media_type::DOCKER_LAYER_GZIP).unwrap(), "gzip");
+    assert_eq!(compression(oci::media_type::LAYER_ZSTD).unwrap(), "zstd");
+    assert_eq!(compression(oci::media_type::LAYER).unwrap(), "none");
+    assert_eq!(compression(oci::media_type::DOCKER_LAYER).unwrap(), "none");
     assert!(compression("application/vnd.oci.image.layer.nondistributable.v1.tar+gzip").is_err());
   }
 }

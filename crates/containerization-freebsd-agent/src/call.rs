@@ -2,7 +2,7 @@
 //! and reports back on.
 
 use crate::{jail, mount, net, sys};
-use containerization_freebsd_protocol::{Call, Disk, FileCopy, FileType, GuestPath, Return};
+use containerization_freebsd_protocol::message;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -10,43 +10,43 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 /// What to report for a Call: known now, or once a thread has finished work
 /// that only waits, which the session loop shouldn't wait for.
 pub(crate) enum Answer {
-  Now(io::Result<Return>),
-  Later(Box<dyn FnOnce() -> io::Result<Return> + Send>),
+  Now(io::Result<message::Return>),
+  Later(Box<dyn FnOnce() -> io::Result<message::Return> + Send>),
 }
 
 /// Does what `call` asks, and returns what to report. Forks and spawns
 /// happen here, on the session loop, and never in the work for `Later`.
-pub(crate) fn answer(call: &Call) -> Answer {
-  let done = |()| Return::Done;
+pub(crate) fn answer(call: &message::Call) -> Answer {
+  let done = |()| message::Return::Done;
 
   Answer::Now(match call {
-    Call::FileType(path) => file_type(path).map(Return::FileType),
-    Call::Mount(mounting) => mount::mount(mounting).map(done),
-    Call::Unmount(path) => mount::unmount_under(path).map(done),
-    Call::Disks => disks().map(Return::Disks),
-    Call::CopyFile(copy) => copy_file(copy).map(done),
-    Call::RemoveCopy(copy) => remove_copy(copy).map(done),
-    Call::MountDataset(dataset) => mount::mount_dataset(dataset).map(Return::Path),
-    Call::SetRules(rules) => jail::set_rules(rules).map(done),
-    Call::Statistics(of) => jail::statistics(of).map(Return::Statistics),
-    Call::Terminate(wait) => match jail::terminate(wait) {
+    message::Call::FileType(path) => file_type(path).map(message::Return::FileType),
+    message::Call::Mount(mounting) => mount::mount(mounting).map(done),
+    message::Call::Unmount(path) => mount::unmount_under(path).map(done),
+    message::Call::Disks => disks().map(message::Return::Disks),
+    message::Call::CopyFile(copy) => copy_file(copy).map(done),
+    message::Call::RemoveCopy(copy) => remove_copy(copy).map(done),
+    message::Call::MountDataset(dataset) => mount::mount_dataset(dataset).map(message::Return::Path),
+    message::Call::SetRules(rules) => jail::set_rules(rules).map(done),
+    message::Call::Statistics(of) => jail::statistics(of).map(message::Return::Statistics),
+    message::Call::Terminate(wait) => match jail::terminate(wait) {
       Ok(terminating) => return Answer::Later(Box::new(move || terminating().map(done))),
       Err(error) => Err(error),
     },
-    Call::DropConnections(name) => jail::drop_connections(name).map(done),
-    Call::AwaitRemoval(wait) => {
+    message::Call::DropConnections(name) => jail::drop_connections(name).map(done),
+    message::Call::AwaitRemoval(wait) => {
       let wait = wait.clone();
       return Answer::Later(Box::new(move || jail::await_removal(&wait).map(done)));
     }
-    Call::Claim(claim) => net::claim(claim).map(Return::Name),
-    Call::SetAddress(addressing) => net::set_address(addressing).map(done),
-    Call::AwaitRoute(seconds) => {
+    message::Call::Claim(claim) => net::claim(claim).map(message::Return::Name),
+    message::Call::SetAddress(addressing) => net::set_address(addressing).map(done),
+    message::Call::AwaitRoute(seconds) => {
       let seconds = *seconds;
       return Answer::Later(Box::new(move || net::await_route(seconds).map(done)));
     }
-    Call::CreateEpair(bridge) => net::create_epair(bridge).map(Return::Name),
-    Call::Lease(mac) => match net::lease(mac) {
-      Ok(leasing) => return Answer::Later(Box::new(move || leasing().map(Return::Lease))),
+    message::Call::CreateEpair(bridge) => net::create_epair(bridge).map(message::Return::Name),
+    message::Call::Lease(mac) => match net::lease(mac) {
+      Ok(leasing) => return Answer::Later(Box::new(move || leasing().map(message::Return::Lease))),
       Err(error) => Err(error),
     },
   })
@@ -54,34 +54,34 @@ pub(crate) fn answer(call: &Call) -> Answer {
 
 /// The type of file at `path`, looked up from inside its jail if it names
 /// one. Symlinks are followed, so one that leads nowhere is missing.
-fn file_type(path: &GuestPath) -> io::Result<FileType> {
-  let found = match sys::jail_id(path.jail.as_deref())? {
-    Some(jail) => sys::file_type_in(jail, &path.path)?,
+fn file_type(path: &message::GuestPath) -> io::Result<message::FileType> {
+  let found = match sys::jail::jail_id(path.jail.as_deref())? {
+    Some(jail) => sys::jail::file_type_in(jail, &path.path)?,
     None => found(std::fs::metadata(&path.path))?.map(|metadata| {
       if metadata.is_dir() {
-        sys::FileType::Directory
+        sys::jail::FileType::Directory
       } else if metadata.is_file() {
-        sys::FileType::File
+        sys::jail::FileType::File
       } else {
-        sys::FileType::Other
+        sys::jail::FileType::Other
       }
     }),
   };
 
   Ok(match found {
-    None => FileType::Missing,
-    Some(sys::FileType::Directory) => FileType::Directory,
-    Some(sys::FileType::File) => FileType::File,
-    Some(sys::FileType::Other) => FileType::Other,
+    None => message::FileType::Missing,
+    Some(sys::jail::FileType::Directory) => message::FileType::Directory,
+    Some(sys::jail::FileType::File) => message::FileType::File,
+    Some(sys::jail::FileType::Other) => message::FileType::Other,
   })
 }
 
-fn disks() -> io::Result<Vec<Disk>> {
+fn disks() -> io::Result<Vec<message::Disk>> {
   Ok(
-    sys::disks()?
+    sys::disk::disks()?
       .into_iter()
-      .map(|name| Disk {
-        ident: sys::disk_ident(&name)
+      .map(|name| message::Disk {
+        ident: sys::disk::disk_ident(&name)
           .ok()
           .filter(|ident| !ident.is_empty()),
         device: format!("/dev/{name}"),
@@ -92,7 +92,7 @@ fn disks() -> io::Result<Vec<Disk>> {
 
 /// Copies `copy.from` to `copy.to` with the same permissions, unless the
 /// original is missing or something is already at the destination.
-fn copy_file(copy: &FileCopy) -> io::Result<()> {
+fn copy_file(copy: &message::FileCopy) -> io::Result<()> {
   let Some(mut from) = open(&copy.from)? else {
     return Ok(());
   };
@@ -113,7 +113,7 @@ fn copy_file(copy: &FileCopy) -> io::Result<()> {
 }
 
 /// Removes `copy.to` if it holds the same bytes as `copy.from`.
-fn remove_copy(copy: &FileCopy) -> io::Result<()> {
+fn remove_copy(copy: &message::FileCopy) -> io::Result<()> {
   let (Some(from), Some(to)) = (open(&copy.from)?, open(&copy.to)?) else {
     return Ok(());
   };
@@ -142,9 +142,9 @@ fn contents(file: File, limit: u64) -> io::Result<Option<Vec<u8>>> {
 /// Opens the file at `path` for reading, from inside its jail if it names
 /// one, without waiting for a writer if it is a FIFO. Returns `None` if
 /// nothing is there.
-fn open(path: &GuestPath) -> io::Result<Option<File>> {
-  match sys::jail_id(path.jail.as_deref())? {
-    Some(jail) => sys::open_in(jail, &path.path),
+fn open(path: &message::GuestPath) -> io::Result<Option<File>> {
+  match sys::jail::jail_id(path.jail.as_deref())? {
+    Some(jail) => sys::file::open_in(jail, &path.path),
     None => found(
       OpenOptions::new()
         .read(true)
@@ -157,9 +157,9 @@ fn open(path: &GuestPath) -> io::Result<Option<File>> {
 /// Creates a file at `path` with permissions `mode`, less the umask, from
 /// inside its jail if it names one. Returns `None` if something is already
 /// there.
-fn create(path: &GuestPath, mode: u16) -> io::Result<Option<File>> {
-  match sys::jail_id(path.jail.as_deref())? {
-    Some(jail) => sys::create_in(jail, &path.path, mode),
+fn create(path: &message::GuestPath, mode: u16) -> io::Result<Option<File>> {
+  match sys::jail::jail_id(path.jail.as_deref())? {
+    Some(jail) => sys::file::create_in(jail, &path.path, mode),
     None => match OpenOptions::new()
       .write(true)
       .create_new(true)
@@ -174,9 +174,9 @@ fn create(path: &GuestPath, mode: u16) -> io::Result<Option<File>> {
 }
 
 /// Removes the file at `path`, from inside its jail if it names one.
-fn remove(path: &GuestPath) -> io::Result<()> {
-  match sys::jail_id(path.jail.as_deref())? {
-    Some(jail) => sys::remove_in(jail, &path.path),
+fn remove(path: &message::GuestPath) -> io::Result<()> {
+  match sys::jail::jail_id(path.jail.as_deref())? {
+    Some(jail) => sys::file::remove_in(jail, &path.path),
     None => found(std::fs::remove_file(&path.path)).map(|_| ()),
   }
 }

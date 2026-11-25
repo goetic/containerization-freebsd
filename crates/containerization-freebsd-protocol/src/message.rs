@@ -3,8 +3,7 @@
 //! bytes. An enum's variant is a u8 tag before its fields. The payload of
 //! Data, Stderr and Error is the raw bytes alone.
 
-use crate::codec::{Decode, DecodeError, Encode, Reader, Writer, encode, record, tagged};
-use crate::frame::Frame;
+use crate::{codec, frame};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -587,48 +586,48 @@ impl Message {
 
   /// The message as a frame on `channel`. Data, Stderr, and Error become the
   /// payload as they are, without a copy.
-  pub fn frame(self, channel: u32) -> Frame {
+  pub fn frame(self, channel: u32) -> frame::Frame {
     let (kind, payload) = match self {
-      Self::Hello { version, answer } => (kind::HELLO, encode(&(version, answer))),
-      Self::Ping(number) => (kind::PING, encode(&number)),
-      Self::Pong(number) => (kind::PONG, encode(&number)),
-      Self::Received(bytes) => (kind::RECEIVED, encode(&bytes)),
-      Self::SetTime { seconds, nanoseconds } => (kind::SET_TIME, encode(&(seconds, nanoseconds))),
-      Self::Exec(exec) => (kind::EXEC, encode(&exec)),
-      Self::Connect(connect) => (kind::CONNECT, encode(&connect)),
-      Self::Listen(listen) => (kind::LISTEN, encode(&listen)),
-      Self::Accepted { listener } => (kind::ACCEPTED, encode(&listener)),
-      Self::Call(call) => (kind::CALL, encode(&call)),
-      Self::Return(value) => (kind::RETURN, encode(&value)),
+      Self::Hello { version, answer } => (kind::HELLO, codec::encode(&(version, answer))),
+      Self::Ping(number) => (kind::PING, codec::encode(&number)),
+      Self::Pong(number) => (kind::PONG, codec::encode(&number)),
+      Self::Received(bytes) => (kind::RECEIVED, codec::encode(&bytes)),
+      Self::SetTime { seconds, nanoseconds } => (kind::SET_TIME, codec::encode(&(seconds, nanoseconds))),
+      Self::Exec(exec) => (kind::EXEC, codec::encode(&exec)),
+      Self::Connect(connect) => (kind::CONNECT, codec::encode(&connect)),
+      Self::Listen(listen) => (kind::LISTEN, codec::encode(&listen)),
+      Self::Accepted { listener } => (kind::ACCEPTED, codec::encode(&listener)),
+      Self::Call(call) => (kind::CALL, codec::encode(&call)),
+      Self::Return(value) => (kind::RETURN, codec::encode(&value)),
       Self::Opened => (kind::OPENED, Vec::new()),
       Self::Data(bytes) => (kind::DATA, bytes),
       Self::Stderr(bytes) => (kind::STDERR, bytes),
       Self::Eof => (kind::EOF, Vec::new()),
-      Self::Resize(size) => (kind::RESIZE, encode(&size)),
-      Self::Signal(signal) => (kind::SIGNAL, encode(&signal)),
-      Self::Exited(exit) => (kind::EXITED, encode(&exit)),
+      Self::Resize(size) => (kind::RESIZE, codec::encode(&size)),
+      Self::Signal(signal) => (kind::SIGNAL, codec::encode(&signal)),
+      Self::Exited(exit) => (kind::EXITED, codec::encode(&exit)),
       Self::Error(message) => (kind::ERROR, message.into_bytes()),
     };
 
-    Frame { channel, kind, payload }
+    frame::Frame { channel, kind, payload }
   }
 
-  pub fn from_frame(frame: Frame) -> Result<Self, DecodeError> {
-    let Frame { kind, payload, .. } = frame;
+  pub fn from_frame(frame: frame::Frame) -> Result<Self, codec::DecodeError> {
+    let frame::Frame { kind, payload, .. } = frame;
 
     match kind {
       kind::DATA => Ok(Self::Data(payload)),
       kind::STDERR => Ok(Self::Stderr(payload)),
       kind::ERROR => String::from_utf8(payload)
         .map(Self::Error)
-        .map_err(|_| DecodeError::NotUtf8),
+        .map_err(|_| codec::DecodeError::NotUtf8),
       kind => Self::decode(kind, &payload),
     }
   }
 
   /// Decodes `frame` without taking its payload, which only Data, Stderr,
   /// and Error copy.
-  pub fn peek(frame: &Frame) -> Result<Self, DecodeError> {
+  pub fn peek(frame: &frame::Frame) -> Result<Self, codec::DecodeError> {
     match frame.kind {
       kind::DATA | kind::STDERR | kind::ERROR => Self::from_frame(frame.clone()),
       kind => Self::decode(kind, &frame.payload),
@@ -637,8 +636,8 @@ impl Message {
 
   /// Decodes the fields of a message of `kind` that is not Data, Stderr, or
   /// Error.
-  fn decode(kind: u8, payload: &[u8]) -> Result<Self, DecodeError> {
-    let mut reader = Reader::new(payload);
+  fn decode(kind: u8, payload: &[u8]) -> Result<Self, codec::DecodeError> {
+    let mut reader = codec::Reader::new(payload);
     let message = match kind {
       kind::HELLO => Self::Hello {
         version: reader.get()?,
@@ -664,7 +663,7 @@ impl Message {
       kind::RESIZE => Self::Resize(reader.get()?),
       kind::SIGNAL => Self::Signal(reader.get()?),
       kind::EXITED => Self::Exited(reader.get()?),
-      kind => return Err(DecodeError::UnknownKind(kind)),
+      kind => return Err(codec::DecodeError::UnknownKind(kind)),
     };
 
     reader.finish()?;
@@ -672,7 +671,7 @@ impl Message {
   }
 }
 
-record!(Exec {
+codec::record!(Exec {
   argv,
   env,
   cwd,
@@ -683,28 +682,28 @@ record!(Exec {
   limits,
   rescue,
 });
-record!(User { name, group, groups });
-record!(Limit { resource, soft, hard });
-record!(Connect { to, jail });
-record!(Listen { path, jail, mode });
-record!(GuestPath { path, jail });
-record!(Mount {
+codec::record!(User { name, group, groups });
+codec::record!(Limit { resource, soft, hard });
+codec::record!(Connect { to, jail });
+codec::record!(Listen { path, jail, mode });
+codec::record!(GuestPath { path, jail });
+codec::record!(Mount {
   kind,
   source,
   destination,
   options,
 });
-record!(FileCopy { from, to });
-record!(Disk { device, ident });
-record!(Rules { jail, rules });
-record!(StatisticsOf { jail, dataset });
-record!(JailWait { jail, seconds });
-record!(Claim { jail, mac });
-record!(Addressing { jail, device, gateway });
-record!(DeviceAddress { device, address });
-record!(Bridge { name, address, subnet });
-record!(Lease { address, gateway });
-record!(Statistics {
+codec::record!(FileCopy { from, to });
+codec::record!(Disk { device, ident });
+codec::record!(Rules { jail, rules });
+codec::record!(StatisticsOf { jail, dataset });
+codec::record!(JailWait { jail, seconds });
+codec::record!(Claim { jail, mac });
+codec::record!(Addressing { jail, device, gateway });
+codec::record!(DeviceAddress { device, address });
+codec::record!(Bridge { name, address, subnet });
+codec::record!(Lease { address, gateway });
+codec::record!(Statistics {
   cpu_seconds,
   cpu_percent,
   memory,
@@ -718,7 +717,7 @@ record!(Statistics {
   networks,
   block_io,
 });
-record!(NetworkStatistics {
+codec::record!(NetworkStatistics {
   interface,
   received_packets,
   transmitted_packets,
@@ -729,23 +728,23 @@ record!(NetworkStatistics {
   received_dropped,
   transmitted_dropped,
 });
-record!(DatasetIo {
+codec::record!(DatasetIo {
   dataset,
   read_bytes,
   write_bytes,
   read_operations,
   write_operations,
 });
-record!(WindowSize { rows, columns });
-tagged!(Address {
+codec::record!(WindowSize { rows, columns });
+codec::tagged!(Address {
   0 => Port(port),
   1 => Unix(path),
 });
-tagged!(Exit {
+codec::tagged!(Exit {
   0 => Code(code),
   1 => Signal(signal),
 });
-tagged!(Call {
+codec::tagged!(Call {
   0 => FileType(path),
   1 => Mount(mount),
   2 => Unmount(path),
@@ -764,7 +763,7 @@ tagged!(Call {
   15 => CreateEpair(bridge),
   16 => Lease(mac),
 });
-tagged!(Return {
+codec::tagged!(Return {
   0 => FileType(found),
   1 => Done,
   2 => Disks(disks),
@@ -775,8 +774,8 @@ tagged!(Return {
 });
 
 /// A file type is a u8 tag.
-impl Encode for FileType {
-  fn encode(&self, out: &mut Writer) {
+impl codec::Encode for FileType {
+  fn encode(&self, out: &mut codec::Writer) {
     let tag: u8 = match self {
       Self::Missing => 0,
       Self::Directory => 1,
@@ -787,27 +786,27 @@ impl Encode for FileType {
   }
 }
 
-impl Decode for FileType {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+impl codec::Decode for FileType {
+  fn decode(reader: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
     match reader.get::<u8>()? {
       0 => Ok(Self::Missing),
       1 => Ok(Self::Directory),
       2 => Ok(Self::File),
       3 => Ok(Self::Other),
-      tag => Err(DecodeError::UnknownTag(tag)),
+      tag => Err(codec::DecodeError::UnknownTag(tag)),
     }
   }
 }
 
 /// A resource is its number on the wire.
-impl Encode for Resource {
-  fn encode(&self, out: &mut Writer) {
+impl codec::Encode for Resource {
+  fn encode(&self, out: &mut codec::Writer) {
     out.put(&self.0);
   }
 }
 
-impl Decode for Resource {
-  fn decode(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+impl codec::Decode for Resource {
+  fn decode(reader: &mut codec::Reader<'_>) -> Result<Self, codec::DecodeError> {
     reader.get().map(Self)
   }
 }
@@ -1140,7 +1139,7 @@ mod tests {
 
   #[test]
   fn refuses_unknown_kinds_and_payloads_of_the_wrong_length() {
-    let unknown = Frame {
+    let unknown = frame::Frame {
       channel: 0,
       kind: 0x7F,
       payload: Vec::new(),
@@ -1150,8 +1149,8 @@ mod tests {
     let mut long = Message::Eof.frame(2);
     long.payload.push(0);
 
-    assert_eq!(Message::from_frame(unknown), Err(DecodeError::UnknownKind(0x7F)));
-    assert_eq!(Message::from_frame(short), Err(DecodeError::Truncated));
-    assert_eq!(Message::from_frame(long), Err(DecodeError::TooLong));
+    assert_eq!(Message::from_frame(unknown), Err(codec::DecodeError::UnknownKind(0x7F)));
+    assert_eq!(Message::from_frame(short), Err(codec::DecodeError::Truncated));
+    assert_eq!(Message::from_frame(long), Err(codec::DecodeError::TooLong));
   }
 }

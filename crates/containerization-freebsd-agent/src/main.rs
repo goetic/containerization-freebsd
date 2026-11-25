@@ -38,8 +38,8 @@ fn serve(path: &Path) -> io::Result<()> {
     .custom_flags(libc::O_NOCTTY)
     .open(path)?;
 
-  containerization_freebsd_agent::make_raw(&console)?;
-  containerization_freebsd_agent::serve(console.try_clone()?, console)
+  containerization_freebsd_sys::terminal::make_raw(&console)?;
+  containerization_freebsd_agent::session::serve(console.try_clone()?, console)
 }
 
 fn unpack(args: Vec<std::ffi::OsString>) -> ExitCode {
@@ -49,7 +49,13 @@ fn unpack(args: Vec<std::ffi::OsString>) -> ExitCode {
     return ExitCode::from(2);
   };
 
-  match containerization_freebsd_agent::unpack(io::stdin(), compression, Path::new(root), Path::new(staging), diff_id) {
+  match containerization_freebsd_agent::unpack::unpack(
+    io::stdin(),
+    compression,
+    Path::new(root),
+    Path::new(staging),
+    diff_id,
+  ) {
     Ok(()) => ExitCode::SUCCESS,
     Err(error) => {
       eprintln!("containerization-freebsd-agent: unpacking onto {root}: {error}");

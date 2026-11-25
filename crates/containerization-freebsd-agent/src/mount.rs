@@ -1,7 +1,7 @@
 //! File systems mounted in the guest and in jails, and ZFS datasets.
 
 use crate::sys;
-use containerization_freebsd_protocol::Mount;
+use containerization_freebsd_protocol::message;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -14,18 +14,18 @@ const SYMLINKS: usize = 32;
 /// Mounts what `mounting` describes, creating missing directories at its
 /// destination. A destination in a jail resolves within the jail's root,
 /// from the guest, since the jail can't mount.
-pub(crate) fn mount(mounting: &Mount) -> io::Result<()> {
+pub(crate) fn mount(mounting: &message::Mount) -> io::Result<()> {
   let destination = &mounting.destination;
   let point = match &destination.jail {
     Some(jail) => {
-      let (_, root) = sys::find_jail(jail)?;
+      let (_, root) = sys::jail::find_jail(jail)?;
       mount_point(&root, &destination.path)?
     }
     None => PathBuf::from(&destination.path),
   };
 
   std::fs::create_dir_all(&point)?;
-  sys::mount(&mounting.kind, &mounting.source, &point, &mounting.options)
+  sys::mount::mount(&mounting.kind, &mounting.source, &point, &mounting.options)
 }
 
 /// Resolves `path` in the jail rooted at `root` as `resolve` does, refusing
@@ -94,11 +94,11 @@ pub(crate) fn unmount_under(path: &str) -> io::Result<()> {
   let under = Path::new(path);
   let mut failed = None;
 
-  for mounted in sys::mounts()?.iter().rev() {
+  for mounted in sys::mount::mounts()?.iter().rev() {
     if mounted.kind == "zfs" || mounted.point == under || !mounted.point.starts_with(under) {
       continue;
     }
-    if let Err(error) = sys::unmount(&mounted.point) {
+    if let Err(error) = sys::mount::unmount(&mounted.point) {
       failed.get_or_insert_with(|| io::Error::new(error.kind(), format!("{}: {error}", mounted.point.display())));
     }
   }
@@ -109,7 +109,7 @@ pub(crate) fn unmount_under(path: &str) -> io::Result<()> {
 /// returns where. A dataset whose mountpoint is `none` or `legacy` gets
 /// `/<dataset>`. A dataset that is already mounted needs no zfs(8) at all.
 pub(crate) fn mount_dataset(dataset: &str) -> io::Result<String> {
-  let mounted = sys::mounts()?
+  let mounted = sys::mount::mounts()?
     .into_iter()
     .find(|mounted| mounted.kind == "zfs" && mounted.source == dataset);
   if let Some(mounted) = mounted {

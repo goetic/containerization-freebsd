@@ -6,7 +6,7 @@
 //! or push, POST and PUT need push. Blob GETs and HEADs redirect to
 //! unauthenticated storage outside the API, as real registries often do.
 
-use crate::oci::Digest;
+use crate::digest;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -80,7 +80,7 @@ impl FakeRegistry {
   pub(crate) fn blob(mut self, bytes: &[u8]) -> Self {
     self
       .blobs
-      .insert(Digest::of(bytes).to_string(), bytes.to_vec());
+      .insert(digest::Digest::of(bytes).to_string(), bytes.to_vec());
     self
   }
 
@@ -128,7 +128,7 @@ impl FakeRegistry {
         Response::status("202 Accepted").header("Location", format!("/v2/{repository}/blobs/uploads/{}", self.uploads))
       }
       ("PUT", Route::Upload { .. }) => match request.query("digest") {
-        Some(digest) if digest == Digest::of(&request.body).as_str() => {
+        Some(digest) if digest == digest::Digest::of(&request.body).as_str() => {
           self.blobs.insert(digest, request.body.clone());
           Response::status("201 Created")
         }
@@ -145,7 +145,7 @@ impl FakeRegistry {
     let entry = (media_type.to_string(), bytes);
     self
       .manifests
-      .insert(format!("{repository}/{}", Digest::of(&entry.1)), entry.clone());
+      .insert(format!("{repository}/{}", digest::Digest::of(&entry.1)), entry.clone());
     self
       .manifests
       .insert(format!("{repository}/{target}"), entry);

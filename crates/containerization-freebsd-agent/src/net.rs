@@ -3,7 +3,7 @@
 //! leases for spare devices.
 
 use crate::sys;
-use containerization_freebsd_protocol::{Addressing, Bridge, Claim, Lease};
+use containerization_freebsd_protocol::message;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -17,18 +17,18 @@ const LEASING: Duration = Duration::from_secs(30);
 
 /// Moves the guest's network device with the claim's MAC address into the
 /// claim's VNET jail, and returns the device's name.
-pub(crate) fn claim(claim: &Claim) -> io::Result<String> {
-  let (jail, _) = sys::find_jail(&claim.jail)?;
+pub(crate) fn claim(claim: &message::Claim) -> io::Result<String> {
+  let (jail, _) = sys::jail::find_jail(&claim.jail)?;
   let device = with_mac(&claim.mac, "in no other jail")?;
 
-  sys::move_to_vnet(&device, jail)?;
+  sys::netif::move_to_vnet(&device, jail)?;
   Ok(device)
 }
 
 /// Brings up the VNET jail's lo0, and gives it the device address and
 /// default route that `addressing` asks for.
-pub(crate) fn set_address(addressing: &Addressing) -> io::Result<()> {
-  let (jail, _) = sys::find_jail(&addressing.jail)?;
+pub(crate) fn set_address(addressing: &message::Addressing) -> io::Result<()> {
+  let (jail, _) = sys::jail::find_jail(&addressing.jail)?;
   let device = match &addressing.device {
     Some(device) => {
       let (address, prefix) = cidr(&device.address)?;
@@ -38,7 +38,7 @@ pub(crate) fn set_address(addressing: &Addressing) -> io::Result<()> {
   };
   let gateway = addressing.gateway.as_deref().map(ipv4).transpose()?;
 
-  sys::address_in(jail, &sys::Addressing { device, gateway })
+  sys::netif::address_in(jail, &sys::netif::Addressing { device, gateway })
 }
 
 /// Waits up to `seconds` for the guest's default route, and for its
@@ -47,8 +47,8 @@ pub(crate) fn await_route(seconds: u32) -> io::Result<()> {
   let deadline = Instant::now() + Duration::from_secs(u64::from(seconds));
 
   loop {
-    if let Some(index) = sys::default_route()?
-      && sys::interfaces()?
+    if let Some(index) = sys::netif::default_route()?
+      && sys::interface::interfaces()?
         .iter()
         .any(|interface| interface.index == index && interface.link_up)
     {
@@ -66,14 +66,14 @@ pub(crate) fn await_route(seconds: u32) -> io::Result<()> {
 
 /// Creates an epair, adds its `a` end to the bridge, and returns that end's
 /// name, first setting up NAT if this boot has no bridge yet.
-pub(crate) fn create_epair(bridge: &Bridge) -> io::Result<String> {
-  if !sys::interface_exists(&bridge.name)? {
+pub(crate) fn create_epair(bridge: &message::Bridge) -> io::Result<String> {
+  if !sys::netif::interface_exists(&bridge.name)? {
     set_up_nat(bridge)?;
   }
-  let outside = sys::create_interface("epair")?;
+  let outside = sys::netif::create_interface("epair")?;
 
-  if let Err(error) = sys::bridge_add(&bridge.name, &outside).and_then(|()| sys::bring_up(&outside)) {
-    let _ = sys::destroy_interface(&outside);
+  if let Err(error) = sys::netif::bridge_add(&bridge.name, &outside).and_then(|()| sys::netif::bring_up(&outside)) {
+    let _ = sys::netif::destroy_interface(&outside);
     return Err(error);
   }
   Ok(outside)
@@ -81,13 +81,13 @@ pub(crate) fn create_epair(bridge: &Bridge) -> io::Result<String> {
 
 /// Creates the bridge with its address, turns on IP forwarding, and has pf
 /// translate the subnet to the address of the default route's interface.
-fn set_up_nat(bridge: &Bridge) -> io::Result<()> {
+fn set_up_nat(bridge: &message::Bridge) -> io::Result<()> {
   let (address, prefix) = cidr(&bridge.address)?;
   // Rewritten from its parts, so that only an address reaches pf's rules.
   let (subnet, subnet_prefix) = cidr(&bridge.subnet)?;
-  let external = sys::default_route()?
+  let external = sys::netif::default_route()?
     .and_then(|index| {
-      sys::interfaces()
+      sys::interface::interfaces()
         .ok()?
         .into_iter()
         .find(|interface| interface.index == index)
@@ -101,17 +101,17 @@ fn set_up_nat(bridge: &Bridge) -> io::Result<()> {
     .name;
 
   for module in ["if_bridge", "if_epair", "pf"] {
-    sys::load_module(module)?;
+    sys::netif::load_module(module)?;
   }
-  let created = sys::create_interface("bridge")?;
-  sys::rename_interface(&created, &bridge.name)?;
-  sys::add_address(&bridge.name, address, prefix)?;
-  sys::bring_up(&bridge.name)?;
-  sys::set_int("net.inet.ip.forwarding", 1)?;
+  let created = sys::netif::create_interface("bridge")?;
+  sys::netif::rename_interface(&created, &bridge.name)?;
+  sys::netif::add_address(&bridge.name, address, prefix)?;
+  sys::netif::bring_up(&bridge.name)?;
+  sys::sysctl::set_int("net.inet.ip.forwarding", 1)?;
   pf_rules(&format!(
     "set skip on lo0\nnat on {external} inet from {subnet}/{subnet_prefix} to any -> ({external})\npass all\n"
   ))?;
-  sys::start_pf()
+  sys::netif::start_pf()
 }
 
 /// Replaces pf's rules with `rules`, through pfctl(8).
@@ -141,12 +141,12 @@ fn pf_rules(rules: &str) -> io::Result<()> {
 /// and returns the wait for its lease, which may take `LEASING`. dhclient
 /// configures nothing, since its script is true(1), and is killed once it
 /// has a lease.
-pub(crate) fn lease(mac: &str) -> io::Result<impl FnOnce() -> io::Result<Lease> + Send + use<>> {
+pub(crate) fn lease(mac: &str) -> io::Result<impl FnOnce() -> io::Result<message::Lease> + Send + use<>> {
   let device = with_mac(mac, "in no jail")?;
   let work = Work::new(&device)?;
   std::fs::write(work.0.join("conf"), "timeout 30;\nscript \"/usr/bin/true\";\n")?;
   let leases = work.0.join("leases");
-  sys::bring_up(&device)?;
+  sys::netif::bring_up(&device)?;
   let dhclient = Command::new("/sbin/dhclient")
     .arg("-d")
     .arg("-c")
@@ -164,7 +164,7 @@ pub(crate) fn lease(mac: &str) -> io::Result<impl FnOnce() -> io::Result<Lease> 
       device,
     },
     Err(error) => {
-      let _ = sys::bring_down(&device);
+      let _ = sys::netif::bring_down(&device);
       return Err(error);
     }
   };
@@ -204,7 +204,7 @@ impl Drop for Dhclient {
   fn drop(&mut self) {
     let _ = self.child.kill();
     let _ = self.child.wait();
-    let _ = sys::bring_down(&self.device);
+    let _ = sys::netif::bring_down(&self.device);
   }
 }
 
@@ -228,7 +228,7 @@ impl Drop for Work {
 
 /// The address, with its prefix length, and the first router of the last
 /// whole lease in `leases`, a dhclient.leases(5) file.
-fn parse_lease(leases: &str) -> Option<Lease> {
+fn parse_lease(leases: &str) -> Option<message::Lease> {
   let (_, last) = leases.rsplit_once("lease {")?;
   // dhclient may still be writing it.
   let (last, _) = last.split_once('}')?;
@@ -247,7 +247,7 @@ fn parse_lease(leases: &str) -> Option<Lease> {
     .and_then(|routers| routers.split(',').next())
     .map(|router| router.trim().to_string());
 
-  Some(Lease {
+  Some(message::Lease {
     address: format!("{address}/{}", u32::from(mask).count_ones()),
     gateway,
   })
@@ -258,7 +258,7 @@ fn parse_lease(leases: &str) -> Option<Lease> {
 fn with_mac(mac: &str, elsewhere: &str) -> io::Result<String> {
   let wanted = parse_mac(mac)?;
 
-  sys::interfaces()?
+  sys::interface::interfaces()?
     .into_iter()
     .find(|interface| interface.address == wanted)
     .map(|interface| interface.name)
@@ -320,7 +320,7 @@ mod tests {
 
     assert_eq!(
       parse_lease(leases),
-      Some(Lease {
+      Some(message::Lease {
         address: "192.168.64.140/16".into(),
         gateway: Some("192.168.64.1".into()),
       })
@@ -333,7 +333,7 @@ mod tests {
 
     assert_eq!(
       parse_lease(leases),
-      Some(Lease {
+      Some(message::Lease {
         address: "10.0.0.5/24".into(),
         gateway: None,
       })

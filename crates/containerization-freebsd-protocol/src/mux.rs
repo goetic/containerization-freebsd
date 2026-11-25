@@ -5,9 +5,7 @@
 //! and the guest opens odd-numbered ones, so the guest can open a channel for
 //! each connection to a socket it listens on without asking the host first.
 
-use crate::codec::DecodeError;
-use crate::frame::{Frame, MAX_PAYLOAD, encode_frame, encoded_len};
-use crate::message::{Message, kind};
+use crate::{codec, frame, message};
 use std::collections::HashMap;
 use std::{fmt, mem};
 
@@ -53,10 +51,13 @@ impl Side {
     channel != CONTROL && channel % 2 == self.first_channel() % 2
   }
 
-  fn opens(self, message: &Message) -> bool {
+  fn opens(self, message: &message::Message) -> bool {
     match message {
-      Message::Exec(_) | Message::Connect(_) | Message::Listen(_) | Message::Call(_) => self == Self::Host,
-      Message::Accepted { .. } => self == Self::Guest,
+      message::Message::Exec(_)
+      | message::Message::Connect(_)
+      | message::Message::Listen(_)
+      | message::Message::Call(_) => self == Self::Host,
+      message::Message::Accepted { .. } => self == Self::Guest,
       _ => false,
     }
   }
@@ -71,7 +72,7 @@ pub struct VersionMismatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-  Decode(DecodeError),
+  Decode(codec::DecodeError),
   Version(VersionMismatch),
   /// A channel was opened, or a non-control message sent or received, before
   /// the Hellos started a session.
@@ -98,14 +99,14 @@ enum Kind {
 }
 
 impl Kind {
-  fn of(message: &Message) -> Option<Self> {
+  fn of(message: &message::Message) -> Option<Self> {
     match message {
-      Message::Exec(exec) => Some(Self::Exec {
+      message::Message::Exec(exec) => Some(Self::Exec {
         pty: exec.pty.is_some(),
       }),
-      Message::Connect(_) | Message::Accepted { .. } => Some(Self::Relay),
-      Message::Listen(_) => Some(Self::Listener),
-      Message::Call(_) => Some(Self::Call),
+      message::Message::Connect(_) | message::Message::Accepted { .. } => Some(Self::Relay),
+      message::Message::Listen(_) => Some(Self::Listener),
+      message::Message::Call(_) => Some(Self::Call),
       _ => None,
     }
   }
@@ -150,12 +151,13 @@ impl Channel {
   /// The channel as it would be after `message` from `sender`, and whether
   /// it would still be open, or `None` if the channel does not allow the
   /// message now. The channel itself is left as it is.
-  fn after(mut self, sender: Role, message: &Message) -> Option<(Self, Status)> {
+  fn after(mut self, sender: Role, message: &message::Message) -> Option<(Self, Status)> {
     let (initiator, responder) = (sender == Role::Initiator, sender == Role::Responder);
     // A Call channel carries only the responder's Return, or an Error, and
     // either closes it.
     if self.kind == Kind::Call {
-      let allowed = matches!(message, Message::Error(_)) || (responder && matches!(message, Message::Return(_)));
+      let allowed =
+        matches!(message, message::Message::Error(_)) || (responder && matches!(message, message::Message::Return(_)));
       return allowed.then_some((self, Status::Closed));
     }
     let process = matches!(self.kind, Kind::Exec { .. });
@@ -169,14 +171,14 @@ impl Channel {
     let started = initiator || self.opened;
 
     let allowed = match message {
-      Message::Opened => responder && !self.opened,
-      Message::Data(_) => started && !ended && self.kind != Kind::Listener,
-      Message::Eof => started && !ended,
-      Message::Stderr(_) => responder && self.opened && self.kind == Kind::Exec { pty: false },
-      Message::Resize(_) => initiator && self.kind == Kind::Exec { pty: true },
-      Message::Signal(_) => initiator && process,
-      Message::Exited(_) => responder && self.opened && process,
-      Message::Error(_) => true,
+      message::Message::Opened => responder && !self.opened,
+      message::Message::Data(_) => started && !ended && self.kind != Kind::Listener,
+      message::Message::Eof => started && !ended,
+      message::Message::Stderr(_) => responder && self.opened && self.kind == Kind::Exec { pty: false },
+      message::Message::Resize(_) => initiator && self.kind == Kind::Exec { pty: true },
+      message::Message::Signal(_) => initiator && process,
+      message::Message::Exited(_) => responder && self.opened && process,
+      message::Message::Error(_) => true,
       _ => false,
     };
     if !allowed {
@@ -184,15 +186,15 @@ impl Channel {
     }
 
     match message {
-      Message::Opened => self.opened = true,
-      Message::Eof if initiator => self.initiator_eof = true,
-      Message::Eof => self.responder_eof = true,
+      message::Message::Opened => self.opened = true,
+      message::Message::Eof if initiator => self.initiator_eof = true,
+      message::Message::Eof => self.responder_eof = true,
       _ => {}
     }
 
     let closed = match message {
-      Message::Exited(_) | Message::Error(_) => true,
-      Message::Eof => !process && self.initiator_eof && self.responder_eof,
+      message::Message::Exited(_) | message::Message::Error(_) => true,
+      message::Message::Eof => !process && self.initiator_eof && self.responder_eof,
       _ => false,
     };
     Some((self, if closed { Status::Closed } else { Status::Open }))
@@ -238,7 +240,7 @@ impl Mux {
   /// channel and can open none until the guest answers. On the guest, the
   /// Hello answers the host's last Hello. If no answer is due, it announces
   /// that the agent has no session because it just started or lost frames.
-  pub fn hello(&mut self) -> Frame {
+  pub fn hello(&mut self) -> frame::Frame {
     let answer = match self.side {
       Side::Host => {
         self.unanswered = self.unanswered.saturating_add(1);
@@ -250,7 +252,7 @@ impl Mux {
       self.end_session();
     }
 
-    Message::Hello {
+    message::Message::Hello {
       version: VERSION,
       answer,
     }
@@ -259,7 +261,7 @@ impl Mux {
 
   /// Opens a channel with `message`, which must be Exec, Connect or Listen on
   /// the host, or Accepted on the guest.
-  pub fn open(&mut self, message: Message) -> Result<(u32, Frame), Error> {
+  pub fn open(&mut self, message: message::Message) -> Result<(u32, frame::Frame), Error> {
     self.require_session()?;
     let channel = self.free_channel();
     let kind = Kind::of(&message)
@@ -275,12 +277,12 @@ impl Mux {
   /// Frames a message for an open channel or [`CONTROL`], if this side may
   /// send it now. The control channel accepts Ping and Pong from either side,
   /// Received from the guest, and SetTime from the host.
-  pub fn send(&mut self, channel: u32, message: Message) -> Result<Frame, Error> {
+  pub fn send(&mut self, channel: u32, message: message::Message) -> Result<frame::Frame, Error> {
     if channel == CONTROL {
       return match message {
-        Message::Ping(_) | Message::Pong(_) => Ok(message.frame(CONTROL)),
-        Message::Received(_) if self.side == Side::Guest => Ok(message.frame(CONTROL)),
-        Message::SetTime { .. } if self.side == Side::Host => Ok(message.frame(CONTROL)),
+        message::Message::Ping(_) | message::Message::Pong(_) => Ok(message.frame(CONTROL)),
+        message::Message::Received(_) if self.side == Side::Guest => Ok(message.frame(CONTROL)),
+        message::Message::SetTime { .. } if self.side == Side::Host => Ok(message.frame(CONTROL)),
         _ => Err(not_allowed(channel, &message)),
       };
     }
@@ -297,18 +299,18 @@ impl Mux {
   pub fn send_data(&mut self, channel: u32, bytes: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     // The rules for Data don't depend on what it holds, so an empty one,
     // which allocates nothing, stands in for `bytes`.
-    let data = Message::Data(Vec::new());
+    let data = message::Message::Data(Vec::new());
     if channel == CONTROL {
       return Err(not_allowed(channel, &data));
     }
     self.require_session()?;
     let next = self.check(channel, self.side, &data)?;
-    if bytes.len() > MAX_PAYLOAD {
+    if bytes.len() > frame::MAX_PAYLOAD {
       return Err(Error::TooLarge(bytes.len()));
     }
 
-    out.reserve(encoded_len(bytes));
-    encode_frame(channel, kind::DATA, bytes, out);
+    out.reserve(frame::encoded_len(bytes));
+    frame::encode_frame(channel, message::kind::DATA, bytes, out);
     self.commit(channel, next);
     Ok(())
   }
@@ -319,16 +321,16 @@ impl Mux {
   /// A received Hello that is not itself an answer ends the session, and
   /// every channel is forgotten. Respond to it with [`Mux::hello`], which on
   /// the guest answers the host and on the host starts a new session.
-  pub fn receive(&mut self, frame: Frame) -> Result<(u32, Message), Error> {
+  pub fn receive(&mut self, frame: frame::Frame) -> Result<(u32, message::Message), Error> {
     let channel = frame.channel;
-    let message = Message::from_frame(frame).map_err(Error::Decode)?;
+    let message = message::Message::from_frame(frame).map_err(Error::Decode)?;
 
     if channel == CONTROL {
       match message {
-        Message::Hello { version, answer } => self.hear_hello(version, answer)?,
-        Message::Ping(_) | Message::Pong(_) => {}
-        Message::Received(_) if self.side == Side::Host => {}
-        Message::SetTime { .. } if self.side == Side::Guest => {}
+        message::Message::Hello { version, answer } => self.hear_hello(version, answer)?,
+        message::Message::Ping(_) | message::Message::Pong(_) => {}
+        message::Message::Received(_) if self.side == Side::Host => {}
+        message::Message::SetTime { .. } if self.side == Side::Guest => {}
         _ => return Err(not_allowed(channel, &message)),
       }
       return Ok((channel, message));
@@ -399,7 +401,7 @@ impl Mux {
 
   /// The state `channel` would have after `sender` sends `message` on it, if
   /// the channel allows that. Nothing changes until `commit`.
-  fn check(&self, channel: u32, sender: Side, message: &Message) -> Result<(Channel, Status), Error> {
+  fn check(&self, channel: u32, sender: Side, message: &message::Message) -> Result<(Channel, Status), Error> {
     let state = *self
       .channels
       .get(&channel)
@@ -424,15 +426,15 @@ impl Mux {
   }
 }
 
-fn not_allowed(channel: u32, message: &Message) -> Error {
+fn not_allowed(channel: u32, message: &message::Message) -> Error {
   Error::NotAllowed {
     channel,
     message: message.name(),
   }
 }
 
-fn sized(frame: Frame) -> Result<Frame, Error> {
-  if frame.payload.len() > MAX_PAYLOAD {
+fn sized(frame: frame::Frame) -> Result<frame::Frame, Error> {
+  if frame.payload.len() > frame::MAX_PAYLOAD {
     Err(Error::TooLarge(frame.payload.len()))
   } else {
     Ok(frame)
@@ -465,7 +467,8 @@ impl fmt::Display for Error {
       Self::NotAllowed { channel, message } => write!(formatter, "{message} is not allowed on channel {channel} now"),
       Self::TooLarge(length) => write!(
         formatter,
-        "a {length}-byte payload is over the {MAX_PAYLOAD}-byte limit"
+        "a {length}-byte payload is over the {}-byte limit",
+        frame::MAX_PAYLOAD
       ),
     }
   }
@@ -484,7 +487,6 @@ impl std::error::Error for Error {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::message::Exec;
 
   #[test]
   fn wraps_channel_numbers_around_past_control_and_open_channels() {
@@ -492,7 +494,12 @@ mod tests {
     let mut guest = Mux::new(Side::Guest);
     guest.receive(host.hello()).unwrap();
     host.receive(guest.hello()).unwrap();
-    let open = |mux: &mut Mux| mux.open(Message::Exec(Exec::default())).unwrap().0;
+    let open = |mux: &mut Mux| {
+      mux
+        .open(message::Message::Exec(message::Exec::default()))
+        .unwrap()
+        .0
+    };
 
     assert_eq!(open(&mut host), 2);
     host.next = u32::MAX - 1;

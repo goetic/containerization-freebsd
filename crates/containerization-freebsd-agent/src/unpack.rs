@@ -71,7 +71,7 @@ fn stage(input: impl Read + Send + 'static, compression: &str, staging: &Path) -
     }
   };
   let mut file = File::create(staging)?;
-  let mut hash = sys::Sha256::new();
+  let mut hash = sys::sha256::Sha256::new();
   let mut listing = Listing::default();
   let take = |chunk: &[u8]| {
     hash.update(chunk);
@@ -403,7 +403,7 @@ fn remove_tree(path: &Path) -> io::Result<()> {
 /// Clears the flags of `path` and, if it is a directory, of everything under
 /// it.
 fn clear_flags(path: &Path) -> io::Result<()> {
-  sys::clear_flags(path)?;
+  sys::file::clear_flags(path)?;
   if fs::symlink_metadata(path)?.is_dir() {
     for child in fs::read_dir(path)? {
       clear_flags(&child?.path())?;
@@ -539,7 +539,7 @@ mod tests {
     write(&source.path().join("dir/new"), "upper");
     write(&source.path().join("added"), "upper");
     let tar = archive(source.path(), "pax");
-    let mut hash = sys::Sha256::new();
+    let mut hash = sys::sha256::Sha256::new();
     hash.update(&tar);
     let diff_id: String = hash
       .finish()

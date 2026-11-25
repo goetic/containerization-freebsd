@@ -1,6 +1,5 @@
 //! Pseudo-terminals, raw mode and window sizes.
 
-use crate::{check, close_on_exec};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
@@ -26,11 +25,11 @@ pub fn make_raw(terminal: &impl AsFd) -> io::Result<()> {
   // SAFETY: tcgetattr fills the termios when it succeeds, and the termios is
   // read only after that.
   unsafe {
-    check(libc::tcgetattr(fd, termios.as_mut_ptr()))?;
+    crate::check(libc::tcgetattr(fd, termios.as_mut_ptr()))?;
     let mut termios = termios.assume_init();
     libc::cfmakeraw(&mut termios);
-    check(libc::cfsetspeed(&mut termios, libc::B115200))?;
-    check(libc::tcsetattr(fd, libc::TCSANOW, &termios))?;
+    crate::check(libc::cfsetspeed(&mut termios, libc::B115200))?;
+    crate::check(libc::tcsetattr(fd, libc::TCSANOW, &termios))?;
   }
   Ok(())
 }
@@ -43,7 +42,7 @@ pub fn open_terminal(size: WindowSize) -> io::Result<(File, OwnedFd)> {
 
   // SAFETY: openpty writes only the two descriptors and reads the winsize,
   // all of which outlive the call; the name and termios may be null.
-  check(unsafe {
+  crate::check(unsafe {
     libc::openpty(
       &mut controller,
       &mut child,
@@ -58,8 +57,8 @@ pub fn open_terminal(size: WindowSize) -> io::Result<(File, OwnedFd)> {
   // openpty leaves both inheritable. Every process spawned later would inherit
   // them, and the controller would not see the child end close until those
   // processes exit too.
-  close_on_exec(controller.as_fd())?;
-  close_on_exec(child.as_fd())?;
+  crate::close_on_exec(controller.as_fd())?;
+  crate::close_on_exec(child.as_fd())?;
   Ok((File::from(controller), child))
 }
 
@@ -70,8 +69,8 @@ pub fn take_terminal_on_exec(command: &mut Command) {
   // which are async-signal-safe, and allocates nothing.
   unsafe {
     command.pre_exec(|| {
-      check(libc::setsid())?;
-      check(libc::ioctl(0, libc::TIOCSCTTY as _, 0))?;
+      crate::check(libc::setsid())?;
+      crate::check(libc::ioctl(0, libc::TIOCSCTTY as _, 0))?;
       Ok(())
     });
   }
@@ -81,7 +80,7 @@ pub fn resize(terminal: &File, size: WindowSize) -> io::Result<()> {
   let size = window(size);
 
   // SAFETY: TIOCSWINSZ reads a winsize, which outlives the call.
-  check(unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ as _, &raw const size) })?;
+  crate::check(unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ as _, &raw const size) })?;
   Ok(())
 }
 

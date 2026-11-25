@@ -162,6 +162,7 @@ name = "containerization-freebsd-test"
 version = "0.1.0"
 dependencies = [
  "containerization-freebsd",
+ "containerization-freebsd-protocol",
  "serde_json",
 ]
 

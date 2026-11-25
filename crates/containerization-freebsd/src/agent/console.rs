@@ -2,10 +2,9 @@
 //! window as the agent reports what it has read, and the thread that writes
 //! to the console as the window allows.
 
-use super::AGENT_TIMEOUT;
-use super::session::Event;
-use crate::error::{Error, Result};
-use containerization_freebsd_protocol::{CONTROL, Decoder, Frame, Message, Skipped, WINDOW};
+use super::session;
+use crate::error;
+use containerization_freebsd_protocol::{frame, message, mux};
 use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -28,45 +27,45 @@ struct Window {
 impl Credit {
   /// Waits until the window has room, then reserves and returns up to
   /// `wanted` bytes of it.
-  pub(super) fn take(&self, wanted: usize) -> Result<usize> {
+  pub(super) fn take(&self, wanted: usize) -> error::Result<usize> {
     let window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
     let mut window = self
       .changed
-      .wait_timeout_while(window, AGENT_TIMEOUT, |window| {
-        !window.closed && window.unreceived >= WINDOW
+      .wait_timeout_while(window, super::AGENT_TIMEOUT, |window| {
+        !window.closed && window.unreceived >= mux::WINDOW
       })
       .unwrap_or_else(PoisonError::into_inner)
       .0;
 
     if window.closed {
-      return Err(Error::Guest("the console closed".to_string()));
+      return Err(error::Error::Guest("the console closed".to_string()));
     }
-    if window.unreceived >= WINDOW {
-      return Err(Error::Timeout(format!(
+    if window.unreceived >= mux::WINDOW {
+      return Err(error::Error::Timeout(format!(
         "the guest agent read none of the console's last {} bytes within {}s",
         window.unreceived,
-        AGENT_TIMEOUT.as_secs()
+        super::AGENT_TIMEOUT.as_secs()
       )));
     }
-    let room = (WINDOW - window.unreceived).min(wanted);
+    let room = (mux::WINDOW - window.unreceived).min(wanted);
     window.unreceived += room;
     Ok(room)
   }
 
   /// Updates the window from a frame the agent sent.
-  fn hear(&self, frame: &Frame) {
-    if frame.channel != CONTROL {
+  fn hear(&self, frame: &frame::Frame) {
+    if frame.channel != mux::CONTROL {
       return;
     }
     let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
 
-    match Message::peek(frame) {
-      Ok(Message::Received(bytes)) => {
+    match message::Message::peek(frame) {
+      Ok(message::Message::Received(bytes)) => {
         window.unreceived = window.unreceived.saturating_sub(bytes as usize);
       }
       // The agent is new or starting over. Bytes the old agent never read
       // are lost, or the agent has already read past them.
-      Ok(Message::Hello { .. }) => window.unreceived = 0,
+      Ok(message::Message::Hello { .. }) => window.unreceived = 0,
       _ => return,
     }
     self.changed.notify_all();
@@ -86,7 +85,7 @@ impl Credit {
 /// it went.
 pub(super) struct Outgoing {
   pub(super) bytes: Vec<u8>,
-  pub(super) done: SyncSender<Result<()>>,
+  pub(super) done: SyncSender<error::Result<()>>,
 }
 
 /// Writes each frame from `queue` to the console in order, in slices as the
@@ -97,14 +96,14 @@ pub(super) fn write(queue: &Receiver<Outgoing>, mut input: PipeWriter, credit: &
   }
 }
 
-fn write_frame(input: &mut PipeWriter, credit: &Credit, bytes: &[u8]) -> Result<()> {
+fn write_frame(input: &mut PipeWriter, credit: &Credit, bytes: &[u8]) -> error::Result<()> {
   let mut rest = bytes;
 
   while !rest.is_empty() {
     let (now, later) = rest.split_at(credit.take(rest.len())?);
     input
       .write_all(now)
-      .map_err(Error::io("writing to the guest agent"))?;
+      .map_err(error::Error::io("writing to the guest agent"))?;
     rest = later;
   }
   Ok(())
@@ -115,13 +114,18 @@ fn write_frame(input: &mut PipeWriter, credit: &Credit, bytes: &[u8]) -> Result<
 /// handler thread, reopens the window however busy that thread is. The raw
 /// bytes are passed only while `session` is false, since the handler shows
 /// console text only before a session starts.
-pub(super) fn read(mut output: PipeReader, credit: &Credit, session: &AtomicBool, events: &mpsc::Sender<Event>) {
-  let mut decoder = Decoder::new();
+pub(super) fn read(
+  mut output: PipeReader,
+  credit: &Credit,
+  session: &AtomicBool,
+  events: &mpsc::Sender<session::Event>,
+) {
+  let mut decoder = frame::Decoder::new();
   let mut buffer = vec![0; 64 << 10];
 
   while let Ok(read @ 1..) = output.read(&mut buffer) {
     if !session.load(Ordering::Relaxed) {
-      let _ = events.send(Event::Read(buffer[..read].to_vec()));
+      let _ = events.send(session::Event::Read(buffer[..read].to_vec()));
     }
     decoder.push(&buffer[..read]);
 
@@ -129,9 +133,9 @@ pub(super) fn read(mut output: PipeReader, credit: &Credit, session: &AtomicBool
       let event = match decoded {
         Ok(frame) => {
           credit.hear(&frame);
-          Event::Frame(frame)
+          session::Event::Frame(frame)
         }
-        Err(Skipped(_)) => Event::Skipped,
+        Err(frame::Skipped(_)) => session::Event::Skipped,
       };
       let _ = events.send(event);
     }

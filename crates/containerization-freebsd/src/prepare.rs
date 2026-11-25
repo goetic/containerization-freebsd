@@ -1,11 +1,8 @@
 //! A guest's first boot from FreeBSD's VM image, producing the base disk that
 //! later machines clone or restore.
 
-use crate::Machine;
-use crate::agent::FileType;
-use crate::error::{Error, Result};
-use crate::fat::Volume;
-use crate::machine::Layout;
+use crate::{error, fat, machine};
+use containerization_freebsd_protocol::{message, mux};
 use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -46,8 +43,14 @@ pub enum Upgrade {
 /// boots it once with a seed that installs `bundle` (the agent and the
 /// patched virtiofs modules), waits for the first boot to finish, and powers
 /// off. The returned layout boots the prepared disk without seed or NAT.
-pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundle: &Path) -> Result<Layout> {
-  std::fs::create_dir_all(directory).map_err(Error::io(format!("making {}", directory.display())))?;
+pub fn prepare(
+  base: &Path,
+  directory: &Path,
+  size: u64,
+  upgrade: Upgrade,
+  bundle: &Path,
+) -> error::Result<machine::Layout> {
+  std::fs::create_dir_all(directory).map_err(error::Error::io(format!("making {}", directory.display())))?;
 
   let disk = directory.join("disk.raw");
   clone(base, &disk, size)?;
@@ -56,7 +59,7 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
   let seed = directory.join("seed.img");
   write_seed(&seed, bundle)?;
 
-  let mut layout = Layout::first(directory, disk)?;
+  let mut layout = machine::Layout::first(directory, disk)?;
   layout.nat = upgrade == Upgrade::Latest;
   layout.seed = Some(seed.clone());
 
@@ -80,28 +83,28 @@ pub fn prepare(base: &Path, directory: &Path, size: u64, upgrade: Upgrade, bundl
 /// can succeed just before that reboot (see `power_off`). Or the reboot
 /// takes the agent down before it answers, and the wait succeeds on the next
 /// boot.
-fn wait_first_boot(machine: &Machine) -> Result<()> {
+fn wait_first_boot(machine: &machine::Machine) -> error::Result<()> {
   let deadline = Instant::now() + FIRST_BOOT;
 
   loop {
     machine.wait_ready(deadline.saturating_duration_since(Instant::now()))?;
     match machine.agent.file_type("/firstboot") {
-      Ok(FileType::Missing) => return Ok(()),
+      Ok(message::FileType::Missing) => return Ok(()),
       Ok(_) => {}
       // The upgrade's reboot ended the session, or the agent went down
       // before the next boot's agent could end it.
       Err(
-        Error::SessionEnded(_)
-        | Error::Timeout(_)
-        | Error::Protocol {
-          error: containerization_freebsd_protocol::Error::NoSession,
+        error::Error::SessionEnded(_)
+        | error::Error::Timeout(_)
+        | error::Error::Protocol {
+          error: mux::Error::NoSession,
           ..
         },
       ) => {}
       Err(error) => return Err(error),
     }
     if Instant::now() >= deadline {
-      return Err(Error::Timeout(format!(
+      return Err(error::Error::Timeout(format!(
         "the first boot did not finish within {}s",
         FIRST_BOOT.as_secs()
       )));
@@ -116,7 +119,7 @@ fn wait_first_boot(machine: &Machine) -> Result<()> {
 /// `shutdown -p` reaches init first, or while init is going down, the guest
 /// powers off. If the agent or `shutdown` is killed first, the guest reboots
 /// and a new session starts.
-fn power_off(machine: &Machine) -> Result<()> {
+fn power_off(machine: &machine::Machine) -> error::Result<()> {
   for _ in 0..BOOTS {
     let sessions = machine.agent.sessions();
     // The reboot may already have ended the agent. A new session or the
@@ -129,7 +132,7 @@ fn power_off(machine: &Machine) -> Result<()> {
         return Ok(());
       }
       if started.elapsed() >= POWER_OFF {
-        return Err(Error::Timeout(format!(
+        return Err(error::Error::Timeout(format!(
           "the guest neither powered off nor booted again within {}s",
           POWER_OFF.as_secs()
         )));
@@ -137,23 +140,26 @@ fn power_off(machine: &Machine) -> Result<()> {
       std::thread::sleep(Duration::from_millis(100));
     }
   }
-  Err(Error::Guest(format!(
+  Err(error::Error::Guest(format!(
     "the guest did not power off within {BOOTS} boots"
   )))
 }
 
 /// Writes the NoCloud seed `image`: a FAT volume labelled `SEED_LABEL` that
 /// holds the meta-data, the user-data, and `bundle`.
-fn write_seed(image: &Path, bundle: &Path) -> Result<()> {
+fn write_seed(image: &Path, bundle: &Path) -> error::Result<()> {
   let instance = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |since| since.as_secs());
   let meta_data = format!("instance-id: freebsd-{instance}\nlocal-hostname: freebsd\n");
   let reading = || format!("reading {}", bundle.display());
-  let mut bundle = File::open(bundle).map_err(Error::io(reading()))?;
-  let bundle_size = bundle.metadata().map_err(Error::io(reading()))?.len();
+  let mut bundle = File::open(bundle).map_err(error::Error::io(reading()))?;
+  let bundle_size = bundle
+    .metadata()
+    .map_err(error::Error::io(reading()))?
+    .len();
 
-  let seed = Volume::create(
+  let seed = fat::Volume::create(
     image,
     SEED_LABEL,
     (meta_data.len() + USER_DATA.len()) as u64 + bundle_size,
@@ -167,11 +173,11 @@ fn write_seed(image: &Path, bundle: &Path) -> Result<()> {
 /// Makes `destination` a copy of `base`, grown to at least `size` bytes for
 /// the guest to expand into. On APFS, `std::fs::copy` makes the copy a clone
 /// with fclonefileat(2), which shares `base`'s blocks until either changes.
-fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
+fn clone(base: &Path, destination: &Path, size: u64) -> error::Result<()> {
   // fclonefileat refuses a destination that exists, and std::fs::copy would
   // then copy every byte.
   let _ = std::fs::remove_file(destination);
-  std::fs::copy(base, destination).map_err(Error::io(format!(
+  std::fs::copy(base, destination).map_err(error::Error::io(format!(
     "copying {} to {}",
     base.display(),
     destination.display()
@@ -181,9 +187,9 @@ fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
   let file = File::options()
     .write(true)
     .open(destination)
-    .map_err(Error::io(growing()))?;
-  if file.metadata().map_err(Error::io(growing()))?.len() < size {
-    file.set_len(size).map_err(Error::io(growing()))?;
+    .map_err(error::Error::io(growing()))?;
+  if file.metadata().map_err(error::Error::io(growing()))?.len() < size {
+    file.set_len(size).map_err(error::Error::io(growing()))?;
   }
 
   Ok(())
@@ -192,8 +198,8 @@ fn clone(base: &Path, destination: &Path, size: u64) -> Result<()> {
 /// Writes `LOADER_ENV` to `/efi/freebsd/loader.env` on the disk's EFI system
 /// partition. loader.efi(8) sets these variables before reading
 /// `loader.conf` and passes them to the kernel as tunables.
-fn write_loader_env(disk: &Path) -> Result<()> {
-  let esp = Volume::esp(disk)?;
+fn write_loader_env(disk: &Path) -> error::Result<()> {
+  let esp = fat::Volume::esp(disk)?;
 
   esp.write("efi/freebsd/loader.env", &mut LOADER_ENV.as_bytes())?;
   esp.finish()

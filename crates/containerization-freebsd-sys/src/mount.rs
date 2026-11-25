@@ -20,20 +20,19 @@ pub struct Mounted {
 /// `size=64m`.
 #[cfg(target_os = "freebsd")]
 pub fn mount(kind: &str, source: &str, point: &Path, options: &[String]) -> io::Result<()> {
-  use crate::{c_string, iovec};
   use std::ffi::{CStr, CString};
 
   let mut pairs: Vec<(CString, Option<CString>)> = vec![
-    (c"fstype".into(), Some(c_string(kind)?)),
-    (c"fspath".into(), Some(c_string(point)?)),
-    (c"from".into(), Some(c_string(source)?)),
+    (c"fstype".into(), Some(crate::c_string(kind)?)),
+    (c"fspath".into(), Some(crate::c_string(point)?)),
+    (c"from".into(), Some(crate::c_string(source)?)),
   ];
   for option in options {
     let (name, value) = match option.split_once('=') {
       Some((name, value)) => (name, Some(value)),
       None => (option.as_str(), None),
     };
-    pairs.push((c_string(name)?, value.map(c_string).transpose()?));
+    pairs.push((crate::c_string(name)?, value.map(crate::c_string).transpose()?));
   }
   // Where the kernel explains a failure, if it does.
   let mut message = [0u8; 256];
@@ -41,15 +40,15 @@ pub fn mount(kind: &str, source: &str, point: &Path, options: &[String]) -> io::
     .iter()
     .flat_map(|(name, value)| {
       [
-        iovec(name.to_bytes_with_nul()),
+        crate::iovec(name.to_bytes_with_nul()),
         value
           .as_deref()
-          .map_or(iovec(&[]), |value| iovec(value.to_bytes_with_nul())),
+          .map_or(crate::iovec(&[]), |value| crate::iovec(value.to_bytes_with_nul())),
       ]
     })
     .collect();
   parameters.extend([
-    iovec(c"errmsg".to_bytes_with_nul()),
+    crate::iovec(c"errmsg".to_bytes_with_nul()),
     libc::iovec {
       iov_base: message.as_mut_ptr().cast(),
       iov_len: message.len(),

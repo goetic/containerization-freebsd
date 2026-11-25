@@ -4,13 +4,10 @@
 //! container, these share one machine; for a VM each, create a machine per
 //! container.
 
-use crate::Statistics;
-use crate::agent::{Agent, Exec, Process, QUICK, Relay, Spawn};
-use crate::copy::Parents;
-use crate::error::{Error, Result};
-use crate::jail::{self, Jail, Mount, Network};
-use crate::socket::{SocketRelay, UnixSocket};
-use crate::zfs::Zfs;
+use crate::agent::{self, Spawn};
+use crate::jail::{self, mount, network};
+use crate::{copy, error, socket, zfs};
+use containerization_freebsd_protocol::message;
 use std::mem;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
@@ -21,21 +18,21 @@ pub struct Configuration {
   /// The main process, started by `Container::start`. Its working directory
   /// is a path in the container, and its user a name from the container's
   /// `/etc/passwd`, or a uid.
-  pub process: Exec,
+  pub process: message::Exec,
   /// Defaults to the container's id.
   pub hostname: Option<String>,
-  pub network: Network,
+  pub network: network::Network,
   /// Without one, a networked container gets the guest's resolv.conf unless
   /// its root has its own.
   pub dns: Option<Dns>,
   /// Lines appended to the root's `/etc/hosts`.
   pub hosts: Vec<Host>,
-  /// Extra jail(8) parameters, in `Jail::start`'s form. `mount.devfs` is
+  /// Extra jail(8) parameters, in `jail::Jail::start`'s form. `mount.devfs` is
   /// always set.
   pub parameters: Vec<String>,
   /// Mounted in this order, before resolv.conf and hosts are written, and
   /// kept until the container stops.
-  pub mounts: Vec<Mount>,
+  pub mounts: Vec<mount::Mount>,
   /// An rctl `pcpu` limit, in CPUs, on all the container's processes
   /// together; like the `cpus` that sizes a Containerization container's VM.
   /// `None`: unlimited.
@@ -45,7 +42,7 @@ pub struct Configuration {
   pub memory_in_bytes: Option<u64>,
   /// Relayed between the host and paths in the container from `start` until
   /// the container stops.
-  pub sockets: Vec<UnixSocket>,
+  pub sockets: Vec<socket::UnixSocket>,
 }
 
 /// A container's `/etc/resolv.conf`.
@@ -69,13 +66,13 @@ pub struct Host {
 /// Dropping the container kills that process but leaves the jail and clone;
 /// remove them with `delete`, or later with `Containers::delete`.
 pub struct Container<'a> {
-  agent: &'a Agent,
-  jail: Jail<'a>,
+  agent: &'a agent::Agent,
+  jail: jail::Jail<'a>,
   dataset: String,
-  process: Exec,
-  sockets: Vec<UnixSocket>,
-  main: Option<Process>,
-  relays: Mutex<Vec<SocketRelay>>,
+  process: message::Exec,
+  sockets: Vec<socket::UnixSocket>,
+  main: Option<agent::channel::Process>,
+  relays: Mutex<Vec<socket::SocketRelay>>,
 }
 
 impl<'a> Container<'a> {
@@ -83,9 +80,15 @@ impl<'a> Container<'a> {
   /// on it. Ids are unique in the guest: ASCII letters, digits, `-` and `_`,
   /// starting with a letter or digit, and not all digits, which jail(8) would
   /// take as a jid.
-  pub fn create(agent: &'a Agent, id: &str, from: &str, dataset: &str, configuration: Configuration) -> Result<Self> {
+  pub fn create(
+    agent: &'a agent::Agent,
+    id: &str,
+    from: &str,
+    dataset: &str,
+    configuration: Configuration,
+  ) -> error::Result<Self> {
     check_id(id)?;
-    let zfs = Zfs::new(agent);
+    let zfs = zfs::Zfs::new(agent);
     zfs.clone(from, dataset)?;
 
     match set_up(agent, id, dataset, &configuration) {
@@ -115,15 +118,18 @@ impl<'a> Container<'a> {
 
   /// Relays the container's sockets and starts its main process. Fails if
   /// the container has already started.
-  pub fn start(&mut self) -> Result<()> {
+  pub fn start(&mut self) -> error::Result<()> {
     if self.main.is_some() {
-      return Err(Error::Invalid(format!("container {} has started already", self.id())));
+      return Err(error::Error::Invalid(format!(
+        "container {} has started already",
+        self.id()
+      )));
     }
     let relays = self
       .sockets
       .iter()
       .map(|socket| self.jail.relay_socket(socket))
-      .collect::<Result<_>>()?;
+      .collect::<error::Result<_>>()?;
     *self
       .relays
       .get_mut()
@@ -132,97 +138,97 @@ impl<'a> Container<'a> {
     Ok(())
   }
 
-  pub fn main_process(&self) -> Option<&Process> {
+  pub fn main_process(&self) -> Option<&agent::channel::Process> {
     self.main.as_ref()
   }
 
   /// Starts another process in the container. This is `spawn` under the name
   /// Containerization gives it.
-  pub fn exec(&self, exec: Exec) -> Result<Process> {
+  pub fn exec(&self, exec: message::Exec) -> error::Result<agent::channel::Process> {
     self.spawn(exec)
   }
 
-  /// Like `Jail::connect`, in the container.
-  pub fn connect(&self, port: u16) -> Result<Relay> {
+  /// Like `jail::Jail::connect`, in the container.
+  pub fn connect(&self, port: u16) -> error::Result<agent::channel::Relay> {
     self.jail.connect(port)
   }
 
-  /// Like `Jail::connect_unix`, in the container.
-  pub fn connect_unix(&self, path: &str) -> Result<Relay> {
+  /// Like `jail::Jail::connect_unix`, in the container.
+  pub fn connect_unix(&self, path: &str) -> error::Result<agent::channel::Relay> {
     self.jail.connect_unix(path)
   }
 
-  /// Like `Jail::copy_in`, into the container.
-  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, parents: Parents) -> Result<()> {
+  /// Like `jail::Jail::copy_in`, into the container.
+  pub fn copy_in(&self, source: &Path, destination: &str, mode: u32, parents: copy::Parents) -> error::Result<()> {
     self.jail.copy_in(source, destination, mode, parents)
   }
 
-  /// Like `Jail::copy_out`, out of the container.
-  pub fn copy_out(&self, source: &str, destination: &Path, parents: Parents) -> Result<()> {
+  /// Like `jail::Jail::copy_out`, out of the container.
+  pub fn copy_out(&self, source: &str, destination: &Path, parents: copy::Parents) -> error::Result<()> {
     self.jail.copy_out(source, destination, parents)
   }
 
-  /// `Jail::statistics`, plus the ZFS I/O counters of the container's
+  /// `jail::Jail::statistics`, plus the ZFS I/O counters of the container's
   /// dataset.
-  pub fn statistics(&self) -> Result<Statistics> {
+  pub fn statistics(&self) -> error::Result<message::Statistics> {
     self.jail.statistics_with(Some(&self.dataset))
   }
 
   /// Closes the socket relays and stops the jail: its processes get SIGTERM
   /// and 10 seconds to exit before they are killed. The main process's last
   /// output and exit stay readable. Stopping a stopped container is a no-op.
-  pub fn stop(&self) -> Result<()> {
+  pub fn stop(&self) -> error::Result<()> {
     self.close_relays()?;
     stop(self.agent, self.id())
   }
 
   /// Stops the container and destroys its clone.
-  pub fn delete(self) -> Result<()> {
+  pub fn delete(self) -> error::Result<()> {
     self.close_relays()?;
     delete(self.agent, self.id(), &self.dataset)
   }
 
-  fn close_relays(&self) -> Result<()> {
+  fn close_relays(&self) -> error::Result<()> {
     let relays = mem::take(&mut *self.relays.lock().unwrap_or_else(PoisonError::into_inner));
 
-    relays.into_iter().try_for_each(SocketRelay::close)
+    relays.into_iter().try_for_each(socket::SocketRelay::close)
   }
 }
 
 impl Spawn for Container<'_> {
-  /// Starts a process in the container, like `Jail::spawn`.
-  fn spawn(&self, exec: Exec) -> Result<Process> {
+  /// Starts a process in the container, like `jail::Jail::spawn`.
+  fn spawn(&self, exec: message::Exec) -> error::Result<agent::channel::Process> {
     self.jail.spawn(exec)
   }
 }
 
 /// The containers of one machine, each cloned as `<store>/<id>`.
 pub struct Containers<'a> {
-  agent: &'a Agent,
-  zfs: Zfs<'a>,
+  agent: &'a agent::Agent,
+  zfs: zfs::Zfs<'a>,
   store: String,
 }
 
 impl<'a> Containers<'a> {
   /// Manages containers under the dataset `store`, such as
   /// `images/containers`. `create` creates the store, mounted, if missing.
-  pub fn new(agent: &'a Agent, store: &str) -> Self {
+  pub fn new(agent: &'a agent::Agent, store: &str) -> Self {
     Self {
       agent,
-      zfs: Zfs::new(agent),
+      zfs: zfs::Zfs::new(agent),
       store: store.to_string(),
     }
   }
 
   /// Creates container `id` on a clone of the snapshot `from`, as
   /// `Container::create` does.
-  pub fn create(&self, id: &str, from: &str, configuration: Configuration) -> Result<Container<'a>> {
+  pub fn create(&self, id: &str, from: &str, configuration: Configuration) -> error::Result<Container<'a>> {
     self.zfs.create_mounted(&self.store)?;
     Container::create(self.agent, id, from, &self.dataset(id), configuration)
   }
 
   /// Lists the ids of the store's containers, running or not.
-  pub fn list(&self) -> Result<Vec<String>> {
+  pub fn list(&self) -> error::Result<Vec<String>> {
     if !self.zfs.exists(&self.store)? {
       return Ok(Vec::new());
     }
@@ -241,7 +247,7 @@ impl<'a> Containers<'a> {
   /// Deletes container `id`, stopping its jail if running. For when the
   /// `Container` value is gone, such as after its owner exited without
   /// deleting it.
-  pub fn delete(&self, id: &str) -> Result<()> {
+  pub fn delete(&self, id: &str) -> error::Result<()> {
     check_id(id)?;
     delete(self.agent, id, &self.dataset(id))
   }
@@ -279,7 +285,7 @@ fn hosts(hosts: &[Host]) -> String {
     .collect()
 }
 
-fn check_id(id: &str) -> Result<()> {
+fn check_id(id: &str) -> error::Result<()> {
   let allowed = |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '_';
   let valid = id.starts_with(|character: char| character.is_ascii_alphanumeric())
     && id.chars().all(allowed)
@@ -288,18 +294,23 @@ fn check_id(id: &str) -> Result<()> {
   if valid {
     Ok(())
   } else {
-    Err(Error::Invalid(format!("{id:?} can't name a container")))
+    Err(error::Error::Invalid(format!("{id:?} can't name a container")))
   }
 }
 
 /// Starts the jail for container `id` on `dataset`, applies its limits and
 /// mounts, and writes its files.
-fn set_up<'a>(agent: &'a Agent, id: &str, dataset: &str, configuration: &Configuration) -> Result<Jail<'a>> {
-  let root = Zfs::new(agent).mountpoint(dataset)?;
+fn set_up<'a>(
+  agent: &'a agent::Agent,
+  id: &str,
+  dataset: &str,
+  configuration: &Configuration,
+) -> error::Result<jail::Jail<'a>> {
+  let root = zfs::Zfs::new(agent).mountpoint(dataset)?;
   let hostname = format!("host.hostname={}", configuration.hostname.as_deref().unwrap_or(id));
   let mut parameters = vec!["mount.devfs", hostname.as_str()];
   parameters.extend(configuration.parameters.iter().map(String::as_str));
-  let jail = Jail::start(agent, id, &root, &configuration.network, &parameters)?;
+  let jail = jail::Jail::start(agent, id, &root, &configuration.network, &parameters)?;
   // Set limits even when there are none, to lift rctl rules an earlier jail
   // of the same name left.
   let furnished = jail
@@ -321,7 +332,7 @@ fn set_up<'a>(agent: &'a Agent, id: &str, dataset: &str, configuration: &Configu
   }
 }
 
-fn write_files(jail: &Jail, configuration: &Configuration) -> Result<()> {
+fn write_files(jail: &jail::Jail, configuration: &Configuration) -> error::Result<()> {
   if let Some(dns) = &configuration.dns {
     write(jail, "/etc/resolv.conf", &dns.resolv_conf(), false)?;
   }
@@ -333,29 +344,29 @@ fn write_files(jail: &Jail, configuration: &Configuration) -> Result<()> {
 
 /// Writes or appends `text` to `path` from inside the jail, so symlinks in
 /// the jail's root resolve within it.
-fn write(jail: &Jail, path: &str, text: &str, append: bool) -> Result<()> {
+fn write(jail: &jail::Jail, path: &str, text: &str, append: bool) -> error::Result<()> {
   let script = if append { r#"cat >> "$0""# } else { r#"cat > "$0""# };
-  let process = jail.spawn(Exec::new(["/bin/sh", "-c", script, path]))?;
+  let process = jail.spawn(message::Exec::new(["/bin/sh", "-c", script, path]))?;
   process.write(text.as_bytes())?;
   process.close_input()?;
   process.finish(
     &format!("writing {path} in jail {}", jail.name()),
-    Some(QUICK),
+    Some(agent::QUICK),
     &mut std::io::sink(),
   )
 }
 
-fn stop(agent: &Agent, id: &str) -> Result<()> {
-  match Jail::find(agent, id)? {
+fn stop(agent: &agent::Agent, id: &str) -> error::Result<()> {
+  match jail::Jail::find(agent, id)? {
     Some(jail) => jail.stop(),
     None => Ok(()),
   }
 }
 
-fn delete(agent: &Agent, id: &str, dataset: &str) -> Result<()> {
-  let zfs = Zfs::new(agent);
+fn delete(agent: &agent::Agent, id: &str, dataset: &str) -> error::Result<()> {
+  let zfs = zfs::Zfs::new(agent);
 
-  match Jail::find(agent, id)? {
+  match jail::Jail::find(agent, id)? {
     Some(jail) => jail.stop()?,
     // The jail may be gone while its rctl rules and mounts remain: removed
     // outside this crate, or a stop failed while it was dying.

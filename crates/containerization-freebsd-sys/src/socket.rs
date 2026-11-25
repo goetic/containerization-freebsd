@@ -1,9 +1,7 @@
 //! Sockets opened from a child process attached to a jail, so that paths and
 //! loopback are the jail's, and passed back over SCM_RIGHTS.
 
-use crate::jail::{JailId, attach};
-use crate::process::reap_errno;
-use crate::{c_string, check, close_on_exec, errno, retry};
+use crate::{jail, process};
 use std::ffi::CStr;
 use std::io;
 use std::mem::{self, MaybeUninit};
@@ -41,7 +39,7 @@ impl SocketAddress {
   /// The Unix socket at `path`.
   pub fn unix(path: impl AsRef<Path>) -> io::Result<Self> {
     let path = path.as_ref();
-    let bytes = c_string(path)?.into_bytes();
+    let bytes = crate::c_string(path)?.into_bytes();
     // SAFETY: all zeros is a valid, unnamed Unix socket address; the path is
     // filled in below.
     let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
@@ -91,7 +89,7 @@ impl SocketAddress {
 
 /// Connects to the first of `addresses` that accepts, from a child process
 /// attached to `jail`, so paths and loopback are the jail's.
-pub fn connect_in(jail: JailId, addresses: &[SocketAddress]) -> io::Result<OwnedFd> {
+pub fn connect_in(jail: jail::JailId, addresses: &[SocketAddress]) -> io::Result<OwnedFd> {
   // SAFETY: the closure makes only async-signal-safe system calls on data it
   // borrows, and allocates nothing.
   let connected = unsafe {
@@ -100,12 +98,12 @@ pub fn connect_in(jail: JailId, addresses: &[SocketAddress]) -> io::Result<Owned
       for address in addresses {
         let socket = libc::socket(address.family(), libc::SOCK_STREAM, 0);
         if socket == -1 {
-          return Err(errno());
+          return Err(crate::errno());
         }
         if libc::connect(socket, address.as_ptr(), address.length) == 0 {
           return Ok(Some(socket));
         }
-        error = errno();
+        error = crate::errno();
         libc::close(socket);
       }
       Err(error)
@@ -119,9 +117,9 @@ pub fn connect_in(jail: JailId, addresses: &[SocketAddress]) -> io::Result<Owned
 /// replaced. If `mode` is given, the socket file gets those permissions.
 // mode_t is u16 on FreeBSD and macOS, but u32 on Linux.
 #[allow(clippy::unnecessary_cast)]
-pub fn listen_in(jail: JailId, path: impl AsRef<Path>, mode: Option<u16>) -> io::Result<OwnedFd> {
+pub fn listen_in(jail: jail::JailId, path: impl AsRef<Path>, mode: Option<u16>) -> io::Result<OwnedFd> {
   let address = SocketAddress::unix(&path)?;
-  let path = c_string(path.as_ref())?;
+  let path = crate::c_string(path.as_ref())?;
   // bind(2) creates the socket file as 0777 & ~umask.
   let mask = mode.map(|mode| !mode & 0o777);
 
@@ -137,7 +135,7 @@ pub fn listen_in(jail: JailId, path: impl AsRef<Path>, mode: Option<u16>) -> io:
         || libc::bind(socket, address.as_ptr(), address.length) == -1
         || libc::listen(socket, libc::SOMAXCONN) == -1
       {
-        return Err(errno());
+        return Err(crate::errno());
       }
       Ok(Some(socket))
     })
@@ -147,8 +145,8 @@ pub fn listen_in(jail: JailId, path: impl AsRef<Path>, mode: Option<u16>) -> io:
 
 /// Removes the socket at `path`, if there is one, from a child process
 /// attached to `jail`.
-pub fn remove_socket_in(jail: JailId, path: impl AsRef<Path>) -> io::Result<()> {
-  let path = c_string(path.as_ref())?;
+pub fn remove_socket_in(jail: jail::JailId, path: impl AsRef<Path>) -> io::Result<()> {
+  let path = crate::c_string(path.as_ref())?;
 
   // SAFETY: as in `connect_in`.
   unsafe { in_jail(jail, || unlink_socket(&path).map(|()| None)) }?;
@@ -172,7 +170,7 @@ pub fn wait_for_connection(listener: BorrowedFd, stop: BorrowedFd) -> io::Result
   });
 
   // SAFETY: poll writes only the revents of the descriptors it is given.
-  retry(|| unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as libc::nfds_t, -1) })?;
+  crate::retry(|| unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as libc::nfds_t, -1) })?;
   Ok(if descriptors[1].revents == 0 {
     Ready::Connection
   } else {
@@ -189,13 +187,13 @@ fn unlink_socket(path: &CStr) -> Result<(), libc::c_int> {
   // after that.
   unsafe {
     if libc::lstat(path.as_ptr(), status.as_mut_ptr()) == -1 {
-      return match errno() {
+      return match crate::errno() {
         libc::ENOENT => Ok(()),
         error => Err(error),
       };
     }
     if status.assume_init().st_mode & libc::S_IFMT == libc::S_IFSOCK && libc::unlink(path.as_ptr()) == -1 {
-      return Err(errno());
+      return Err(crate::errno());
     }
   }
   Ok(())
@@ -215,16 +213,16 @@ fn unlink_socket(path: &CStr) -> Result<(), libc::c_int> {
 /// The child is a fork of a multithreaded process, so `act` must make only
 /// async-signal-safe calls and allocate nothing.
 pub(crate) unsafe fn in_jail(
-  jail: JailId,
+  jail: jail::JailId,
   act: impl FnOnce() -> Result<Option<libc::c_int>, libc::c_int>,
 ) -> io::Result<Option<OwnedFd>> {
   let (ours, theirs) = UnixStream::pair()?;
 
   // SAFETY: the child only attaches, runs `act`, sends the result and exits,
   // which the caller's guarantee about `act` makes safe after fork.
-  let pid = check(unsafe { libc::fork() })?;
+  let pid = crate::check(unsafe { libc::fork() })?;
   if pid == 0 {
-    let done = attach(jail)
+    let done = jail::attach(jail)
       .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
       .and_then(|()| act())
       .and_then(|fd| {
@@ -251,7 +249,7 @@ pub(crate) unsafe fn in_jail(
 
   let received = receive_fd(&ours);
   drop(ours);
-  reap_errno(pid)?;
+  process::reap_errno(pid)?;
   received
 }
 
@@ -295,7 +293,7 @@ fn send_fd(socket: libc::c_int, fd: libc::c_int) -> Result<(), libc::c_int> {
     (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as libc::c_uint) as _;
     ptr::write_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>(), fd);
     if libc::sendmsg(socket, &message, 0) == -1 {
-      return Err(errno());
+      return Err(crate::errno());
     }
   }
   Ok(())
@@ -330,6 +328,6 @@ fn receive_fd(socket: &UnixStream) -> io::Result<Option<OwnedFd>> {
     OwnedFd::from_raw_fd(ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>()))
   };
 
-  close_on_exec(fd.as_fd())?;
+  crate::close_on_exec(fd.as_fd())?;
   Ok(Some(fd))
 }

@@ -6,20 +6,22 @@
 //! - [`message`] encodes and decodes the messages that frames carry.
 //! - [`mux`] tracks one side's view of a session's channels and checks who may
 //!   send what.
+//! - [`codec`] holds the error for a payload that doesn't decode.
 //!
 //! This crate does no I/O. Each side pushes the bytes it reads into a
-//! [`Decoder`], passes the decoded frames to [`Mux::receive`], and writes the
-//! frames that [`Mux::open`] and [`Mux::send`] return.
+//! [`frame::Decoder`], passes the decoded frames to [`mux::Mux::receive`],
+//! and writes the frames that [`mux::Mux::open`] and [`mux::Mux::send`]
+//! return.
 //!
 //! A session starts when the host sends a Hello and the agent answers with
-//! its own. Both Hellos must carry the same [`VERSION`]. An agent without a
+//! its own. Both Hellos must carry the same [`mux::VERSION`]. An agent without a
 //! session, because it just started or lost frames, announces itself with a
 //! Hello, and the host then starts a session.
 //!
 //! Channel 0 is the control channel. It carries Hello, Ping and Pong, the
 //! host's SetTime, and the agent's Received, which reports how much of the
 //! console the agent has read. The console drops bytes it cannot buffer, so
-//! the host keeps at most [`WINDOW`] bytes in flight.
+//! the host keeps at most [`mux::WINDOW`] bytes in flight.
 //!
 //! The host opens other channels with one of four messages:
 //!
@@ -43,16 +45,7 @@
 //! the agent's Eof confirms it. Exited closes an Exec channel, and Error
 //! closes any channel.
 
-mod codec;
+pub mod codec;
 pub mod frame;
 pub mod message;
 pub mod mux;
-
-pub use codec::DecodeError;
-pub use frame::{Decoder, Frame, MAGIC, MAX_PAYLOAD, Skipped};
-pub use message::{
-  Address, Addressing, Bridge, Call, Claim, Connect, DatasetIo, DeviceAddress, Disk, Exec, Exit, FileCopy, FileType,
-  GuestPath, JailWait, Lease, Limit, Listen, Message, Mount, NetworkStatistics, Resource, Return, Rules, Statistics,
-  StatisticsOf, User, WindowSize,
-};
-pub use mux::{CONTROL, Error, Mux, Side, VERSION, VersionMismatch, WINDOW};

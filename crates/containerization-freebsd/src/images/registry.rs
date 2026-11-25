@@ -1,34 +1,37 @@
 //! Pull, push and platform queries against registries.
 
-use super::{Image, ImageStore, check_runs, choose};
-use crate::error::{Error, Result};
-use crate::oci::{Descriptor, Document, Platform, Reference, RegistryClient};
+use crate::{error, oci};
 
-impl ImageStore {
+impl super::ImageStore {
   /// Pulls `reference`'s image for `platform` through `client`: the index if
   /// there is one, and that platform's manifest, config, and layers. The
   /// index or manifest `reference` names is always fetched; anything else
   /// the store has is not.
-  pub fn pull(&self, reference: &str, platform: &Platform, client: &RegistryClient) -> Result<Image> {
-    let reference = Reference::parse(reference)?;
+  pub fn pull(
+    &self,
+    reference: &str,
+    platform: &oci::Platform,
+    client: &oci::registry::RegistryClient,
+  ) -> error::Result<super::Image> {
+    let reference = oci::reference::Reference::parse(reference)?;
     let _blobs = self.using_blobs()?;
     let top = client.fetch_manifest(&reference, reference.target(), &self.content)?;
 
     let manifest = match self.content.document(&top)? {
-      Document::Index(index) => {
-        let chosen = choose(&index, platform, &reference)?;
+      oci::Document::Index(index) => {
+        let chosen = super::choose(&index, platform, &reference)?;
         if !self.content.has(&chosen.digest) {
           client.fetch_manifest(&reference, chosen.digest.as_str(), &self.content)?;
         }
         self.content.manifest(&chosen)?
       }
-      Document::Manifest(manifest) => manifest,
+      oci::Document::Manifest(manifest) => manifest,
     };
 
     if !self.content.has(&manifest.config.digest) {
       client.fetch_blob(&reference, &manifest.config, &self.content)?;
     }
-    check_runs(&self.content.config(&manifest)?, platform, &reference)?;
+    super::check_runs(&self.content.config(&manifest)?, platform, &reference)?;
     for layer in &manifest.layers {
       if !self.content.has(&layer.digest) {
         client.fetch_blob(&reference, layer, &self.content)?;
@@ -48,8 +51,13 @@ impl ImageStore {
   /// With `platform`, an index is pushed as a new index of only that
   /// platform's manifests. Without it, the whole index is pushed, which needs
   /// every platform's manifest, and a pull fetches only one.
-  pub fn push(&self, reference: &str, platform: Option<&Platform>, client: &RegistryClient) -> Result<()> {
-    let reference = Reference::parse(reference)?;
+  pub fn push(
+    &self,
+    reference: &str,
+    platform: Option<&oci::Platform>,
+    client: &oci::registry::RegistryClient,
+  ) -> error::Result<()> {
+    let reference = oci::reference::Reference::parse(reference)?;
     let _blobs = self.using_blobs()?;
     let image = self.named(&reference)?;
     let descriptor = self.for_platform(&image, platform)?;
@@ -62,8 +70,12 @@ impl ImageStore {
   /// `platforms(reference:)`. Uses the store's image of that name if there
   /// is one, otherwise asks the registry through `client` without pulling
   /// layers.
-  pub fn platforms(&self, reference: &str, client: &RegistryClient) -> Result<Vec<Platform>> {
-    let reference = Reference::parse(reference)?;
+  pub fn platforms(
+    &self,
+    reference: &str,
+    client: &oci::registry::RegistryClient,
+  ) -> error::Result<Vec<oci::Platform>> {
+    let reference = oci::reference::Reference::parse(reference)?;
     let _blobs = self.using_blobs()?;
     if let Some(image) = self.find(&reference)? {
       return self.platforms_of(&image.descriptor, None);
@@ -78,11 +90,11 @@ impl ImageStore {
   /// platform, fetching the config from `remote` if the store lacks it.
   fn platforms_of(
     &self,
-    descriptor: &Descriptor,
-    remote: Option<(&RegistryClient, &Reference)>,
-  ) -> Result<Vec<Platform>> {
+    descriptor: &oci::Descriptor,
+    remote: Option<(&oci::registry::RegistryClient, &oci::reference::Reference)>,
+  ) -> error::Result<Vec<oci::Platform>> {
     match self.content.document(descriptor)? {
-      Document::Index(index) => Ok(
+      oci::Document::Index(index) => Ok(
         index
           .manifests
           .into_iter()
@@ -90,7 +102,7 @@ impl ImageStore {
           .filter(|platform| platform.os != "unknown" && platform.architecture != "unknown")
           .collect(),
       ),
-      Document::Manifest(manifest) => {
+      oci::Document::Manifest(manifest) => {
         if !self.content.has(&manifest.config.digest)
           && let Some((client, reference)) = remote
         {
@@ -103,10 +115,15 @@ impl ImageStore {
 
   /// Pushes everything `descriptor` references: a manifest's config and
   /// layers, or an index's manifests, by digest, and their blobs.
-  fn push_children(&self, client: &RegistryClient, reference: &Reference, descriptor: &Descriptor) -> Result<()> {
+  fn push_children(
+    &self,
+    client: &oci::registry::RegistryClient,
+    reference: &oci::reference::Reference,
+    descriptor: &oci::Descriptor,
+  ) -> error::Result<()> {
     let index = match self.content.document(descriptor)? {
-      Document::Index(index) => index,
-      Document::Manifest(manifest) => {
+      oci::Document::Index(index) => index,
+      oci::Document::Manifest(manifest) => {
         return manifest
           .blobs()
           .try_for_each(|blob| client.push_blob(reference, blob, &self.content));
@@ -117,8 +134,8 @@ impl ImageStore {
         let platform = child
           .platform
           .as_ref()
-          .map_or_else(|| child.digest.to_string(), Platform::to_string);
-        return Err(Error::Invalid(format!(
+          .map_or_else(|| child.digest.to_string(), oci::Platform::to_string);
+        return Err(error::Error::Invalid(format!(
           "the store lacks {reference}'s manifest for {platform}: push the platforms it has, one at a time"
         )));
       }
@@ -132,25 +149,28 @@ impl ImageStore {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::images::tests::{descriptor, json, registry};
-  use crate::oci::{Index, media_type};
-  use crate::testing::FakeRegistry;
+  use crate::oci::media_type;
+  use crate::{images, testing};
 
   /// Ingests `bytes` and returns a `media_type` descriptor for them.
-  fn blob_of(store: &ImageStore, media_type: &str, bytes: &[u8]) -> Descriptor {
+  fn blob_of(store: &images::ImageStore, media_type: &str, bytes: &[u8]) -> oci::Descriptor {
     store.content().ingest(bytes).unwrap();
-    descriptor(media_type, bytes, None)
+    images::tests::descriptor(media_type, bytes, None)
   }
 
   #[test]
   fn pushes_images_that_pull_back() {
     let (pushed, pulled) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let store = ImageStore::new(pushed.path()).unwrap();
-    let client = RegistryClient::default();
+    let store = images::ImageStore::new(pushed.path()).unwrap();
+    let client = oci::registry::RegistryClient::default();
     let image = store
-      .pull(&format!("{}/test/image:1", registry()), &Platform::default(), &client)
+      .pull(
+        &format!("{}/test/image:1", images::tests::registry()),
+        &oci::Platform::default(),
+        &client,
+      )
       .unwrap();
-    let writable = FakeRegistry::default().serve();
+    let writable = testing::FakeRegistry::default().serve();
 
     // The pull fetched only the index's arm64 manifest, so pushing the whole
     // index fails. Pushing for arm64 pushes a new index of that manifest.
@@ -159,19 +179,19 @@ mod tests {
     let error = store.push(&whole, None, &client).unwrap_err();
     assert!(error.to_string().contains("freebsd/amd64"), "{error}");
     store
-      .push(&whole, Some(&Platform::default()), &client)
+      .push(&whole, Some(&oci::Platform::default()), &client)
       .unwrap();
 
     // A single manifest, and an index of only that manifest, are pushed
     // unchanged.
-    let (manifest, _) = image.manifest(&Platform::default()).unwrap();
+    let (manifest, _) = image.manifest(&oci::Platform::default()).unwrap();
     let single = format!("{writable}/test/single:1");
     store.create(&single, manifest.clone()).unwrap();
     let mut entry = manifest;
-    entry.platform = Some(Platform::default());
-    let index = json(&Index {
+    entry.platform = Some(oci::Platform::default());
+    let index = images::tests::json(&oci::Index {
       manifests: vec![entry],
-      ..Index::default()
+      ..oci::Index::default()
     });
     let indexed = format!("{writable}/test/indexed:1");
     store
@@ -179,68 +199,76 @@ mod tests {
       .unwrap();
     for name in [&single, &indexed, &single] {
       store
-        .push(name, Some(&Platform::default()), &client)
+        .push(name, Some(&oci::Platform::default()), &client)
         .unwrap();
     }
 
-    let other = ImageStore::new(pulled.path()).unwrap();
+    let other = images::ImageStore::new(pulled.path()).unwrap();
     for name in [&single, &indexed] {
-      let back = other.pull(name, &Platform::default(), &client).unwrap();
+      let back = other
+        .pull(name, &oci::Platform::default(), &client)
+        .unwrap();
       assert_eq!(back.descriptor.digest, store.get(name).unwrap().descriptor.digest);
-      let config = back.config(&Platform::default()).unwrap();
+      let config = back.config(&oci::Platform::default()).unwrap();
       assert_eq!(config.config.unwrap().cmd, Some(vec!["/bin/sh".to_string()]));
     }
     assert!(other.get(&indexed).unwrap().descriptor.is_index());
-    let back = other.pull(&whole, &Platform::default(), &client).unwrap();
+    let back = other
+      .pull(&whole, &oci::Platform::default(), &client)
+      .unwrap();
     assert_ne!(back.descriptor.digest, image.descriptor.digest);
-    assert_eq!(other.platforms(&whole, &client).unwrap(), [Platform::default()]);
+    assert_eq!(other.platforms(&whole, &client).unwrap(), [oci::Platform::default()]);
   }
 
   #[test]
   fn lists_an_images_platforms_from_the_store_or_the_registry() {
     let root = tempfile::tempdir().unwrap();
-    let store = ImageStore::new(root.path()).unwrap();
-    let reference = format!("{}/test/image:1", registry());
+    let store = images::ImageStore::new(root.path()).unwrap();
+    let reference = format!("{}/test/image:1", images::tests::registry());
     let both = [
-      Platform {
+      oci::Platform {
         architecture: "amd64".into(),
-        ..Platform::default()
+        ..oci::Platform::default()
       },
-      Platform::default(),
+      oci::Platform::default(),
     ];
 
-    let client = RegistryClient::default();
+    let client = oci::registry::RegistryClient::default();
 
     assert_eq!(store.platforms(&reference, &client).unwrap(), both);
     let image = store
-      .pull(&reference, &Platform::default(), &client)
+      .pull(&reference, &oci::Platform::default(), &client)
       .unwrap();
     assert_eq!(store.platforms(&reference, &client).unwrap(), both);
 
     // A manifest's platform comes from its config.
-    let (manifest, _) = image.manifest(&Platform::default()).unwrap();
+    let (manifest, _) = image.manifest(&oci::Platform::default()).unwrap();
     store.create("ghcr.io/test/single:1", manifest).unwrap();
     assert_eq!(
       store.platforms("ghcr.io/test/single:1", &client).unwrap(),
-      [Platform::default()]
+      [oci::Platform::default()]
     );
   }
 
   #[test]
   fn pulls_the_image_for_its_platform_through_a_token() {
     let root = tempfile::tempdir().unwrap();
-    let store = ImageStore::new(root.path()).unwrap();
-    let reference = format!("{}/test/image:1", registry());
+    let store = images::ImageStore::new(root.path()).unwrap();
+    let reference = format!("{}/test/image:1", images::tests::registry());
 
     let image = store
-      .pull(&reference, &Platform::default(), &RegistryClient::default())
+      .pull(
+        &reference,
+        &oci::Platform::default(),
+        &oci::registry::RegistryClient::default(),
+      )
       .unwrap();
 
     assert_eq!(image.reference, reference);
     assert!(image.descriptor.is_index());
-    let config = image.config(&Platform::default()).unwrap();
+    let config = image.config(&oci::Platform::default()).unwrap();
     assert_eq!(config.config.unwrap().cmd, Some(vec!["/bin/sh".to_string()]));
-    let (_, manifest) = image.manifest(&Platform::default()).unwrap();
+    let (_, manifest) = image.manifest(&oci::Platform::default()).unwrap();
     assert!(store.content().has(&manifest.layers[0].digest));
     assert_eq!(store.get(&reference).unwrap().descriptor, image.descriptor);
     assert!(root.path().join("oci-layout").exists());
@@ -249,17 +277,17 @@ mod tests {
   #[test]
   fn refuses_an_image_with_none_for_its_platform() {
     let root = tempfile::tempdir().unwrap();
-    let store = ImageStore::new(root.path()).unwrap();
-    let riscv = Platform {
+    let store = images::ImageStore::new(root.path()).unwrap();
+    let riscv = oci::Platform {
       architecture: "riscv64".into(),
-      ..Platform::default()
+      ..oci::Platform::default()
     };
 
     let error = store
       .pull(
-        &format!("{}/test/image:1", registry()),
+        &format!("{}/test/image:1", images::tests::registry()),
         &riscv,
-        &RegistryClient::default(),
+        &oci::registry::RegistryClient::default(),
       )
       .unwrap_err();
 

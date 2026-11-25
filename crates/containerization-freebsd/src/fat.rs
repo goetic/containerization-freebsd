@@ -1,7 +1,7 @@
 //! FAT volumes that `prepare` writes without mounting them on the host: the
 //! EFI system partition of a raw disk, and the NoCloud seed.
 
-use crate::error::{Error, Result};
+use crate::error;
 use fatfs::{FileSystem, FormatVolumeOptions, FsOptions, ReadWriteSeek};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -31,7 +31,7 @@ pub(crate) struct Volume<T: ReadWriteSeek> {
 impl Volume<File> {
   /// Creates the image `path` and formats it as a FAT volume labelled
   /// `label`, with room for `contents` bytes of files.
-  pub(crate) fn create(path: &Path, label: [u8; 11], contents: u64) -> Result<Self> {
+  pub(crate) fn create(path: &Path, label: [u8; 11], contents: u64) -> error::Result<Self> {
     let name = path.display().to_string();
     let creating = || format!("creating {name}");
     let mut file = File::options()
@@ -40,7 +40,7 @@ impl Volume<File> {
       .create(true)
       .truncate(true)
       .open(path)
-      .map_err(Error::io(creating()))?;
+      .map_err(error::Error::io(creating()))?;
 
     // The FAT tables take under 1/64 of a volume of 512-byte or larger
     // clusters.
@@ -48,8 +48,8 @@ impl Volume<File> {
       .set_len((contents + contents / 64 + OVERHEAD).next_multiple_of(MIB))
       .and_then(|()| fatfs::format_volume(&mut file, FormatVolumeOptions::new().volume_label(label)))
       .and_then(|()| file.rewind())
-      .map_err(Error::io(creating()))?;
-    let fs = FileSystem::new(file, FsOptions::new()).map_err(Error::io(creating()))?;
+      .map_err(error::Error::io(creating()))?;
+    let fs = FileSystem::new(file, FsOptions::new()).map_err(error::Error::io(creating()))?;
     Ok(Self { fs, name })
   }
 }
@@ -57,21 +57,21 @@ impl Volume<File> {
 impl Volume<Partition> {
   /// Opens the FAT file system in the EFI system partition of `disk`, a raw
   /// disk image with a GPT.
-  pub(crate) fn esp(disk: &Path) -> Result<Self> {
+  pub(crate) fn esp(disk: &Path) -> error::Result<Self> {
     let name = format!("the EFI system partition of {}", disk.display());
     let file = File::options()
       .read(true)
       .write(true)
       .open(disk)
-      .map_err(Error::io(format!("opening {}", disk.display())))?;
-    let range = esp(&file).map_err(Error::io(format!("finding {name}")))?;
+      .map_err(error::Error::io(format!("opening {}", disk.display())))?;
+    let range = esp(&file).map_err(error::Error::io(format!("finding {name}")))?;
     let partition = Partition {
       file,
       start: range.start,
       length: range.end - range.start,
       position: 0,
     };
-    let fs = FileSystem::new(partition, FsOptions::new()).map_err(Error::io(format!("reading {name}")))?;
+    let fs = FileSystem::new(partition, FsOptions::new()).map_err(error::Error::io(format!("reading {name}")))?;
     Ok(Self { fs, name })
   }
 }
@@ -79,29 +79,33 @@ impl Volume<Partition> {
 impl<T: ReadWriteSeek> Volume<T> {
   /// Writes `contents` to the file at `path`, creating its directories and
   /// replacing any file there. `path` separates names with `/`.
-  pub(crate) fn write(&self, path: &str, contents: &mut impl Read) -> Result<()> {
+  pub(crate) fn write(&self, path: &str, contents: &mut impl Read) -> error::Result<()> {
     let writing = || format!("writing {path} on {}", self.name);
     let (parents, name) = path.rsplit_once('/').unwrap_or(("", path));
     let mut directory = self.fs.root_dir();
 
     for parent in parents.split('/').filter(|parent| !parent.is_empty()) {
-      directory = directory.create_dir(parent).map_err(Error::io(writing()))?;
+      directory = directory
+        .create_dir(parent)
+        .map_err(error::Error::io(writing()))?;
     }
-    let mut file = directory.create_file(name).map_err(Error::io(writing()))?;
+    let mut file = directory
+      .create_file(name)
+      .map_err(error::Error::io(writing()))?;
     // create_file opens a file that exists without truncating it.
     file
       .truncate()
       .and_then(|()| io::copy(contents, &mut file))
       .and_then(|_| file.flush())
-      .map_err(Error::io(writing()))
+      .map_err(error::Error::io(writing()))
   }
 
   /// Writes out what the volume still holds in memory and closes it.
-  pub(crate) fn finish(self) -> Result<()> {
+  pub(crate) fn finish(self) -> error::Result<()> {
     self
       .fs
       .unmount()
-      .map_err(Error::io(format!("closing {}", self.name)))
+      .map_err(error::Error::io(format!("closing {}", self.name)))
   }
 }
 
