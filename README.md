@@ -11,6 +11,29 @@ Each guest's disk is an APFS copy-on-write clone.
 
 Pre-release.
 
+## Requirements
+
+- macOS 27 or later on Apple silicon, since FreeBSD's VM image is arm64.
+- Swift 6.2 or later, from Xcode or its command line tools, because
+  [virtualization] builds a Swift package.
+- A binary that starts machines must be signed with the
+  `com.apple.security.virtualization` entitlement, and a rebuild drops the
+  signature. `bin/dev/sign` signs with `virtualization.entitlements`.
+- Every binary that links the library, test binaries included, needs an
+  rpath to `/usr/lib/swift`, where virtualization finds the Swift runtime.
+  Without it, dyld fails at launch. Cargo doesn't propagate a dependency's
+  link arguments, so add it to the caller's `.cargo/config.toml`, as this
+  repository does:
+
+  ```toml
+  [target.'cfg(target_os = "macos")']
+  rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+  ```
+
+- Host connections to a container's own interface address are subject to
+  macOS's Local Network privacy, which denies them without a prompt to
+  launchd agents and the processes they start ([TN3179]).
+
 ## Guest additions
 
 - A single-port virtio console, `/dev/ttyV0.0` in the guest, which the agent
@@ -64,3 +87,4 @@ MIT. See [LICENSE.md](LICENSE.md).
 
 [Containerization]: https://github.com/apple/containerization
 [virtualization]: https://github.com/synchronal/virtualization
+[TN3179]: https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy

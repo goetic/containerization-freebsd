@@ -6,6 +6,20 @@
 //! Types live in the modules that define them, such as
 //! [`machine::Machine`] and [`container::Container`]. The guest agent's
 //! messages, such as `Exec`, come from `containerization-freebsd-protocol`.
+//!
+//! # Requirements
+//!
+//! - macOS 27 or later on Apple silicon.
+//! - A binary that starts a [`machine::Machine`] must be signed with the
+//!   `com.apple.security.virtualization` entitlement after every build.
+//! - Every binary that links this crate, test binaries included, needs an
+//!   rpath to `/usr/lib/swift`, such as `-C link-arg=-Wl,-rpath,/usr/lib/swift`
+//!   in its `.cargo/config.toml`. Without it, dyld can't find the Swift
+//!   runtime that `virtualization` links, and the binary fails at launch.
+//!
+//! The project's [README] has the details.
+//!
+//! [README]: https://github.com/goetic/containerization-freebsd/blob/main/README.md
 
 pub mod agent;
 pub mod build;
