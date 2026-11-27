@@ -7,6 +7,13 @@ it needs macOS 27 on Apple silicon, a binary signed with the
 `com.apple.security.virtualization` entitlement, and an rpath to
 `/usr/lib/swift`.
 
+## Example
+
+[`examples/container.rs`](examples/container.rs) downloads FreeBSD's VM
+image, the guest bundle, and the userland; prepares a base; boots a machine;
+runs a command through its agent; and runs a container on a ZFS clone of the
+userland.
+
 ## Features
 
 - `kernel-messages`: reads the kernel message buffer (msgbuf) from guest RAM

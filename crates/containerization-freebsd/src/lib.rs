@@ -7,6 +7,14 @@
 //! [`machine::Machine`] and [`container::Container`]. The guest agent's
 //! messages, such as `Exec`, come from `containerization-freebsd-protocol`.
 //!
+//! # Example
+//!
+//! [`examples/container.rs`] downloads FreeBSD's VM image, the guest bundle,
+//! and the userland; prepares a base; boots a machine; runs a command through
+//! its agent; and runs a container on a ZFS clone of the userland.
+//!
+//! [`examples/container.rs`]: https://github.com/goetic/containerization-freebsd/blob/main/crates/containerization-freebsd/examples/container.rs
+//!
 //! # Requirements
 //!
 //! - macOS 27 or later on Apple silicon.
